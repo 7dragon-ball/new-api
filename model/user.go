@@ -808,6 +808,72 @@ func (user *User) Update(updatePassword bool) error {
 	return nil
 }
 
+// [TM-FORK] 多 root：系统必须始终保留至少一个启用的超级管理员。
+// 用 common.NewMessage 而不是 errors.New，让文案经 common.ApiError 直接透出，
+// 与上游对用户可见错误的写法一致（见 model/user.go 的 "ID is empty!"）。
+var ErrLastEnabledRootUser = common.NewMessage("Cannot remove the last enabled administrator. Enable or promote another administrator first.")
+
+// [TM-FORK] CountEnabledRootUsers 返回启用且未软删除的 super admin 数量。
+// 仅用于诊断与测试；判定「是否最后一个 root」必须用 ensureEnabledRootSurvivesWithTx，
+// 因为先 COUNT 再写会漏掉并发窗口。
+func CountEnabledRootUsers(tx *gorm.DB) (int64, error) {
+	var count int64
+	err := tx.Model(&User{}).
+		Where("role = ? AND status = ?", common.RoleRootUser, common.UserStatusEnabled).
+		Count(&count).Error
+	return count, err
+}
+
+// [TM-FORK] lockEnabledRootIDsWithTx 锁定当前全部「启用且未软删除」的 root 行并返回 id（升序）。
+// 必须锁整组而不是只 COUNT：两个并发请求各自只读计数会同时看到 2 并双双通过；
+// 先按 id 顺序加行锁，第二个事务会阻塞到第一个提交，随后读到 1 并被拒。
+// 按 id 排序是为了让并发事务以相同顺序取锁，避免死锁。
+func lockEnabledRootIDsWithTx(tx *gorm.DB) ([]int, error) {
+	var ids []int
+	err := lockForUpdate(tx.Model(&User{})).
+		Where("role = ? AND status = ?", common.RoleRootUser, common.UserStatusEnabled).
+		Order("id").
+		Pluck("id", &ids).Error
+	return ids, err
+}
+
+// [TM-FORK] ensureEnabledRootSurvivesWithTx 校验：把 targetID 的 role 改成 newRole、
+// status 改成 newStatus（removing=true 表示删除该用户）之后，系统里必须仍至少有一个
+// 启用的 root。newRole / newStatus 传 0 表示「本次不改该字段」，与 UpdateWithTx 的
+// 既有语义一致（零值不落库）。调用方必须已处于事务中，且必须在任何写之前调用。
+func ensureEnabledRootSurvivesWithTx(tx *gorm.DB, targetID int, newRole int, newStatus int, removing bool) error {
+	ids, err := lockEnabledRootIDsWithTx(tx)
+	if err != nil {
+		return err
+	}
+	targetIsRoot := false
+	for _, id := range ids {
+		if id == targetID {
+			targetIsRoot = true
+			break
+		}
+	}
+	// 目标此刻不是「启用中的 root」→ 本次改动不减少可用管理员数，不设限。
+	if !targetIsRoot {
+		return nil
+	}
+	roleAfter := common.RoleRootUser
+	if newRole != 0 {
+		roleAfter = newRole
+	}
+	statusAfter := common.UserStatusEnabled
+	if newStatus != 0 {
+		statusAfter = newStatus
+	}
+	if !removing && roleAfter == common.RoleRootUser && statusAfter == common.UserStatusEnabled {
+		return nil
+	}
+	if len(ids) > 1 {
+		return nil
+	}
+	return ErrLastEnabledRootUser
+}
+
 func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
 	if updatePassword {
