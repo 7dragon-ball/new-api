@@ -61,3 +61,64 @@ func TestLockEnabledRootIDsEmitsRowLockAndSkipsDeleted(t *testing.T) {
 	assert.Contains(t, sql, "FOR UPDATE")
 	assert.Contains(t, sql, "deleted_at IS NULL")
 }
+
+func TestLastEnabledRootUserCannotBeDemoted(t *testing.T) {
+	setupUserUpdateTestState(t)
+	root := createTestRootUser(t, "only-root", common.UserStatusEnabled)
+
+	change := User{Id: root.Id, Role: common.RoleCommonUser}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		return change.UpdateWithTx(tx, false)
+	})
+	require.ErrorIs(t, err, ErrLastEnabledRootUser)
+
+	var after User
+	require.NoError(t, DB.First(&after, root.Id).Error)
+	assert.Equal(t, common.RoleRootUser, after.Role)
+	assert.EqualValues(t, 1, after.AuthVersion)
+}
+
+func TestLastEnabledRootUserCannotBeDisabled(t *testing.T) {
+	setupUserUpdateTestState(t)
+	root := createTestRootUser(t, "only-root", common.UserStatusEnabled)
+
+	change := User{Id: root.Id, Status: common.UserStatusDisabled}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		return change.UpdateWithTx(tx, false)
+	})
+	require.ErrorIs(t, err, ErrLastEnabledRootUser)
+
+	var after User
+	require.NoError(t, DB.First(&after, root.Id).Error)
+	assert.Equal(t, common.UserStatusEnabled, after.Status)
+}
+
+func TestDemotingOneOfTwoRootsSucceeds(t *testing.T) {
+	setupUserUpdateTestState(t)
+	first := createTestRootUser(t, "root-a", common.UserStatusEnabled)
+	createTestRootUser(t, "root-b", common.UserStatusEnabled)
+
+	change := User{Id: first.Id, Role: common.RoleCommonUser}
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return change.UpdateWithTx(tx, false)
+	}))
+
+	var after User
+	require.NoError(t, DB.First(&after, first.Id).Error)
+	assert.Equal(t, common.RoleCommonUser, after.Role)
+}
+
+func TestGuardedUpdateLeavesNonRootUserAlone(t *testing.T) {
+	setupUserUpdateTestState(t)
+	createTestRootUser(t, "only-root", common.UserStatusEnabled)
+	member := createAccessTokenTestUser(t, "plain-user")
+
+	change := User{Id: member.Id, Role: common.RoleAdminUser}
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return change.UpdateWithTx(tx, false)
+	}))
+
+	var after User
+	require.NoError(t, DB.First(&after, member.Id).Error)
+	assert.Equal(t, common.RoleAdminUser, after.Role)
+}

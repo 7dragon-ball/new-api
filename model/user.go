@@ -894,6 +894,16 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		(newUser.Role != 0 && current.Role != newUser.Role) ||
 		(newUser.Status != 0 && current.Status != newUser.Status) ||
 		(newUser.Group != "" && current.Group != newUser.Group)
+	// [TM-FORK] 多 root 不变量：只有「目标当前是 root，且这次要把它改成非 root
+	// 或改成禁用」时才需要校验。外层的 current.Role 判断只是廉价预筛，真正的
+	// 判定（目标是否仍是启用中的 root、剩下几个）在加锁后的数据上重做。
+	if current.Role == common.RoleRootUser &&
+		((newUser.Role != 0 && newUser.Role != common.RoleRootUser) ||
+			(newUser.Status != 0 && newUser.Status != common.UserStatusEnabled)) {
+		if err = ensureEnabledRootSurvivesWithTx(tx, user.Id, newUser.Role, newUser.Status, false); err != nil {
+			return err
+		}
+	}
 	if authChanged {
 		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
