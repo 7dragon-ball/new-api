@@ -1017,7 +1017,8 @@ func CreateUser(c *gin.Context) {
 		user.DisplayName = user.Username
 	}
 	myRole := c.GetInt("role")
-	if user.Role >= myRole {
+	// [TM-FORK] 多 root：root 可以创建同级（root）账号；其他角色仍不得创建同级或更高。
+	if user.Role >= myRole && myRole != common.RoleRootUser {
 		common.ApiErrorT(c, "Cannot create users with permission level equal to or higher than yourself")
 		return
 	}
