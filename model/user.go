@@ -1044,12 +1044,23 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
 			}
-			var role int
-			if err := tx.Model(&User{}).Where("id = ?", user.Id).Select("role").Scan(&role).Error; err != nil {
+		}
+		// [TM-FORK] 多 root：这里要读 role 与 status 两个字段，且自删/管理员删除两条路径都要用。
+		var current struct {
+			Role   int
+			Status int
+		}
+		if err := tx.Model(&User{}).Where("id = ?", user.Id).Select("role", "status").Scan(&current).Error; err != nil {
+			return err
+		}
+		// 自删路径保持上游语义：root 不能通过 DELETE /api/user/self 删除自己。
+		if identity != nil && current.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
+		}
+		// 管理员删除路径：不能删掉最后一个启用的 root。
+		if current.Role == common.RoleRootUser && current.Status == common.UserStatusEnabled {
+			if err := ensureEnabledRootSurvivesWithTx(tx, user.Id, 0, 0, true); err != nil {
 				return err
-			}
-			if role == common.RoleRootUser {
-				return ErrCannotDeleteRootUser
 			}
 		}
 		var err error

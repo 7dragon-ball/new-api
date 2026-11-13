@@ -2,6 +2,7 @@ package model
 
 import (
 	"strings"
+	"time"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -121,4 +122,66 @@ func TestGuardedUpdateLeavesNonRootUserAlone(t *testing.T) {
 	var after User
 	require.NoError(t, DB.First(&after, member.Id).Error)
 	assert.Equal(t, common.RoleAdminUser, after.Role)
+}
+
+func TestLastEnabledRootUserCannotBeDeleted(t *testing.T) {
+	setupUserUpdateTestState(t)
+	root := createTestRootUser(t, "only-root", common.UserStatusEnabled)
+
+	_, err := (&User{Id: root.Id}).Delete()
+	require.ErrorIs(t, err, ErrLastEnabledRootUser)
+
+	var count int64
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", root.Id).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestDeletingDisabledRootIsAllowed(t *testing.T) {
+	setupUserUpdateTestState(t)
+	createTestRootUser(t, "active-root", common.UserStatusEnabled)
+	disabled := createTestRootUser(t, "disabled-root", common.UserStatusDisabled)
+
+	_, err := (&User{Id: disabled.Id}).Delete()
+	require.NoError(t, err)
+}
+
+func TestDisabledRootDeletionThenLastActiveDemotionFails(t *testing.T) {
+	setupUserUpdateTestState(t)
+	active := createTestRootUser(t, "active-root", common.UserStatusEnabled)
+	disabled := createTestRootUser(t, "disabled-root", common.UserStatusDisabled)
+
+	_, err := (&User{Id: disabled.Id}).Delete()
+	require.NoError(t, err)
+
+	change := User{Id: active.Id, Role: common.RoleCommonUser}
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		return change.UpdateWithTx(tx, false)
+	})
+	require.ErrorIs(t, err, ErrLastEnabledRootUser)
+}
+
+func TestRootSelfDeleteKeepsUpstreamError(t *testing.T) {
+	setupUserUpdateTestState(t)
+	root := createTestRootUser(t, "only-root", common.UserStatusEnabled)
+
+	// delete 在 identity != nil 时先跑 ValidateAuthSessionWithTx，伪造的 identity 会
+	// 在到达守卫前就返回 ErrUserSessionInactive。必须建一条真实可用的会话。
+	now := time.Now().Unix()
+	require.NoError(t, DB.Create(&UserSession{
+		SID: "root-self-delete", UserID: root.Id, Version: 1, UserAuthVersion: 1,
+		Status: UserSessionStatusActive, RefreshHash: "refresh-hash", LoginMethod: "password",
+		LastActiveAt: now, ExpiresAt: now + 3600,
+	}).Error)
+	identity := AuthSessionIdentity{
+		UserID: root.Id, SessionID: "root-self-delete",
+		UserAuthVersion: 1, SessionVersion: 1,
+	}
+
+	_, err := DeleteUserForSession(identity)
+	// 断言的是上游错误，不是新守卫的错误：自删路径必须保持原语义。
+	require.ErrorIs(t, err, ErrCannotDeleteRootUser)
+
+	var after User
+	require.NoError(t, DB.First(&after, root.Id).Error)
+	assert.Equal(t, common.RoleRootUser, after.Role)
 }
