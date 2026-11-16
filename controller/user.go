@@ -1399,8 +1399,15 @@ func UpdateUserDepartment(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if _, err := model.GetUserById(id, false); err != nil {
+	originUser, err := model.GetUserById(id, false)
+	if err != nil {
 		common.ApiErrorT(c, "User not found")
+		return
+	}
+	// 与 UpdateUser / ManageUser / DeleteUser 同一条边界：同级或更高角色的账号不可操作。
+	// 漏掉这一句时，role=10 的管理员能改 role=100 的部门，而它连读该用户都会被拒。
+	if !canManageTargetRole(c.GetInt("role"), originUser.Role) {
+		common.ApiErrorT(c, "No permission to update users of same or higher permission level")
 		return
 	}
 	var req struct {
@@ -1429,8 +1436,14 @@ func UpdateUserDepartment(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	// 审计参数传解引用后的值而不是 *int：auditContentEN 用 %v 渲染模板里的占位符，
+	// 传指针会让 Content 写成 "0xc0004a21b0"（清空时是 "<nil>"）。
+	auditDepartmentID := any(nil)
+	if req.DepartmentID != nil {
+		auditDepartmentID = *req.DepartmentID
+	}
 	recordManageAuditFor(c, id, "user.department_update",
-		map[string]any{"id": id, "department_id": req.DepartmentID})
+		map[string]any{"id": id, "department_id": auditDepartmentID})
 	common.ApiSuccess(c, nil)
 }
 

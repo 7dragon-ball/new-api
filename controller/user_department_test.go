@@ -1,8 +1,11 @@
 package controller
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -111,6 +114,75 @@ func TestUpdateUserDepartmentValueInAuditParams(t *testing.T) {
 	var count int64
 	require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("action = ?", "user.department_update").Count(&count).Error)
 	assert.EqualValues(t, 1, count, "每次改归属恰好一条审计（markAuditLogged 生效则不会翻倍）")
+}
+
+func TestUpdateUserDepartmentAuditContentRendersValue(t *testing.T) {
+	// 审计 Content 的模板是一条给人看的英文句子，占位符用 %v 渲染。
+	// 传 *int 会把指针地址写进去（"to 0xc0004a21b0"），清空时写 "<nil>"。
+	target, dept := setupDepartmentAssignTest(t)
+	_, resp := departmentRequest(t, http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
+		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
+		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
+	require.Equal(t, true, resp["success"])
+
+	var logs []model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "user.department_update").Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Contains(t, logs[0].Content, "to "+strconv.Itoa(dept.Id))
+	assert.NotContains(t, logs[0].Content, "0x", "Content 里不得出现指针地址")
+}
+
+// departmentRequestAs 与 departmentRequest 相同，但可以指定调用方角色。
+// 同目录其它管理写路径（UpdateUser / ManageUser / DeleteUser）都用 canManageTargetRole
+// 挡「同级或更高」的目标，这里要能构造出低角色管理员来验证同一条边界。
+func departmentRequestAs(t *testing.T, role int, method, path, body string, params gin.Params, handler gin.HandlerFunc) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = params
+	c.Set("id", 1)
+	c.Set("username", "admin")
+	c.Set("role", role)
+	handler(c)
+
+	var decoded map[string]any
+	if response.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &decoded), "body=%s", response.Body.String())
+	}
+	return response, decoded
+}
+
+func TestUpdateUserDepartmentRejectsHigherRoleTarget(t *testing.T) {
+	// role=10 的管理员改 role=100 的账号：连 GET /api/user/:id 都会被 canManageTargetRole 拒，
+	// 改部门也必须拒，否则授权分层被绕过（虽然 role=10 账号只能 out-of-band 建出来）。
+	target, dept := setupDepartmentAssignTest(t)
+	require.NoError(t, model.DB.Model(target).Update("role", common.RoleRootUser).Error)
+	before := model.Department{Name: "原部门"}
+	require.NoError(t, model.DB.Save(&before).Error)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).Update("department_id", before.Id).Error)
+
+	_, resp := departmentRequestAs(t, common.RoleAdminUser,
+		http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
+		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
+		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
+
+	assert.Equal(t, false, resp["success"])
+	stored, err := model.GetUserById(target.Id, false)
+	require.NoError(t, err)
+	require.NotNil(t, stored.DepartmentId)
+	assert.Equal(t, before.Id, *stored.DepartmentId, "被拒时部门不得变化")
+}
+
+func TestUpdateUserDepartmentAllowsLowerRoleTarget(t *testing.T) {
+	// role=10 改 role=1 是允许的（canManageTargetRole(10,1) 为真），这条钉住修复不会把正常路径拦掉。
+	target, dept := setupDepartmentAssignTest(t)
+	_, resp := departmentRequestAs(t, common.RoleAdminUser,
+		http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
+		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
+		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
 }
 
 var _ = common.RoleRootUser
