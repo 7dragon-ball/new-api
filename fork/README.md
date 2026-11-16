@@ -1,7 +1,8 @@
 # fork/ — New API 的定制补丁
 
-本仓库是 [New API](https://github.com/QuantumNous/new-api)（AI API 网关）的 fork，在上面做了两组
-后端定制：支持多个超级管理员（root），以及在 `users` 表记录真实的最近调用时刻。
+本仓库是 [New API](https://github.com/QuantumNous/new-api)（AI API 网关）的 fork，在上面做了三组
+后端定制：支持多个超级管理员（root）、在 `users` 表记录真实的最近调用时刻，以及把部门归属
+从业务库搬到 `new_api` 库。
 
 定制不是直接改上游代码，而是以 git 补丁的形式存于本目录 `fork/patches/`，由 `fork/scripts/apply.sh`
 落到源码树。所以 `fork/patches/` 是定制的**权威清单**：从一个干净的上游提交出发、用 `apply.sh`
@@ -12,25 +13,26 @@
 
 ## 本仓库 main 分支的代码状态（动手前必看）
 
-补丁清单是 9 个，但 **`main` 的源码树里只应用了后 2 个**：
+补丁清单是 15 个，但 **`main` 的源码树里只应用了 0008-0009**：
 
 | 范围 | 在 `main` 源码树里 | 说明 |
 |---|---|---|
 | 0001-0007 多 root | **仅存于 `fork/patches/`** | 没有对应的代码提交。`model/user.go` 里看不到 `ensureEnabledRootSurvivesWithTx` 等函数。 |
 | 0008-0009 最近调用时刻 | **已应用** | `users.last_called_at` 字段与三条写入路径都在代码里。 |
+| 0010-0015 部门归属 | **仅存于 `fork/patches/`** | 没有对应的代码提交。`model/department.go` 在 `main` 上不存在。 |
 
-这个不对称不影响用法，但会影响判断：在 `main` 上 `grep` 不到多 root 的代码，不代表补丁丢了。
+这个不对称不影响用法，但会影响判断：在 `main` 上 `grep` 不到多 root 或部门的代码，不代表补丁丢了。
 
 因此 **不要在 `main` 上直接跑 `apply.sh`**——0008/0009 会因目标改动已存在而冲突。
-要得到「9 个补丁全部应用」的完整状态，必须从一个不含 0008/0009 的干净上游提交出发：
+要得到「15 个补丁全部应用」的完整状态，必须从一个不含 0008/0009 的干净上游提交出发：
 
 ```bash
 git checkout -b fork-full origin/main    # 或任意上游提交
-fork/scripts/apply.sh                    # 9 个补丁逐个 ok
+fork/scripts/apply.sh                    # 15 个补丁逐个 ok
 ```
 
-实测：从 `origin/main` 出发，9 个补丁全部干净重放，产出与下表 diffstat 完全一致的
-7 个文件、829 行插入。
+实测：从导出时的 `origin/main`（本组补丁的基线）出发，15 个补丁全部干净重放，
+重放后的源码树与本分支零差异，`verify.sh` 全绿。基线会随上游前进，因此这里不记具体提交号。
 
 ## 为什么用补丁，而不是直接改代码
 
@@ -42,7 +44,7 @@ fork/scripts/apply.sh                    # 9 个补丁逐个 ok
 
 代价是：补丁记录了导出时的上游代码上下文。上游前进后旧补丁可能无法直接应用，需要解决冲突后重新导出。
 
-## 两组补丁分别解决什么
+## 三组补丁分别解决什么
 
 ### 一、多 root 管理员（0001-0007）
 
@@ -96,6 +98,32 @@ fork/scripts/apply.sh                    # 9 个补丁逐个 ok
 > **本仓库前端未改动。** `web/` 与上游完全一致，自带控制台不显示这一列。该字段供自行开发的
 > 管理端读取；要用的话在列表里渲染 `last_called_at` 即可，无需额外接口。
 
+### 三、部门归属（0010-0015）
+
+**背景**：部门原本存在业务库 `token_master` 的 `department` 表里，与账号数据分离在两个库，
+任何「按部门筛选用户」「按部门聚合用量」都要跨库拼装，BFF 侧只能整表拉回内存再过滤。
+
+**做法**：把部门字典搬进 `new_api` 库（`department` 表 + `users.department_id`），让归属成为
+账号自己的属性，筛选与聚合都能在一条 SQL 里完成。业务库只保留手机号等附加资料。
+
+- 0010：`model/department.go`（`department` 表、名字归一与 1-30 字校验、`uk_department_name`
+  唯一索引）与 `users.department_id`（可空、带索引）。**有意不加外键**：外键的 RESTRICT 看不见
+  `deleted_at`，被软删除的用户仍会挡住部门删除，所以「还有几个用户」这条检查由
+  `DeleteDepartment` 自己数未软删的行。GORM 零值跳过会让可空 FK 写不进 NULL，字段声明成 `*int`。
+- 0011：`/api/department/` 的增删改查（`GET` 支持 `keyword`，`LIKE` 里的 `%`/`_` 已转义）。
+- 0012：`GET /api/user/search` 改为原生 SQL 过滤，支持按部门与用户名；软删除范围收紧；
+  `POST /api/user/` 接受 `department_id` 并在响应里回 `data.id`。
+- 0013：新增 `PUT /api/user/:id/department`。**不复用 `PUT /api/user/`**——那是上游自带前端
+  在用的整行替换接口，请求体不带部门时会被整行覆盖清空。
+- 0014：`GET /api/data/departments` 按时间区间聚合各部门的成员数、秘钥数、调用数、token 数与
+  额度。三个数据源各自聚合成 CTE 再 LEFT JOIN：摊平成多表 JOIN 会做
+  `users × tokens × quota_data` 笛卡尔积，有 N 把秘钥的用户用量被放大 N 倍。
+- 0015：`UpdateUserDepartment` 补 `canManageTargetRole`（否则 `role=10` 能改 `role=100` 的部门，
+  而它连读该用户都会被拒）；审计参数传解引用值而不是 `*int`（`%v` 渲染指针会写成 `0xc0004a21b0`）。
+
+**发布顺序**：必须先部署含这些接口的新版 BFF，再执行删掉 `token_master.department` 与
+`user_profile.department_id` 的 goose 迁移。旧版 BFF 仍在读写那两列，列一删就立刻报错。
+
 ## 目录结构
 
 ```
@@ -121,8 +149,14 @@ fork/
 | 0007 | Postgres 并发用例：两个事务同时把两个 root 各自降级，断言恰好一个成功、一个被拒，且最终只剩一个启用的 root。SQLite 无 `FOR UPDATE`，跑不出锁竞争，因此单独开 Postgres 连接。 |
 | 0008 | `User` 新增 `LastCalledAt`（`users.last_called_at`，默认 0）；三条扣费 UPDATE 路径同行写入秒级时间戳（含批量刷库落点）。该补丁同时带进 `model/user.go` 结构体的整段对齐格式化 diff，属噪声，不影响行为。 |
 | 0009 | `UpdateWithTx` 的 `Omit` 白名单加 `last_called_at`，防止整行覆盖写回旧值。 |
+| 0010 | 新增 `model/department.go`：`department` 表（显式 `TableName` 单数，手写 SQL 都写 `department`）、名字归一（全角空格→半角后 TrimSpace）与 1-30 字校验、`uk_department_name` 唯一索引。`User` 新增 `DepartmentId *int`（`users.department_id`）：可空 FK 必须是 `*int`，否则 GORM 的零值跳过让「清空部门」写不进 NULL。 |
+| 0011 | `/api/department/` 的 `GET`（`keyword` 模糊查，`%`/`_`/`\` 已转义并带 `ESCAPE`）、`POST`、`PUT`（id 走请求体，与上游 `prefill_group` 同形）、`DELETE /:id`。全部挂 `AdminAuth`，写操作进管理审计。重名靠唯一索引拦，错误转成 `Department name already exists`。 |
+| 0012 | `GET /api/user/search` 换成原生 SQL：支持 `department_id` 与用户名过滤、管理员可查已软删除账号（显式 WHERE 而非 `Unscoped()` 裸放开）；`POST /api/user/` 接受 `department_id` 并在响应 `data.id` 里回传新 id（BFF 建号后要立刻写手机号，拿不到 id 就只能全表扫）。 |
+| 0013 | 新增 `PUT /api/user/:id/department`，请求体 `{"department_id": <id>}`，传 `null` 表示清空。独立路由而非复用 `PUT /api/user/`：后者是整行替换，上游自带前端调用时不带部门字段，复用会把部门冲掉。 |
+| 0014 | 新增 `GET /api/data/departments?start_timestamp=&end_timestamp=`，按时间区间聚合各部门 `members`/`keys`/`calls`/`tokens`/`quota`。三个数据源各聚成 CTE 再 LEFT JOIN（`dept_users`/`tk`/`qd`）：摊平成一条多表 JOIN 会做 `users × tokens × quota_data` 笛卡尔积，把有 N 把秘钥的用户的调用量放大 N 倍，`count(DISTINCT)` 只掩盖症状。全 LEFT JOIN 让零成员部门也出现。 |
+| 0015 | 补两处终审问题：`UpdateUserDepartment` 加 `canManageTargetRole` 分级校验（与 `UpdateUser`/`ManageUser`/`DeleteUser` 同一条边界，缺了它 `role=10` 能改 `role=100` 的部门）；审计参数改传解引用值而非 `*int`（`auditContentEN` 用 `%v` 渲染，传指针会把 `0xc0004a21b0` 写进审计 Content，清空时写 `<nil>`）。 |
 
-代码改动总量（不含本目录）：
+代码改动总量（不含本目录）。多 root + 最近调用（0001-0009）：
 
 ```
  controller/security_enrollment_test.go |   3 +
@@ -135,31 +169,67 @@ fork/
  7 files changed, 829 insertions(+), 58 deletions(-)
 ```
 
-其中测试 3 个文件共 25 个用例（model 17 个、controller 8 个）。上游受保护的项目标识（README、
-LICENSE、NOTICE、`web/`、Dockerfile、Go module path）一律未改动；`web/` 与上游完全一致。
+部门（0010-0015）：
+
+```
+ controller/audit.go                       |   6 +
+ controller/department.go                  | 126 +++++++++++++++++++
+ controller/department_test.go             | 195 ++++++++++++++++++++++++++++++
+ controller/department_usage.go            |  69 +++++++++++
+ controller/department_usage_test.go       | 169 ++++++++++++++++++++++++++
+ controller/security_enrollment_test.go    |   2 +-
+ controller/user.go                        |  88 +++++++++++++-
+ controller/user_department_test.go        | 188 ++++++++++++++++++++++++++++
+ controller/user_search_department_test.go | 133 ++++++++++++++++++++++++++++
+ model/department.go                       |  36 ++++++
+ model/department_test.go                  |  62 ++++++++++
+ model/main.go                             |   1 +
+ model/task_cas_test.go                    |   1 +
+ model/user.go                             |  27 ++++-
+ model/user_department_test.go             |  66 ++++++++++
+ model/user_pagination_test.go             |   2 +-
+ model/user_search_filter_test.go          |  97 +++++++++++++++
+ router/api-router.go                      |  14 +++
+ 18 files changed, 1275 insertions(+), 7 deletions(-)
+```
+
+测试：多 root + 最近调用共 25 个用例（model 17、controller 8）；部门相关新增 44 个 `Test` 函数
+（model 与 controller 两包）。上游受保护的项目标识（README、LICENSE、NOTICE、`web/`、Dockerfile、
+Go module path）一律未改动；`web/` 与上游完全一致。
 
 ## 改了哪些文件
 
 | 文件 | 改动 |
 |---|---|
-| `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` 字段与三条扣费写入路径 |
-| `controller/user.go` | `CreateUser` 允许 root 建 root；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支条件 |
+| `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` 字段与三条扣费写入路径、`DepartmentId` 字段、`/api/user/search` 的过滤 SQL |
+| `model/department.go` | 新增：部门字典、名字归一与校验、`BeforeSave` |
+| `controller/user.go` | `CreateUser` 允许 root 建 root；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支条件；`SearchUsers` 部门/名字过滤；新增 `UpdateUserDepartment` |
+| `controller/department.go` | 新增：部门增删改查 |
+| `controller/department_usage.go` | 新增：部门用量聚合 |
+| `controller/audit.go` | 新增 `department.*` 审计 action 的英文模板 |
+| `router/api-router.go` | 新增 `/api/department/` 四路由、`PUT /api/user/:id/department`、`GET /api/data/departments` |
 | `service/security_verification.go` | proof action 白名单加两项 |
-| `controller/security_enrollment_test.go` | 绑定清单加两行用例 |
+| `controller/security_enrollment_test.go` | 绑定清单加用例 |
 | `model/user_multi_root_test.go` | 新增：不变量、锁行为、自删语义、并发 |
-| `controller/user_multi_root_test.go` | 新增：建号、授权/撤销、最后一个 root 保护、缺少 proof、`role=10` 提权被拒 |
 | `model/user_last_called_test.go` | 新增：三条写入路径 + 纯额度变更/退款不计入 + 编辑不覆盖 |
+| `model/department_test.go`、`model/user_department_test.go`、`model/user_search_filter_test.go` | 新增：字典 CRUD、空值语义、筛选 SQL |
+| `controller/user_multi_root_test.go` | 新增：建号、授权/撤销、最后一个 root 保护、缺少 proof、`role=10` 提权被拒 |
+| `controller/department_test.go`、`controller/user_department_test.go`、`controller/user_search_department_test.go`、`controller/department_usage_test.go` | 新增：部门接口、改归属（含越权与审计）、筛选、聚合 |
 
-新增接口能力（都在既有路由下，没有新增路由）：
+新增接口能力：
 
 - `POST /api/user/manage`（请求体 `ManageRequest`）的 `action` 多了 `grant_root`、`revoke_root`。
   请求体形如 `{"id": <目标用户 id>, "action": "grant_root"}`，需带 `X-Security-Proof`
   （scope `admin.user.manage`，context `{"user_id", "action"}`）。
 - `GET /api/user/`、`GET /api/user/search`、`GET /api/user/:id` 的响应里 `User` 多了
-  `last_called_at`（秒级 Unix 时间，`0` 表示从未调用）。
+  `last_called_at`（秒级 Unix 时间，`0` 表示从未调用）与 `department_id`（`null` 表示未分配）。
+- `GET|POST|PUT /api/department/`、`DELETE /api/department/:id`：部门字典读写。
+- `PUT /api/user/:id/department`：改单个用户的部门归属。
+- `GET /api/data/departments`：部门用量聚合，`members`/`keys`/`calls`/`tokens`/`quota`。
 
 调用约定：`grant_root` 只有 root 能调，`revoke_root` 受「至少留一个启用 root」约束；两者都要求
-目标用户存在且状态合法。
+目标用户存在且状态合法。部门的写操作与改归属都受 `canManageTargetRole` 约束（同级或更高角色的
+账号不可操作）。
 
 ## 用法
 
@@ -176,13 +246,13 @@ git checkout -b fork-full origin/main
 fork/scripts/apply.sh
 ```
 
-全部 9 个补丁按文件名顺序 `git am --3way` 应用，成功时逐个打印 `ok`，最后以 `done.` 结束。
+全部 15 个补丁按文件名顺序 `git am --3way` 应用，成功时逐个打印 `ok`，最后以 `done.` 结束。
 
 > **只能应用一次。** 补丁已应用后再跑会失败并进入 `git am` 冲突态（脚本报
 > `conflict or already applied`）——因为补丁要新建的文件已在工作区。判断是否已应用请看历史：
 >
 > ```bash
-> git log --oneline -9          # 已应用则应看到 9 条补丁提交
+> git log --oneline -15         # 已应用则应看到 15 条补丁提交
 > git am --abort                # 若已误触发冲突态，用这个退出
 > ```
 >
@@ -252,6 +322,11 @@ fork/scripts/build.sh /path/to/new-api my-tag-1    # 自定义源码路径与 ta
 镜像名前缀与默认 tag 是脚本内置值，按自己的部署习惯覆盖即可。构建时间包含一次 `bun install`
 加前端构建（Dockerfile 第一阶段），不能跳过。
 
+> **默认 tag `rc.49-tm1` 已落后于补丁集，部署时请显式传 tag。** 三组补丁对应的 tag 约定见
+> `token-master2/deploy/.env.example`：`tm1`=多 root，`tm2`=加最近调用，`tm3`=加部门。
+> 当前 15 个补丁全部应用后的产物应打成 `rc.49-tm3` 这类名字；跑 `tm1`/`tm2` 镜像会让部门列、
+> 部门筛选与聚合接口整块 404。
+
 构建期要从镜像仓库拉基础镜像、从 Go proxy 拉模块，国内网络通常不通。用环境变量显式传代理，
 **不要**指望 shell 里的 `HTTPS_PROXY` 自动生效：
 
@@ -265,16 +340,19 @@ TM_BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.
 > **默认 tag 里的 `rc.49` 只是沿用部署侧命名习惯，不代表源码基线是上游 `v1.0.0-rc.49`。**
 > 上线前必须跑完整回归，不能假设与某个上游 release 等价。
 
-## 测试覆盖不到的三个点
+## 测试覆盖不到的四点
 
-自动化测试（25 个用例）覆盖了不变量、写路径与接口行为，但以下三项只能人工验证：
+自动化测试覆盖了不变量、写路径与接口行为，但以下四项只能人工验证：
 
 1. **`revoke_root` 的 Casbin override 清理**：现有测试无法区分「走了 `demote` 分支」与「走了
    `else` 分支」，两条都会把 role 写成 1。唯一手段是在 Postgres 上直接查 `casbin_rule`
    （目标用户先 `SetUserPermissions`，撤销后应无 override）。
 2. **`last_called_at` 的端到端可见性**：需要真实扣费后查库，确认时间戳是秒级真实时刻，
    且管理员充值、退款不会刷新它。
-3. **前端渲染**：本仓库前端未改动，若在自己前端展示该列，属另一侧的验证。
+3. **部门用量聚合的数字正确性**：测试用的是造出来的 `quota_data`/`tokens` 行，能验证 CTE 结构与
+   零成员部门不丢失，但真实库里「一个用户多把秘钥」「跨部门迁移后历史流水仍记在旧账上」等
+   形态要拿生产数据抽样核对。特别地，`keys` 只统计成员**当前**拥有的有效秘钥数。
+4. **前端渲染**：本仓库前端未改动，若在自己前端展示这些字段/接口，属另一侧的验证。
 
 ## 标记约定
 
@@ -284,9 +362,10 @@ TM_BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.
 // [TM-FORK] <一句话说明为什么这块和上游不同>
 ```
 
-9 个补丁全部应用后共 24 处、5 个文件。在只含 0008-0009 的 `main` 上只能 grep 到 10 处
-（`model/user.go` 4 处、`model/user_last_called_test.go` 6 处），这是正常的——多 root 的标记
-只在补丁里。完整清单：
+9 个补丁全部应用后共 24 处、5 个文件。加上部门补丁（0010-0015）后，15 个补丁共 46 处、10 个文件。
+在只含 0008-0009 的 `main` 上只能 grep 到 10 处
+（`model/user.go` 4 处、`model/user_last_called_test.go` 6 处），这是正常的——多 root 与部门的
+标记只在补丁里。完整清单：
 
 ```bash
 grep -rn "\[TM-FORK\]" --include="*.go" .
@@ -310,15 +389,22 @@ fork/scripts/verify.sh
 git format-patch -o fork/patches <new-baseline>..HEAD -- . ':!fork'
 ```
 
+> 这条命令用范围导出，产物 subject 带 `[PATCH n/m]` 前缀；而本目录现有补丁是逐个提交
+> `git format-patch --no-signature --stdout -1 <sha>` 导出的，subject 是 plain `[PATCH]`。
+> 重导出后请统一成一种，否则同一目录里两种风格并存。
+
 冲突优先级（按概率降序）：`ManageUser` 的 switch → `UpdateWithTx`/`delete` → 白名单 →
-`CreateUser` 的等级检查。
+`CreateUser` 的等级检查 → `SearchUsers`/`GetAllUsers`（部门筛选改了 SQL）→ `router/api-router.go`
+（三组补丁都在同一处插路由）。
 
 处理原则：
 
 - 先接受上游版本，再按 `// [TM-FORK]` 逐块重落补丁。
 - 守卫**永远**在事务内、永远在写之前，不因上游重构挪到控制器。
 - `adminUserManageActions` 是白名单，上游新增 action 时**取并集**。
-- 升级后重跑 `verify.sh`，并人工验证上面「测试覆盖不到」的三项。仅编译通过不算成功。
+- 部门相关的手写 SQL（删除计数、用量聚合）都写 `department`（单数），`Department.TableName()`
+  必须保持单数，否则上游若改动默认命名策略会静默错表。
+- 升级后重跑 `verify.sh`，并人工验证上面「测试覆盖不到」的四项。仅编译通过不算成功。
 
 ## 已知限制（有意不修）
 

@@ -1,0 +1,402 @@
+From 193b2afae0626d32866cac4ebc3d5654d36748b5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=82=B5=E5=BA=B7?= <shaokang@schkzy.cn>
+Date: Mon, 16 Nov 2026 11:08:35 +0800
+Subject: [PATCH] feat(user): filter by department/name, scope soft-delete,
+ return new id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[TM-FORK] 三项管理端需要的改动：
+
+1. SearchUsers 加 department_id / username / display_name 三个精确条件。
+   keyword 是 LIKE 模糊匹配，下拉选 alice 会顺带带出 alicia，BFF 原来靠全量扫描
+   再本地 === 过滤补这个语义；扫描删掉后必须有人接住。
+2. 未指定 status 时收口成 deleted_at IS NULL。原实现用 Unscoped()，
+   软删用户既进 items 也计入 total，管理端只好自己两次 count 相减 ——
+   total 与 items 不同源时列表会出现「本页 1 条但 total 说 5 条」。
+3. CreateUser 白名单加 DepartmentId（漏了就是接口回 success 但部门没落库），
+   部门存在性预检放在事务之前（被拒时 users 表不得新增行），响应补 data.id ——
+   BFF 建号后要立刻写 user_profile.phone，原来只能按 username 回查，匹配不上就丢档案。
+---
+ controller/security_enrollment_test.go    |   2 +-
+ controller/user.go                        |  32 +++++-
+ controller/user_search_department_test.go | 133 ++++++++++++++++++++++
+ model/user.go                             |  17 ++-
+ model/user_pagination_test.go             |   2 +-
+ model/user_search_filter_test.go          |  97 ++++++++++++++++
+ 6 files changed, 279 insertions(+), 4 deletions(-)
+ create mode 100644 controller/user_search_department_test.go
+ create mode 100644 model/user_search_filter_test.go
+
+diff --git a/controller/security_enrollment_test.go b/controller/security_enrollment_test.go
+index 211eae5cd..622550086 100644
+--- a/controller/security_enrollment_test.go
++++ b/controller/security_enrollment_test.go
+@@ -76,7 +76,7 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
+ 	var version string
+ 	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+ 	t.Logf("database: %s %s", dialect, version)
+-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.AuthFlow{}, &model.UserOAuthBinding{}, &model.Option{}, &model.UserAccessToken{}, &model.Department{}))
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.TwoFA{}, &model.TwoFABackupCode{}, &model.PasskeyCredential{}, &model.AuthFlow{}, &model.UserOAuthBinding{}, &model.Option{}, &model.UserAccessToken{}, &model.Department{}, &model.CasbinRule{}, &model.AuthzRole{}))
+ 	require.NoError(t, logDB.AutoMigrate(&model.AuditLog{}))
+ 	model.DB, model.LOG_DB = db, logDB
+ 	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
+diff --git a/controller/user.go b/controller/user.go
+index 4108b42c6..21c20b8cc 100644
+--- a/controller/user.go
++++ b/controller/user.go
+@@ -366,9 +366,22 @@ func SearchUsers(c *gin.Context) {
+ 			status = &parsed
+ 		}
+ 	}
++	// [TM-FORK] 部门 / 账号 / 显示名精确筛选
++	var departmentID *int
++	if v := strings.TrimSpace(c.Query("department_id")); v != "" {
++		parsed, err := strconv.Atoi(v)
++		if err != nil || parsed <= 0 {
++			// 非法 id 直接 400，不静默忽略：否则「筛了但没筛」会让运营以为部门下真的没用户。
++			common.ApiErrorT(c, "Invalid parameters")
++			return
++		}
++		departmentID = &parsed
++	}
++	username := strings.TrimSpace(c.Query("username"))
++	displayName := strings.TrimSpace(c.Query("display_name"))
+ 	pageInfo := common.GetPageQuery(c)
+ 	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
+-	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
++	users, total, err := model.SearchUsers(keyword, group, role, status, departmentID, username, displayName, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
+ 	if err != nil {
+ 		common.ApiError(c, err)
+ 		return
+@@ -1037,6 +1050,20 @@ func CreateUser(c *gin.Context) {
+ 		Password:    user.Password,
+ 		DisplayName: user.DisplayName,
+ 		Role:        user.Role, // 保持管理员设置的角色
++		// [TM-FORK] 部门归属随建号一并写上游，与 users 同一事务
++		DepartmentId: user.DepartmentId,
++	}
++	// [TM-FORK] 部门不存在是最常见的可预见失败，在开启事务前挡掉（被拒时 users 表不得新增行）
++	if user.DepartmentId != nil {
++		var exists int64
++		if err := model.DB.Model(&model.Department{}).Where("id = ?", *user.DepartmentId).Count(&exists).Error; err != nil {
++			common.ApiError(c, err)
++			return
++		}
++		if exists == 0 {
++			common.ApiErrorT(c, "Department not found")
++			return
++		}
+ 	}
+ 	authzTouched := false
+ 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+@@ -1061,9 +1088,12 @@ func CreateUser(c *gin.Context) {
+ 
+ 	auditParams["username"] = cleanUser.Username
+ 	recordManageAuditFor(c, cleanUser.Id, "user.create", auditParams)
++	// [TM-FORK] 返回新用户 id：BFF 建号后要立刻写 token_master.user_profile.phone，
++	// 原来只能靠 /api/user/search 按 username 精确匹配回查，匹配不上就丢档案。
+ 	c.JSON(http.StatusOK, gin.H{
+ 		"success": true,
+ 		"message": "",
++		"data":    gin.H{"id": cleanUser.Id},
+ 	})
+ 	return
+ }
+diff --git a/controller/user_search_department_test.go b/controller/user_search_department_test.go
+new file mode 100644
+index 000000000..e84feb148
+--- /dev/null
++++ b/controller/user_search_department_test.go
+@@ -0,0 +1,133 @@
++package controller
++
++import (
++	"net/http"
++	"strconv"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/service/authz"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func setupUserSearchControllerTest(t *testing.T) (*model.User, service.AuthIdentity) {
++	t.Helper()
++	operator, identity, _ := setupAdminUserTest(t)
++	require.NoError(t, model.DB.Exec("DELETE FROM department").Error)
++	// CreateUser 建普通用户会顺带清一次用户权限并刷新 authz 策略，
++	// 测试环境需要把这两张表和 enforcer 准备好，否则接口回 500。
++	require.NoError(t, model.DB.AutoMigrate(&model.SystemTask{}))
++	require.NoError(t, authz.Init(model.DB))
++	return operator, identity
++}
++
++func TestSearchUsersRejectsInvalidDepartmentId(t *testing.T) {
++	_, identity := setupUserSearchControllerTest(t)
++	for _, raw := range []string{"abc", "0", "-3"} {
++		response, resp := departmentRequest(t, http.MethodGet,
++			"/api/user/search?department_id="+raw, "", nil, SearchUsers)
++		assert.Equal(t, http.StatusOK, response.Code)
++		assert.Equal(t, false, resp["success"], "department_id=%s 必须显式报错而不是静默忽略", raw)
++		assert.Equal(t, "Invalid parameters", resp["message"], "department_id=%s", raw)
++	}
++	_ = identity
++}
++
++func TestSearchUsersUnknownDepartmentReturnsEmptyPage(t *testing.T) {
++	setupUserSearchControllerTest(t)
++	response, resp := departmentRequest(t, http.MethodGet,
++		"/api/user/search?department_id=999999", "", nil, SearchUsers)
++	assert.Equal(t, http.StatusOK, response.Code)
++	assert.Equal(t, true, resp["success"], "message=%v", resp["message"])
++	data := resp["data"].(map[string]any)
++	assert.EqualValues(t, 0, data["total"])
++	assert.Empty(t, data["items"])
++}
++
++func TestSearchUsersUsernameFilterIsExact(t *testing.T) {
++	_, identity := setupUserSearchControllerTest(t)
++	require.NoError(t, model.DB.Create(&model.User{
++		Username: "bob", Password: "password123", DisplayName: "Bob",
++		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "bob-aff",
++	}).Error)
++
++	_, resp := departmentRequest(t, http.MethodGet,
++		"/api/user/search?username=managed-user", "", nil, SearchUsers)
++	assert.Equal(t, true, resp["success"], "message=%v", resp["message"])
++	items := resp["data"].(map[string]any)["items"].([]any)
++	require.Len(t, items, 1)
++	assert.Equal(t, "managed-user", items[0].(map[string]any)["username"])
++	_ = identity
++}
++
++func TestCreateUserReturnsIdAndStoresDepartment(t *testing.T) {
++	_, identity := setupUserSearchControllerTest(t)
++	dept := &model.Department{Name: "技术部"}
++	require.NoError(t, model.DB.Save(dept).Error)
++
++	// role < 10 不触发 step-up，无需 proof
++	body := `{"username":"dept-create","password":"password-123","department_id":` + strconv.Itoa(dept.Id) + `}`
++	response := adminUserRequest(http.MethodPost, "/api/user/", body, "", identity, common.RoleRootUser, nil, CreateUser)
++
++	var result struct {
++		Success bool           `json:"success"`
++		Message string         `json:"message"`
++		Data    map[string]any `json:"data"`
++	}
++	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
++	require.True(t, result.Success, "message=%s", result.Message)
++
++	newId, ok := result.Data["id"].(float64)
++	require.True(t, ok, "响应必须带 data.id，实际 data=%v", result.Data)
++	require.Greater(t, newId, float64(0))
++
++	stored, err := model.GetUserById(int(newId), false)
++	require.NoError(t, err)
++	require.NotNil(t, stored.DepartmentId)
++	assert.Equal(t, dept.Id, *stored.DepartmentId)
++}
++
++func TestCreateUserWithoutDepartmentStillReturnsId(t *testing.T) {
++	_, identity := setupUserSearchControllerTest(t)
++	body := `{"username":"plain-create","password":"password-123"}`
++	response := adminUserRequest(http.MethodPost, "/api/user/", body, "", identity, common.RoleRootUser, nil, CreateUser)
++
++	var result struct {
++		Success bool   `json:"success"`
++		Message string `json:"message"`
++		Data    struct {
++			Id float64 `json:"id"`
++		} `json:"data"`
++	}
++	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
++	require.True(t, result.Success, "message=%s", result.Message)
++	require.Greater(t, result.Data.Id, float64(0))
++
++	stored, err := model.GetUserById(int(result.Data.Id), false)
++	require.NoError(t, err)
++	assert.Nil(t, stored.DepartmentId)
++}
++
++func TestCreateUserRejectsUnknownDepartmentWithoutInsertingRow(t *testing.T) {
++	_, identity := setupUserSearchControllerTest(t)
++	var before int64
++	require.NoError(t, model.DB.Model(&model.User{}).Count(&before).Error)
++
++	body := `{"username":"ghost-dept","password":"password-123","department_id":999999}`
++	response := adminUserRequest(http.MethodPost, "/api/user/", body, "", identity, common.RoleRootUser, nil, CreateUser)
++
++	var result struct {
++		Success bool   `json:"success"`
++		Message string `json:"message"`
++	}
++	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
++	assert.False(t, result.Success)
++	assert.Equal(t, "Department not found", result.Message)
++
++	var after int64
++	require.NoError(t, model.DB.Model(&model.User{}).Count(&after).Error)
++	assert.EqualValues(t, before, after, "被拒时 users 表不得新增行")
++}
+diff --git a/model/user.go b/model/user.go
+index 2db56f7d7..86c128fe2 100644
+--- a/model/user.go
++++ b/model/user.go
+@@ -441,7 +441,8 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
+ 	return users, total, nil
+ }
+ 
+-func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
++// [TM-FORK] 新增 departmentID / username / displayName 三个可选精确条件。
++func SearchUsers(keyword string, group string, role *int, status *int, departmentID *int, username string, displayName string, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
+ 	var users []*User
+ 	var total int64
+ 	var err error
+@@ -479,12 +480,26 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx
+ 	if role != nil {
+ 		query = query.Where("role = ?", *role)
+ 	}
++	// [TM-FORK] 管理端的部门 / 账号 / 显示名精确筛选
++	if departmentID != nil {
++		query = query.Where("department_id = ?", *departmentID)
++	}
++	if username != "" {
++		query = query.Where("username = ?", username)
++	}
++	if displayName != "" {
++		query = query.Where("display_name = ?", displayName)
++	}
++	// [TM-FORK] status 未指定时只返回未删除用户，total 与 items 同源。
++	// 原实现用 Unscoped() 把软删除用户也算进 total，管理端必须自己相减修正。
+ 	if status != nil {
+ 		if *status == -1 {
+ 			query = query.Where("deleted_at IS NOT NULL")
+ 		} else {
+ 			query = query.Where("deleted_at IS NULL").Where("status = ?", *status)
+ 		}
++	} else {
++		query = query.Where("deleted_at IS NULL")
+ 	}
+ 
+ 	// 获取总数
+diff --git a/model/user_pagination_test.go b/model/user_pagination_test.go
+index 1164019fd..2e5e9f2f3 100644
+--- a/model/user_pagination_test.go
++++ b/model/user_pagination_test.go
+@@ -59,7 +59,7 @@ func TestSearchUsersSortsBeforePagination(t *testing.T) {
+ 	truncateTables(t)
+ 	insertUsersForPaginationTest(t, 42)
+ 
+-	users, total, err := SearchUsers("user", "", nil, nil, 20, 20, NewUserSortOptions("id", "asc"))
++	users, total, err := SearchUsers("user", "", nil, nil, nil, "", "", 20, 20, NewUserSortOptions("id", "asc"))
+ 	require.NoError(t, err)
+ 	assert.Equal(t, int64(42), total)
+ 	assert.Equal(t, []int{21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40}, collectUserIDs(users))
+diff --git a/model/user_search_filter_test.go b/model/user_search_filter_test.go
+new file mode 100644
+index 000000000..1183318ec
+--- /dev/null
++++ b/model/user_search_filter_test.go
+@@ -0,0 +1,97 @@
++package model
++
++import (
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func insertFilterUser(t *testing.T, username, displayName string, deptId *int) *User {
++	t.Helper()
++	user := &User{
++		Username: username, Password: "password123",
++		DisplayName: displayName, Role: common.RoleCommonUser,
++		Status: common.UserStatusEnabled, Group: "default",
++		AffCode: username + "-aff", DepartmentId: deptId,
++	}
++	require.NoError(t, DB.Create(user).Error)
++	return user
++}
++
++func TestSearchUsersFiltersByDepartmentId(t *testing.T) {
++	truncateTables(t)
++	deptId := 3
++	insertFilterUser(t, "in-dept", "在部门", &deptId)
++	insertFilterUser(t, "no-dept", "无部门", nil)
++
++	users, total, err := SearchUsers("", "", nil, nil, &deptId, "", "", 0, 10)
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, total)
++	require.Len(t, users, 1)
++	assert.Equal(t, "in-dept", users[0].Username)
++}
++
++func TestSearchUsersUsernameIsExactMatch(t *testing.T) {
++	truncateTables(t)
++	insertFilterUser(t, "alice", "Alice", nil)
++	insertFilterUser(t, "alicia", "Alicia", nil)
++
++	users, total, err := SearchUsers("", "", nil, nil, nil, "alice", "", 0, 10)
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, total, "精确匹配不能带出 alicia")
++	require.Len(t, users, 1)
++	assert.Equal(t, "alice", users[0].Username)
++}
++
++func TestSearchUsersDisplayNameIsExactMatch(t *testing.T) {
++	truncateTables(t)
++	insertFilterUser(t, "zs1", "张三", nil)
++	insertFilterUser(t, "zs2", "张三丰", nil)
++
++	users, total, err := SearchUsers("", "", nil, nil, nil, "", "张三", 0, 10)
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, total)
++	require.Len(t, users, 1)
++	assert.Equal(t, "zs1", users[0].Username)
++}
++
++func TestSearchUsersDefaultExcludesSoftDeletedFromItemsAndTotal(t *testing.T) {
++	truncateTables(t)
++	insertFilterUser(t, "alive", "活着", nil)
++	gone := insertFilterUser(t, "gone", "已注销", nil)
++	require.NoError(t, DB.Delete(&User{}, gone.Id).Error)
++
++	users, total, err := SearchUsers("", "", nil, nil, nil, "", "", 0, 10)
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, total, "total 必须与 items 同源，否则列表出现空页")
++	assert.Len(t, users, 1)
++	assert.Equal(t, "alive", users[0].Username)
++}
++
++func TestSearchUsersStatusMinusOneReturnsOnlySoftDeleted(t *testing.T) {
++	truncateTables(t)
++	insertFilterUser(t, "alive2", "活着", nil)
++	gone := insertFilterUser(t, "gone2", "已注销", nil)
++	require.NoError(t, DB.Delete(&User{}, gone.Id).Error)
++
++	minusOne := -1
++	users, total, err := SearchUsers("", "", nil, &minusOne, nil, "", "", 0, 10)
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, total)
++	require.Len(t, users, 1)
++	assert.Equal(t, "gone2", users[0].Username)
++}
++
++func TestSearchUsersStatusEnabledExcludesSoftDeleted(t *testing.T) {
++	truncateTables(t)
++	insertFilterUser(t, "enabled-one", "启用", nil)
++	gone := insertFilterUser(t, "deleted-one", "已注销", nil)
++	require.NoError(t, DB.Delete(&User{}, gone.Id).Error)
++
++	enabled := common.UserStatusEnabled
++	_, total, err := SearchUsers("", "", nil, &enabled, nil, "", "", 0, 10)
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, total)
++}
