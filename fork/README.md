@@ -252,16 +252,15 @@ docker run --rm \
 ### 构建镜像
 
 ```bash
-fork/scripts/build.sh                              # 默认 tag：rc.49-tm1
+fork/scripts/build.sh                              # 默认 tag：rc.49-tm3
 fork/scripts/build.sh /path/to/new-api my-tag-1    # 自定义源码路径与 tag
 ```
 
 构建时间包含一次 `bun install` 加前端构建（Dockerfile 第一阶段），不能跳过。
 
-> **默认 tag `rc.49-tm1` 落后于定制集。** 部署时请显式传 tag。三组定制对应的 tag 约定见
-> `token-master2/deploy/.env.example`：`tm1`=多 root，`tm2`=加最近调用，`tm3`=加部门。
-> 当前三组全在的产物应打成 `rc.49-tm3` 这类名字；跑 `tm1`/`tm2` 镜像会让部门列、部门筛选与
-> 聚合接口整块 404。
+> **tag 约定见 `token-master2/deploy/.env.example`**：`tm1`=多 root，`tm2`=加最近调用，
+> `tm3`=加部门。源码里三组定制恒在，所以默认 tag 是 `rc.49-tm3`。**不要打 `tm1`/`tm2`**——
+> 源码不会退回中间状态，打小号 tag 只会让部署侧误判，跑起来部门列、部门筛选与聚合接口整块 404。
 
 国内网络通常拉不到 registry 与 Go proxy，用环境变量显式传代理，**不要**指望 shell 里的
 `HTTPS_PROXY` 自动生效：

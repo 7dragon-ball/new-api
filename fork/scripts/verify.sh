@@ -5,12 +5,12 @@
 # 只在 Dockerfile 第一阶段构建后存在。裸 `go build ./...` 会因此失败。
 set -euo pipefail
 
-UPSTREAM="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
+SRC="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 # 复用同一个 module cache，避免每次重下依赖（首次约 2-4 分钟）
 MODCACHE_VOLUME="${TM_GOMOD_VOLUME:-tm-gomod}"
 
 docker run --rm \
-  -v "$UPSTREAM":/src \
+  -v "$SRC":/src \
   -v "$MODCACHE_VOLUME":/go/pkg/mod \
   -w /src \
   -e GOWORK=off \

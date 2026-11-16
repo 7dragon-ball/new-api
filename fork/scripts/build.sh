@@ -5,11 +5,11 @@
 # 第二阶段才编 Go。因此构建时间包含一次 bun install + 前端构建，不能跳过。
 set -euo pipefail
 
-UPSTREAM="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
+SRC="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 # 源码里三组定制（tm1 多 root / tm2 最近调用 / tm3 部门）恒在，不再有「只应用了前几组」的中间态。
 TAG="${2:-rc.49-tm3}"
 
-cd "$UPSTREAM"
+cd "$SRC"
 
 # 构建期要从 registry 拉基础镜像、从 proxy.golang.org 拉 Go 模块，国内网络通常都不通。
 # 用 TM_BUILD_PROXY 显式传代理，绝不读 shell 里的 $HTTPS_PROXY——宿主机上代理监听在
@@ -24,7 +24,7 @@ else
   echo "==> build proxy: (none). 若拉取超时，用 TM_BUILD_PROXY=http://<宿主可达IP>:<端口> 重跑"
 fi
 
-echo "==> building token-master/new-api:${TAG} from ${UPSTREAM}"
+echo "==> building token-master/new-api:${TAG} from ${SRC}"
 docker build ${build_args[@]+"${build_args[@]}"} -t "token-master/new-api:${TAG}" .
 
 echo "built token-master/new-api:${TAG}"
