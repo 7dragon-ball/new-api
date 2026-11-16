@@ -1391,6 +1391,49 @@ type UpdateUserSettingRequest struct {
 	RecordIpLog                      bool    `json:"record_ip_log"`
 }
 
+// [TM-FORK] PUT /api/user/:id/department  请求体 {"department_id": 2} 或 {"department_id": null}
+// 独立接口而不复用 PUT /api/user/：后者是整行替换语义，上游 UI 不传 department_id 就会把它清空。
+func UpdateUserDepartment(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	if _, err := model.GetUserById(id, false); err != nil {
+		common.ApiErrorT(c, "User not found")
+		return
+	}
+	var req struct {
+		DepartmentID *int `json:"department_id"`
+	}
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	// null 表示清空，跳过部门存在性校验
+	if req.DepartmentID != nil {
+		var exists int64
+		if err := model.DB.Model(&model.Department{}).Where("id = ?", *req.DepartmentID).Count(&exists).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if exists == 0 {
+			common.ApiErrorT(c, "Department not found")
+			return
+		}
+	}
+	// 直接写列，绕开 UpdateWithTx：那里是全字段 Updates，会把整行按内存值回写。
+	// 显式 nil 写成 NULL 是这里唯一的目的。
+	if err := model.DB.Model(&model.User{}).Where("id = ?", id).
+		Update("department_id", req.DepartmentID).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	recordManageAuditFor(c, id, "user.department_update",
+		map[string]any{"id": id, "department_id": req.DepartmentID})
+	common.ApiSuccess(c, nil)
+}
+
 func UpdateUserSetting(c *gin.Context) {
 	var req UpdateUserSettingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

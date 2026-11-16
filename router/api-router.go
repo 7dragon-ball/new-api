@@ -164,6 +164,8 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.POST("/", controller.CreateUser)
 				adminRoute.POST("/manage", controller.ManageUser)
 				adminRoute.PUT("/", controller.UpdateUser)
+				// [TM-FORK] 改部门归属：独立接口，避免整行替换语义清空部门
+				adminRoute.PUT("/:id/department", controller.UpdateUserDepartment)
 				adminRoute.DELETE("/:id", controller.DeleteUser)
 				adminRoute.DELETE("/:id/reset_passkey", controller.AdminResetPasskey)
 

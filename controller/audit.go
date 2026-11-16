@@ -48,9 +48,10 @@ var auditContentTemplates = map[string]string{
 	"option.update":             "Updated system setting ${key}",
 
 	// [TM-FORK] 部门字典（部门归属已迁进网关库，CRUD 由本 fork 提供）
-	"department.create": "Created department ${name} (ID: ${id})",
-	"department.update": "Renamed department to ${name} (ID: ${id})",
-	"department.delete": "Deleted department ${name} (ID: ${id})",
+	"department.create":      "Created department ${name} (ID: ${id})",
+	"department.update":      "Renamed department to ${name} (ID: ${id})",
+	"department.delete":      "Deleted department ${name} (ID: ${id})",
+	"user.department_update": "Changed department of user (ID: ${id}) to ${department_id}",
 
 	"option.passkey_domains":           "Updated Passkey domains: removed ${domains}; affected ${known}; unknown ${unknown}",
 	"option.passkey_domains_confirmed": "Confirmed removal of Passkey domains: ${domains}; affected ${known}; unknown ${unknown}",
