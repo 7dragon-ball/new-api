@@ -1,0 +1,104 @@
+From 8a4791f875361e277ad6cb8aca8152abd8a7ecdc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=82=B5=E5=BA=B7?= <shaokang@schkzy.cn>
+Date: Fri, 13 Nov 2026 17:03:50 +0800
+Subject: [PATCH 2/7] feat(model): reject removing the last enabled root in
+ UpdateWithTx
+
+---
+ model/user.go                 | 10 ++++++
+ model/user_multi_root_test.go | 61 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/model/user.go b/model/user.go
+index 75ab47e94..85a929ba9 100644
+--- a/model/user.go
++++ b/model/user.go
+@@ -892,6 +892,16 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
+ 		(newUser.Role != 0 && current.Role != newUser.Role) ||
+ 		(newUser.Status != 0 && current.Status != newUser.Status) ||
+ 		(newUser.Group != "" && current.Group != newUser.Group)
++	// [TM-FORK] 多 root 不变量：只有「目标当前是 root，且这次要把它改成非 root
++	// 或改成禁用」时才需要校验。外层的 current.Role 判断只是廉价预筛，真正的
++	// 判定（目标是否仍是启用中的 root、剩下几个）在加锁后的数据上重做。
++	if current.Role == common.RoleRootUser &&
++		((newUser.Role != 0 && newUser.Role != common.RoleRootUser) ||
++			(newUser.Status != 0 && newUser.Status != common.UserStatusEnabled)) {
++		if err = ensureEnabledRootSurvivesWithTx(tx, user.Id, newUser.Role, newUser.Status, false); err != nil {
++			return err
++		}
++	}
+ 	if authChanged {
+ 		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
+ 		if err != nil {
+diff --git a/model/user_multi_root_test.go b/model/user_multi_root_test.go
+index 1f635bf5b..cfee2a1a6 100644
+--- a/model/user_multi_root_test.go
++++ b/model/user_multi_root_test.go
+@@ -61,3 +61,64 @@ func TestLockEnabledRootIDsEmitsRowLockAndSkipsDeleted(t *testing.T) {
+ 	assert.Contains(t, sql, "FOR UPDATE")
+ 	assert.Contains(t, sql, "deleted_at IS NULL")
+ }
++
++func TestLastEnabledRootUserCannotBeDemoted(t *testing.T) {
++	setupUserUpdateTestState(t)
++	root := createTestRootUser(t, "only-root", common.UserStatusEnabled)
++
++	change := User{Id: root.Id, Role: common.RoleCommonUser}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		return change.UpdateWithTx(tx, false)
++	})
++	require.ErrorIs(t, err, ErrLastEnabledRootUser)
++
++	var after User
++	require.NoError(t, DB.First(&after, root.Id).Error)
++	assert.Equal(t, common.RoleRootUser, after.Role)
++	assert.EqualValues(t, 1, after.AuthVersion)
++}
++
++func TestLastEnabledRootUserCannotBeDisabled(t *testing.T) {
++	setupUserUpdateTestState(t)
++	root := createTestRootUser(t, "only-root", common.UserStatusEnabled)
++
++	change := User{Id: root.Id, Status: common.UserStatusDisabled}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		return change.UpdateWithTx(tx, false)
++	})
++	require.ErrorIs(t, err, ErrLastEnabledRootUser)
++
++	var after User
++	require.NoError(t, DB.First(&after, root.Id).Error)
++	assert.Equal(t, common.UserStatusEnabled, after.Status)
++}
++
++func TestDemotingOneOfTwoRootsSucceeds(t *testing.T) {
++	setupUserUpdateTestState(t)
++	first := createTestRootUser(t, "root-a", common.UserStatusEnabled)
++	createTestRootUser(t, "root-b", common.UserStatusEnabled)
++
++	change := User{Id: first.Id, Role: common.RoleCommonUser}
++	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
++		return change.UpdateWithTx(tx, false)
++	}))
++
++	var after User
++	require.NoError(t, DB.First(&after, first.Id).Error)
++	assert.Equal(t, common.RoleCommonUser, after.Role)
++}
++
++func TestGuardedUpdateLeavesNonRootUserAlone(t *testing.T) {
++	setupUserUpdateTestState(t)
++	createTestRootUser(t, "only-root", common.UserStatusEnabled)
++	member := createAccessTokenTestUser(t, "plain-user")
++
++	change := User{Id: member.Id, Role: common.RoleAdminUser}
++	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
++		return change.UpdateWithTx(tx, false)
++	}))
++
++	var after User
++	require.NoError(t, DB.First(&after, member.Id).Error)
++	assert.Equal(t, common.RoleAdminUser, after.Role)
++}
+-- 
+2.49.0
+
