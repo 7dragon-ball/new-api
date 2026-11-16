@@ -441,7 +441,8 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 	return users, total, nil
 }
 
-func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
+// [TM-FORK] 新增 departmentID / username / displayName 三个可选精确条件。
+func SearchUsers(keyword string, group string, role *int, status *int, departmentID *int, username string, displayName string, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
 	var users []*User
 	var total int64
 	var err error
@@ -479,12 +480,26 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	if role != nil {
 		query = query.Where("role = ?", *role)
 	}
+	// [TM-FORK] 管理端的部门 / 账号 / 显示名精确筛选
+	if departmentID != nil {
+		query = query.Where("department_id = ?", *departmentID)
+	}
+	if username != "" {
+		query = query.Where("username = ?", username)
+	}
+	if displayName != "" {
+		query = query.Where("display_name = ?", displayName)
+	}
+	// [TM-FORK] status 未指定时只返回未删除用户，total 与 items 同源。
+	// 原实现用 Unscoped() 把软删除用户也算进 total，管理端必须自己相减修正。
 	if status != nil {
 		if *status == -1 {
 			query = query.Where("deleted_at IS NOT NULL")
 		} else {
 			query = query.Where("deleted_at IS NULL").Where("status = ?", *status)
 		}
+	} else {
+		query = query.Where("deleted_at IS NULL")
 	}
 
 	// 获取总数

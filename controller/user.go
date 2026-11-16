@@ -366,9 +366,22 @@ func SearchUsers(c *gin.Context) {
 			status = &parsed
 		}
 	}
+	// [TM-FORK] 部门 / 账号 / 显示名精确筛选
+	var departmentID *int
+	if v := strings.TrimSpace(c.Query("department_id")); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed <= 0 {
+			// 非法 id 直接 400，不静默忽略：否则「筛了但没筛」会让运营以为部门下真的没用户。
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		departmentID = &parsed
+	}
+	username := strings.TrimSpace(c.Query("username"))
+	displayName := strings.TrimSpace(c.Query("display_name"))
 	pageInfo := common.GetPageQuery(c)
 	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
-	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
+	users, total, err := model.SearchUsers(keyword, group, role, status, departmentID, username, displayName, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1037,6 +1050,20 @@ func CreateUser(c *gin.Context) {
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
 		Role:        user.Role, // 保持管理员设置的角色
+		// [TM-FORK] 部门归属随建号一并写上游，与 users 同一事务
+		DepartmentId: user.DepartmentId,
+	}
+	// [TM-FORK] 部门不存在是最常见的可预见失败，在开启事务前挡掉（被拒时 users 表不得新增行）
+	if user.DepartmentId != nil {
+		var exists int64
+		if err := model.DB.Model(&model.Department{}).Where("id = ?", *user.DepartmentId).Count(&exists).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if exists == 0 {
+			common.ApiErrorT(c, "Department not found")
+			return
+		}
 	}
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
@@ -1061,9 +1088,12 @@ func CreateUser(c *gin.Context) {
 
 	auditParams["username"] = cleanUser.Username
 	recordManageAuditFor(c, cleanUser.Id, "user.create", auditParams)
+	// [TM-FORK] 返回新用户 id：BFF 建号后要立刻写 token_master.user_profile.phone，
+	// 原来只能靠 /api/user/search 按 username 精确匹配回查，匹配不上就丢档案。
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
+		"data":    gin.H{"id": cleanUser.Id},
 	})
 	return
 }
