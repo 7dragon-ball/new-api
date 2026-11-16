@@ -107,9 +107,13 @@ type User struct {
 	LinuxDOId            string         `json:"linux_do_id" gorm:"column:linux_do_id;index"`
 	Setting              string         `json:"setting" gorm:"type:text;column:setting"`
 	Remark               string         `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
-	StripeCustomer       string         `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
-	CreatedAt            int64          `json:"created_at" gorm:"autoCreateTime;column:created_at"`
-	LastLoginAt          int64          `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+	// [TM-FORK] 组织归属：部门由 token-master 管理端维护，随用户一起返回。
+	// 指针是必需的，不是风格选择：GORM 对零值会跳过，int 的 0 永远清不掉部门，nil 才表示「未分配」。
+	// 不加 omitempty：nil 要序列化成 null，否则前端分不清「未分配」与「字段没返回」。
+	DepartmentId   *int   `json:"department_id" gorm:"index"`
+	StripeCustomer string `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	CreatedAt      int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+	LastLoginAt    int64  `json:"last_login_at" gorm:"default:0;column:last_login_at"`
 	// [TM-FORK] 上游只有 last_login_at（登录）与 quota_data.created_at（写入时被抹成整点），都不足以回答「最近一次调用」。
 	LastCalledAt     int64                      `json:"last_called_at" gorm:"default:0;column:last_called_at"`
 	AuthVersion      int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
@@ -437,7 +441,8 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 	return users, total, nil
 }
 
-func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
+// [TM-FORK] 新增 departmentID / username / displayName 三个可选精确条件。
+func SearchUsers(keyword string, group string, role *int, status *int, departmentID *int, username string, displayName string, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
 	var users []*User
 	var total int64
 	var err error
@@ -475,12 +480,26 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	if role != nil {
 		query = query.Where("role = ?", *role)
 	}
+	// [TM-FORK] 管理端的部门 / 账号 / 显示名精确筛选
+	if departmentID != nil {
+		query = query.Where("department_id = ?", *departmentID)
+	}
+	if username != "" {
+		query = query.Where("username = ?", username)
+	}
+	if displayName != "" {
+		query = query.Where("display_name = ?", displayName)
+	}
+	// [TM-FORK] status 未指定时只返回未删除用户，total 与 items 同源。
+	// 原实现用 Unscoped() 把软删除用户也算进 total，管理端必须自己相减修正。
 	if status != nil {
 		if *status == -1 {
 			query = query.Where("deleted_at IS NOT NULL")
 		} else {
 			query = query.Where("deleted_at IS NULL").Where("status = ?", *status)
 		}
+	} else {
+		query = query.Where("deleted_at IS NULL")
 	}
 
 	// 获取总数

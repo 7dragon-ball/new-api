@@ -1,0 +1,152 @@
+From ca8a49f8f481b191ed417785f1951fbefea8614e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=82=B5=E5=BA=B7?= <shaokang@schkzy.cn>
+Date: Mon, 16 Nov 2026 13:34:55 +0800
+Subject: [PATCH] =?UTF-8?q?fix(controller):=20=E6=94=B9=E9=83=A8=E9=97=A8?=
+ =?UTF-8?q?=E8=A1=A5=E8=A7=92=E8=89=B2=E5=88=86=E5=B1=82=E6=A0=A1=E9=AA=8C?=
+ =?UTF-8?q?=EF=BC=8C=E5=AE=A1=E8=AE=A1=E4=B8=8D=E5=86=8D=E5=86=99=E6=8C=87?=
+ =?UTF-8?q?=E9=92=88=E5=9C=B0=E5=9D=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+终审两处：
+
+- UpdateUserDepartment 只有 AdminAuth 和存在性检查，没走 canManageTargetRole。
+  一个 role=10 的账号能改 role=100 的部门，而它连 GET /api/user/:id 都会被拒。
+  与 UpdateUser / ManageUser / DeleteUser 对齐。
+- user.department_update 的审计参数传的是 *int，auditContentEN 用 %v 渲染，
+  Content 会写成「to 0xc0004a21b0」，清空时写「<nil>」。改传解引用值。
+---
+ controller/user.go                 | 17 ++++++-
+ controller/user_department_test.go | 72 ++++++++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/controller/user.go b/controller/user.go
+index 6d84dca8d..c926360a1 100644
+--- a/controller/user.go
++++ b/controller/user.go
+@@ -1399,10 +1399,17 @@ func UpdateUserDepartment(c *gin.Context) {
+ 		common.ApiErrorT(c, "Invalid parameters")
+ 		return
+ 	}
+-	if _, err := model.GetUserById(id, false); err != nil {
++	originUser, err := model.GetUserById(id, false)
++	if err != nil {
+ 		common.ApiErrorT(c, "User not found")
+ 		return
+ 	}
++	// 与 UpdateUser / ManageUser / DeleteUser 同一条边界：同级或更高角色的账号不可操作。
++	// 漏掉这一句时，role=10 的管理员能改 role=100 的部门，而它连读该用户都会被拒。
++	if !canManageTargetRole(c.GetInt("role"), originUser.Role) {
++		common.ApiErrorT(c, "No permission to update users of same or higher permission level")
++		return
++	}
+ 	var req struct {
+ 		DepartmentID *int `json:"department_id"`
+ 	}
+@@ -1429,8 +1436,14 @@ func UpdateUserDepartment(c *gin.Context) {
+ 		common.ApiError(c, err)
+ 		return
+ 	}
++	// 审计参数传解引用后的值而不是 *int：auditContentEN 用 %v 渲染模板里的占位符，
++	// 传指针会让 Content 写成 "0xc0004a21b0"（清空时是 "<nil>"）。
++	auditDepartmentID := any(nil)
++	if req.DepartmentID != nil {
++		auditDepartmentID = *req.DepartmentID
++	}
+ 	recordManageAuditFor(c, id, "user.department_update",
+-		map[string]any{"id": id, "department_id": req.DepartmentID})
++		map[string]any{"id": id, "department_id": auditDepartmentID})
+ 	common.ApiSuccess(c, nil)
+ }
+ 
+diff --git a/controller/user_department_test.go b/controller/user_department_test.go
+index aafb19b1f..87b1c4bb2 100644
+--- a/controller/user_department_test.go
++++ b/controller/user_department_test.go
+@@ -1,8 +1,11 @@
+ package controller
+ 
+ import (
++	"encoding/json"
+ 	"net/http"
++	"net/http/httptest"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/QuantumNous/new-api/common"
+@@ -113,4 +116,73 @@ func TestUpdateUserDepartmentValueInAuditParams(t *testing.T) {
+ 	assert.EqualValues(t, 1, count, "每次改归属恰好一条审计（markAuditLogged 生效则不会翻倍）")
+ }
+ 
++func TestUpdateUserDepartmentAuditContentRendersValue(t *testing.T) {
++	// 审计 Content 的模板是一条给人看的英文句子，占位符用 %v 渲染。
++	// 传 *int 会把指针地址写进去（"to 0xc0004a21b0"），清空时写 "<nil>"。
++	target, dept := setupDepartmentAssignTest(t)
++	_, resp := departmentRequest(t, http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
++		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
++		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
++	require.Equal(t, true, resp["success"])
++
++	var logs []model.AuditLog
++	require.NoError(t, model.LOG_DB.Where("action = ?", "user.department_update").Find(&logs).Error)
++	require.Len(t, logs, 1)
++	assert.Contains(t, logs[0].Content, "to "+strconv.Itoa(dept.Id))
++	assert.NotContains(t, logs[0].Content, "0x", "Content 里不得出现指针地址")
++}
++
++// departmentRequestAs 与 departmentRequest 相同，但可以指定调用方角色。
++// 同目录其它管理写路径（UpdateUser / ManageUser / DeleteUser）都用 canManageTargetRole
++// 挡「同级或更高」的目标，这里要能构造出低角色管理员来验证同一条边界。
++func departmentRequestAs(t *testing.T, role int, method, path, body string, params gin.Params, handler gin.HandlerFunc) (*httptest.ResponseRecorder, map[string]any) {
++	t.Helper()
++	response := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(response)
++	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
++	c.Request.Header.Set("Content-Type", "application/json")
++	c.Params = params
++	c.Set("id", 1)
++	c.Set("username", "admin")
++	c.Set("role", role)
++	handler(c)
++
++	var decoded map[string]any
++	if response.Body.Len() > 0 {
++		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &decoded), "body=%s", response.Body.String())
++	}
++	return response, decoded
++}
++
++func TestUpdateUserDepartmentRejectsHigherRoleTarget(t *testing.T) {
++	// role=10 的管理员改 role=100 的账号：连 GET /api/user/:id 都会被 canManageTargetRole 拒，
++	// 改部门也必须拒，否则授权分层被绕过（虽然 role=10 账号只能 out-of-band 建出来）。
++	target, dept := setupDepartmentAssignTest(t)
++	require.NoError(t, model.DB.Model(target).Update("role", common.RoleRootUser).Error)
++	before := model.Department{Name: "原部门"}
++	require.NoError(t, model.DB.Save(&before).Error)
++	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).Update("department_id", before.Id).Error)
++
++	_, resp := departmentRequestAs(t, common.RoleAdminUser,
++		http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
++		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
++		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
++
++	assert.Equal(t, false, resp["success"])
++	stored, err := model.GetUserById(target.Id, false)
++	require.NoError(t, err)
++	require.NotNil(t, stored.DepartmentId)
++	assert.Equal(t, before.Id, *stored.DepartmentId, "被拒时部门不得变化")
++}
++
++func TestUpdateUserDepartmentAllowsLowerRoleTarget(t *testing.T) {
++	// role=10 改 role=1 是允许的（canManageTargetRole(10,1) 为真），这条钉住修复不会把正常路径拦掉。
++	target, dept := setupDepartmentAssignTest(t)
++	_, resp := departmentRequestAs(t, common.RoleAdminUser,
++		http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
++		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
++		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
++	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
++}
++
+ var _ = common.RoleRootUser

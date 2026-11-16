@@ -1,0 +1,257 @@
+From dfbae68ac041058a4612a5c9176888a3065dc855 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=82=B5=E5=BA=B7?= <shaokang@schkzy.cn>
+Date: Mon, 16 Nov 2026 10:45:04 +0800
+Subject: [PATCH] feat(model): add department dictionary and
+ users.department_id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[TM-FORK] 部门从 token_master 迁进网关库：新增单层扁平的 department 字典
+（显式固定表名为单数 department，手写聚合 SQL 依赖它），users 加一列
+department_id。
+
+DepartmentId 用 *int 而不是 int：GORM 对零值会跳过，int 的 0 永远清不掉部门，
+只有 nil 能写成 NULL。也不加 omitempty——nil 必须序列化成 null，前端要能区分
+「未分配部门」与「字段没返回」。
+
+部门名在 BeforeSave 里归一（去空白 + 长度按 rune 计），唯一索引才有意义。
+---
+ model/department.go           | 36 +++++++++++++++++++
+ model/department_test.go      | 62 ++++++++++++++++++++++++++++++++
+ model/main.go                 |  1 +
+ model/task_cas_test.go        |  1 +
+ model/user.go                 | 10 ++++--
+ model/user_department_test.go | 66 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 173 insertions(+), 3 deletions(-)
+ create mode 100644 model/department.go
+ create mode 100644 model/department_test.go
+ create mode 100644 model/user_department_test.go
+
+diff --git a/model/department.go b/model/department.go
+new file mode 100644
+index 000000000..fd3df8c42
+--- /dev/null
++++ b/model/department.go
+@@ -0,0 +1,36 @@
++package model
++
++import (
++	"errors"
++	"strings"
++	"unicode/utf8"
++
++	"gorm.io/gorm"
++)
++
++// [TM-FORK] 部门名归一后为空或超长。message 会被 ApiError 原样渲染进响应体的
++// `message` 字段，前端直接展示，所以这句话本身就是给运营看的文案。
++var ErrDepartmentNameInvalid = errors.New("Department name must be 1-30 characters (spaces are trimmed)")
++
++// [TM-FORK] 部门字典：单层扁平，一人一部门。
++// 显式固定表名为单数 department：GORM 默认会复数化成 departments，而手写 SQL
++// （删除计数、部门用量聚合）都写 department。
++func (Department) TableName() string { return "department" }
++
++type Department struct {
++	Id        int    `json:"id"`
++	Name      string `json:"name" gorm:"type:varchar(30);not null;uniqueIndex:uk_department_name"`
++	CreatedAt int64  `json:"created_at" gorm:"autoCreateTime"`
++	UpdatedAt int64  `json:"updated_at" gorm:"autoUpdateTime"`
++}
++
++// [TM-FORK] 写入前归一：唯一索引生效的前提是库里存的已经归一。
++// 只在 Save / Create 路径生效；改名必须用 tx.Save(&dept) 而不是 Updates(map)，
++// 否则这个赋值写不进 SET 子句，重名检查随即失效。
++func (d *Department) BeforeSave(tx *gorm.DB) error {
++	d.Name = strings.TrimSpace(strings.ReplaceAll(d.Name, "　", " "))
++	if n := utf8.RuneCountInString(d.Name); n < 1 || n > 30 {
++		return ErrDepartmentNameInvalid
++	}
++	return nil
++}
+diff --git a/model/department_test.go b/model/department_test.go
+new file mode 100644
+index 000000000..b90dadfa0
+--- /dev/null
++++ b/model/department_test.go
+@@ -0,0 +1,62 @@
++package model
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestDepartmentTableNameIsSingular(t *testing.T) {
++	// 手写 SQL（删除计数、部门用量聚合）都写 department，靠 TableName 钉死单数。
++	assert.Equal(t, "department", Department{}.TableName())
++}
++
++func TestDepartmentBeforeSaveNormalizesName(t *testing.T) {
++	tests := []struct {
++		in      string
++		want    string
++		wantErr bool
++	}{
++		{in: "技术部", want: "技术部"},
++		{in: "  技术部  ", want: "技术部"},
++		{in: "技术部　", want: "技术部"}, // 全角空格也归一
++		{in: "", wantErr: true},
++		{in: "   ", wantErr: true},
++		{in: strings.Repeat("部", 31), wantErr: true},
++		{in: strings.Repeat("部", 30), want: strings.Repeat("部", 30)},
++	}
++	for _, tc := range tests {
++		dept := &Department{Name: tc.in}
++		err := dept.BeforeSave(DB)
++		if tc.wantErr {
++			assert.ErrorIs(t, err, ErrDepartmentNameInvalid, "input=%q", tc.in)
++			continue
++		}
++		require.NoError(t, err, "input=%q", tc.in)
++		assert.Equal(t, tc.want, dept.Name, "input=%q", tc.in)
++	}
++}
++
++func TestDepartmentBeforeSaveCountsRunesNotBytes(t *testing.T) {
++	// 30 个汉字是 90 字节；若按字节算会被误判超长。
++	name := strings.Repeat("部", 30)
++	dept := &Department{Name: name}
++	require.NoError(t, dept.BeforeSave(DB))
++	assert.Equal(t, name, dept.Name)
++}
++
++func TestDepartmentNameUniqueIndexRejectsDuplicate(t *testing.T) {
++	truncateDepartments(t)
++	first := &Department{Name: "技术部"}
++	require.NoError(t, DB.Create(first).Error)
++	// 归一后同名也必须被唯一索引挡住
++	second := &Department{Name: "  技术部 "}
++	assert.Error(t, DB.Create(second).Error)
++}
++
++func truncateDepartments(t *testing.T) {
++	t.Helper()
++	t.Cleanup(func() { DB.Exec("DELETE FROM department") })
++}
+diff --git a/model/main.go b/model/main.go
+index 3f99cd787..3ff9e66c2 100644
+--- a/model/main.go
++++ b/model/main.go
+@@ -360,6 +360,7 @@ func migrateDB() error {
+ 		&Model{},
+ 		&Vendor{},
+ 		&PrefillGroup{},
++		&Department{},
+ 		&Setup{},
+ 		&TwoFA{},
+ 		&TwoFABackupCode{},
+diff --git a/model/task_cas_test.go b/model/task_cas_test.go
+index 3596e65f7..0b1328ff9 100644
+--- a/model/task_cas_test.go
++++ b/model/task_cas_test.go
+@@ -60,6 +60,7 @@ func TestMain(m *testing.M) {
+ 		&SystemTask{},
+ 		&SystemTaskLock{},
+ 		&UserAccessToken{},
++		&Department{},
+ 	); err != nil {
+ 		panic("failed to migrate: " + err.Error())
+ 	}
+diff --git a/model/user.go b/model/user.go
+index 87fbadf94..2db56f7d7 100644
+--- a/model/user.go
++++ b/model/user.go
+@@ -107,9 +107,13 @@ type User struct {
+ 	LinuxDOId            string         `json:"linux_do_id" gorm:"column:linux_do_id;index"`
+ 	Setting              string         `json:"setting" gorm:"type:text;column:setting"`
+ 	Remark               string         `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
+-	StripeCustomer       string         `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+-	CreatedAt            int64          `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+-	LastLoginAt          int64          `json:"last_login_at" gorm:"default:0;column:last_login_at"`
++	// [TM-FORK] 组织归属：部门由 token-master 管理端维护，随用户一起返回。
++	// 指针是必需的，不是风格选择：GORM 对零值会跳过，int 的 0 永远清不掉部门，nil 才表示「未分配」。
++	// 不加 omitempty：nil 要序列化成 null，否则前端分不清「未分配」与「字段没返回」。
++	DepartmentId   *int   `json:"department_id" gorm:"index"`
++	StripeCustomer string `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
++	CreatedAt      int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
++	LastLoginAt    int64  `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+ 	// [TM-FORK] 上游只有 last_login_at（登录）与 quota_data.created_at（写入时被抹成整点），都不足以回答「最近一次调用」。
+ 	LastCalledAt     int64                      `json:"last_called_at" gorm:"default:0;column:last_called_at"`
+ 	AuthVersion      int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
+diff --git a/model/user_department_test.go b/model/user_department_test.go
+new file mode 100644
+index 000000000..8519e137f
+--- /dev/null
++++ b/model/user_department_test.go
+@@ -0,0 +1,66 @@
++package model
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestUserWithoutDepartmentSerializesNullNotMissingKey(t *testing.T) {
++	// 前端按「缺值给 null、不是缺键」约定区分「未分配部门」与「字段没返回」。
++	// 加 omitempty 会让 nil 指针的整个键消失，必须拦住。
++	user := &User{Id: 1, Username: "u", DepartmentId: nil}
++	payload, err := json.Marshal(user)
++	require.NoError(t, err)
++
++	var decoded map[string]any
++	require.NoError(t, json.Unmarshal(payload, &decoded))
++	value, ok := decoded["department_id"]
++	assert.True(t, ok, "department_id 键必须存在，不能因 omitempty 消失")
++	assert.Nil(t, value, "department_id 应为 null")
++}
++
++func TestUserDepartmentIdRoundTrips(t *testing.T) {
++	truncateTables(t)
++	id := 7
++	user := &User{
++		Username:     "dept-holder",
++		Password:     "password123",
++		Role:         common.RoleCommonUser,
++		Status:       common.UserStatusEnabled,
++		Group:        "default",
++		AffCode:      "dept-aff",
++		DepartmentId: &id,
++	}
++	require.NoError(t, DB.Create(user).Error)
++
++	got, err := GetUserById(user.Id, false)
++	require.NoError(t, err)
++	require.NotNil(t, got.DepartmentId)
++	assert.Equal(t, 7, *got.DepartmentId)
++}
++
++func TestUserDepartmentIdCanBeClearedToNull(t *testing.T) {
++	truncateTables(t)
++	id := 9
++	user := &User{
++		Username:     "dept-clear",
++		Password:     "password123",
++		Role:         common.RoleCommonUser,
++		Status:       common.UserStatusEnabled,
++		Group:        "default",
++		AffCode:      "clear-aff",
++		DepartmentId: &id,
++	}
++	require.NoError(t, DB.Create(user).Error)
++
++	// 零值 int 会被 GORM 跳过，只有 *int 的 nil 才能真正写成 NULL。
++	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Update("department_id", (*int)(nil)).Error)
++
++	got, err := GetUserById(user.Id, false)
++	require.NoError(t, err)
++	assert.Nil(t, got.DepartmentId)
++}
