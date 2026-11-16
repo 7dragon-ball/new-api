@@ -6,7 +6,8 @@
 set -euo pipefail
 
 UPSTREAM="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
-TAG="${2:-rc.49-tm1}"
+# 源码里三组定制（tm1 多 root / tm2 最近调用 / tm3 部门）恒在，不再有「只应用了前几组」的中间态。
+TAG="${2:-rc.49-tm3}"
 
 cd "$UPSTREAM"
 
