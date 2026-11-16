@@ -1017,7 +1017,8 @@ func CreateUser(c *gin.Context) {
 		user.DisplayName = user.Username
 	}
 	myRole := c.GetInt("role")
-	if user.Role >= myRole {
+	// [TM-FORK] 多 root：root 可以创建同级（root）账号；其他角色仍不得创建同级或更高。
+	if user.Role >= myRole && myRole != common.RoleRootUser {
 		common.ApiErrorT(c, "Cannot create users with permission level equal to or higher than yourself")
 		return
 	}
@@ -1119,18 +1120,13 @@ func ManageUser(c *gin.Context) {
 	}
 	switch req.Action {
 	case "disable":
+		// [TM-FORK] 多 root：不再按「目标是 root」硬拒；由模型层不变量保证
+		// 不会禁用掉最后一个启用的 root（见 ensureEnabledRootSurvivesWithTx）。
 		user.Status = common.UserStatusDisabled
-		if user.Role == common.RoleRootUser {
-			common.ApiErrorT(c, "Cannot disable super administrator user")
-			return
-		}
 	case "enable":
 		user.Status = common.UserStatusEnabled
 	case "delete":
-		if user.Role == common.RoleRootUser {
-			common.ApiErrorT(c, "Cannot delete super administrator account")
-			return
-		}
+		// [TM-FORK] 同上：删除保护移入 model.User.delete。
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserDelete, service.AdminUserContext{UserID: user.Id})
 		if authorization == nil {
 			return
@@ -1177,6 +1173,33 @@ func ManageUser(c *gin.Context) {
 			return
 		}
 		user.Role = common.RoleCommonUser
+	// [TM-FORK] 多 root：产品里的「管理员」= role 100。提为 root / 撤销 root 独立成
+	// 两个 action，而不是复用 promote/demote：
+	//   - promote/demote 的语义与审计模板（controller/audit.go:25 的
+	//     "Performed ${action} on user ..."）都是「普通管理员(10)」，上游自带前端
+	//     web/src/features/users/components/data-table-row-actions.tsx:237,246
+	//     仍会发这两个 action；
+	//   - 新增 action 是纯增量，回滚只需删这两个 case 与白名单里的两项。
+	case "grant_root":
+		// [TM-FORK] 与 promote 同口径：只有 root 能产出 root。少了这一条，
+		// role=10（上游 promote 造出的普通管理员）可以把自己或任何人提成 root——
+		// canManageTargetRole(10, 1) 为真，且 admin.user.manage 的 proof
+		// （service/security_verification.go 的 state.Role < RoleAdminUser）也放行 10。
+		if myRole != common.RoleRootUser {
+			common.ApiErrorT(c, "Regular administrators cannot grant super administrator")
+			return
+		}
+		if user.Role == common.RoleRootUser {
+			common.ApiErrorT(c, "This user is already a super administrator")
+			return
+		}
+		user.Role = common.RoleRootUser
+	case "revoke_root":
+		if user.Role != common.RoleRootUser {
+			common.ApiErrorT(c, "This user is not a super administrator")
+			return
+		}
+		user.Role = common.RoleCommonUser
 	default:
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -1186,7 +1209,10 @@ func ManageUser(c *gin.Context) {
 	if authorization == nil {
 		return
 	}
-	if req.Action == "demote" {
+	// [TM-FORK] revoke_root 必须走 demote 这条分支：它负责清理该用户的 Casbin
+	// 逐用户 override（authz.ClearUserAuthorizationInTx）。root 是 superuser，override
+	// 对它无意义，但降级为普通用户后这些旧 override 会立刻变成真实权限。
+	if req.Action == "demote" || req.Action == "revoke_root" {
 		if err := model.DB.Transaction(func(tx *gorm.DB) error {
 			if err := user.UpdateWithTx(tx, false); err != nil {
 				return err
