@@ -384,6 +384,16 @@ func SetApiRouter(router *gin.Engine) {
 			prefillGroupRoute.DELETE("/:id", controller.DeletePrefillGroup)
 		}
 
+		// [TM-FORK] 部门字典
+		departmentRoute := apiRouter.Group("/department")
+		departmentRoute.Use(middleware.AdminAuth())
+		{
+			departmentRoute.GET("/", controller.GetDepartments)
+			departmentRoute.POST("/", controller.CreateDepartment)
+			departmentRoute.PUT("/", controller.UpdateDepartment)
+			departmentRoute.DELETE("/:id", controller.DeleteDepartment)
+		}
+
 		mjRoute := apiRouter.Group("/mj")
 		mjRoute.GET("/self", middleware.UserAuth(), controller.GetUserMidjourney)
 		mjRoute.GET("/", middleware.AdminAuth(), controller.GetAllMidjourney)
