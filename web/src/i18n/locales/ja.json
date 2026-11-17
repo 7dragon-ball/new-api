@@ -6889,6 +6889,7 @@
     "Token obtained from your Gotify application": "Gotifyアプリケーションから取得したトークン",
     "Token operation details": "トークン操作の詳細",
     "Token or per-call pricing": "トークン単位またはリクエスト単位の課金",
+    "Token owner is too long": "トークンの使用方が長すぎます",
     "Token price for audio input.": "音声入力のトークン価格。",
     "Token price for audio output.": "音声出力のトークン価格。",
     "Token price for cache reads.": "キャッシュ読み取りのトークン価格。",

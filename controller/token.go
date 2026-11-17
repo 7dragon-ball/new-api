@@ -308,6 +308,12 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorT(c, "Token name is too long")
 		return
 	}
+	// [TM-FORK] owner 是 fork 新增列（varchar(128)），上游没有对应校验：不校验则超长值在
+	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。长度口径与上面的 name 一致（50 字节）。
+	if len(token.Owner) > 50 {
+		common.ApiErrorT(c, "Token owner is too long")
+		return
+	}
 	params := tokenAuditParams(c)
 	params["name"] = token.Name
 	// 非无限额度时，检查额度值是否超出有效范围
@@ -362,7 +368,7 @@ func AddToken(c *gin.Context) {
 		Group:              token.Group,
 		CrossGroupRetry:    token.CrossGroupRetry,
 		AutoGroups:         token.AutoGroups,
-		// [TM-FORK] 使用方：请求体透传到落库（Insert 走 Create，写全字段）
+		// [TM-FORK] 上游 cleanToken 是逐字段字面量，不补这行 owner 直接丢（Insert 走 Create，写全字段）
 		Owner: token.Owner,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
@@ -419,6 +425,12 @@ func UpdateToken(c *gin.Context) {
 		common.ApiErrorT(c, "Token name is too long")
 		return
 	}
+	// [TM-FORK] owner 是 fork 新增列（varchar(128)），上游没有对应校验：不校验则超长值在
+	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。长度口径与上面的 name 一致（50 字节）。
+	if len(token.Owner) > 50 {
+		common.ApiErrorT(c, "Token owner is too long")
+		return
+	}
 	if !token.UnlimitedQuota {
 		if token.RemainQuota < 0 {
 			common.ApiErrorT(c, "Quota value cannot be negative")
@@ -452,7 +464,7 @@ func UpdateToken(c *gin.Context) {
 	} else {
 		// If you add more fields, please also update token.Update()
 		cleanToken.Name = token.Name
-		// [TM-FORK] 使用方：与 Token.Update() 白名单成对，缺这行则使用方被清空
+		// [TM-FORK] 上游这里是逐字段拷贝，不补这行 owner 保持旧值（请求里的新值被静默忽略）
 		cleanToken.Owner = token.Owner
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
@@ -489,6 +501,8 @@ func UpdateToken(c *gin.Context) {
 			changed bool
 		}{
 			{"name", previous.Name != cleanToken.Name},
+			// [TM-FORK] 使用方：与上面的拷贝块成对，漏这行只改 owner 时 changed_fields 为空、审计失真
+			{"owner", previous.Owner != cleanToken.Owner},
 			{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
 			{"remain_quota", previous.RemainQuota != cleanToken.RemainQuota},
 			{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},

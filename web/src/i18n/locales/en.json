@@ -6889,6 +6889,7 @@
     "Token obtained from your Gotify application": "Token obtained from your Gotify application",
     "Token operation details": "Token operation details",
     "Token or per-call pricing": "Token or per-call pricing",
+    "Token owner is too long": "Token owner is too long",
     "Token price for audio input.": "Token price for audio input.",
     "Token price for audio output.": "Token price for audio output.",
     "Token price for cache reads.": "Token price for cache reads.",

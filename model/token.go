@@ -30,7 +30,8 @@ type Token struct {
 	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
 	AutoGroups         string         `json:"-" gorm:"type:text"`
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
-	// [TM-FORK] 使用方：与 name（用途）相互独立的一列；改这里必须同步 Token.Update() 的 Select 白名单
+	// [TM-FORK] 使用方：上游 Token 无此概念，fork 新增一列（与 name「用途」相互独立）。
+	// 结构体字段没法靠「复制原结构体」来二开，只能就地加；写入方见 controller 的两处拷贝块，须同步 Token.Update() 白名单。
 	Owner string `json:"owner" gorm:"type:varchar(128);index;default:''"`
 	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
 	AllowUserQuotaQuery bool   `json:"allow_user_quota_query"`

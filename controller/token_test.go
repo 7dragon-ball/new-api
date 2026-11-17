@@ -641,6 +641,128 @@ func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 	}
 }
 
+func TestTokenOwnerPersistsAcrossCreateUpdateAndStatusToggle(t *testing.T) {
+	const ownerLimitBytes = 50
+
+	t.Run("create stores owner", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		body := map[string]any{"name": "owner-create", "owner": "team-alpha", "expired_time": -1, "unlimited_quota": true}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+		AddToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.Where("name = ?", "owner-create").First(&saved).Error)
+		assert.Equal(t, "team-alpha", saved.Owner)
+	})
+
+	t.Run("update rewrites owner", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "owner-update", "owner-update-key")
+		require.NoError(t, db.Model(token).Update("owner", "team-alpha").Error)
+
+		body := map[string]any{"id": token.Id, "name": "owner-update", "owner": "team-beta", "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "group": "default", "cross_group_retry": false}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.First(&saved, token.Id).Error)
+		assert.Equal(t, "team-beta", saved.Owner)
+
+		var returned struct {
+			Owner string `json:"owner"`
+		}
+		require.NoError(t, common.Unmarshal(response.Data, &returned))
+		assert.Equal(t, "team-beta", returned.Owner)
+	})
+
+	t.Run("status only keeps owner", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "owner-status", "owner-status-key")
+		require.NoError(t, db.Model(token).Update("owner", "team-alpha").Error)
+
+		body := map[string]any{"id": token.Id, "status": common.TokenStatusDisabled}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true", body, 1)
+		UpdateToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.First(&saved, token.Id).Error)
+		assert.Equal(t, common.TokenStatusDisabled, saved.Status)
+		assert.Equal(t, "team-alpha", saved.Owner)
+	})
+
+	// 更新是全字段覆盖（与 name 一致）：请求里不带 owner 即落空值。
+	t.Run("update without owner clears it", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "owner-clear", "owner-clear-key")
+		require.NoError(t, db.Model(token).Update("owner", "team-alpha").Error)
+
+		body := map[string]any{"id": token.Id, "name": "owner-clear", "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "group": "default"}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.First(&saved, token.Id).Error)
+		assert.Empty(t, saved.Owner)
+	})
+
+	t.Run("owner at the byte limit is accepted", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		owner := strings.Repeat("a", ownerLimitBytes)
+		body := map[string]any{"name": "owner-limit", "owner": owner, "expired_time": -1, "unlimited_quota": true}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+		AddToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.Where("name = ?", "owner-limit").First(&saved).Error)
+		assert.Equal(t, owner, saved.Owner)
+	})
+
+	t.Run("too long owner is rejected on create and update", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		// len() 按字节数算，3 字节的中文超限更快，也顺带锁住「按字节而非按字符」的口径。
+		tooLong := strings.Repeat("界", ownerLimitBytes/3+1)
+		require.Greater(t, len(tooLong), ownerLimitBytes)
+
+		createBody := map[string]any{"name": "owner-too-long", "owner": tooLong, "expired_time": -1, "unlimited_quota": true}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", createBody, 1)
+		AddToken(ctx)
+
+		createResponse := decodeAPIResponse(t, recorder)
+		assert.False(t, createResponse.Success)
+		var created int64
+		require.NoError(t, db.Model(&model.Token{}).Where("name = ?", "owner-too-long").Count(&created).Error)
+		assert.Zero(t, created, "rejected create must not leave a row behind")
+
+		token := seedToken(t, db, 1, "owner-bound", "owner-bound-key")
+		require.NoError(t, db.Model(token).Update("owner", "team-alpha").Error)
+
+		updateBody := map[string]any{"id": token.Id, "name": "owner-bound", "owner": tooLong, "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "group": "default"}
+		ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
+		UpdateToken(ctx)
+
+		updateResponse := decodeAPIResponse(t, recorder)
+		assert.False(t, updateResponse.Success)
+		var saved model.Token
+		require.NoError(t, db.First(&saved, token.Id).Error)
+		assert.Equal(t, "team-alpha", saved.Owner, "rejected update must leave owner untouched")
+	})
+}
+
 func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -809,6 +931,7 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"remain_quota":100,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
 		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
 		{name: "user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_user_quota_query"]}`},
+		{name: "owner update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","owner":"acme-team"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["owner"]}`},
 		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","model_limits":"` + strings.Repeat("m", 64*1024-128) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits"]}`},
 		{name: "update storage failure", method: "PUT", path: "/", body: `{"id":$id,"name":"failed-rename","unlimited_quota":true}`, action: "token.update", params: `{"id":$id,"name":"owned"}`, failWrite: true},
 		{name: "foreign update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","unlimited_quota":true}`, action: "token.update", params: `{"id":$other}`},

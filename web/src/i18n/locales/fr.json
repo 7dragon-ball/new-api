@@ -6889,6 +6889,7 @@
     "Token obtained from your Gotify application": "Jeton obtenu depuis votre application Gotify",
     "Token operation details": "Détails de l’opération sur les jetons",
     "Token or per-call pricing": "Par jeton ou par requête",
+    "Token owner is too long": "Le nom de l’utilisateur du jeton est trop long",
     "Token price for audio input.": "Prix par token pour l’entrée audio.",
     "Token price for audio output.": "Prix par token pour la sortie audio.",
     "Token price for cache reads.": "Prix par token pour les lectures du cache.",
