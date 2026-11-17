@@ -37,6 +37,9 @@ type tokenRequest struct {
 	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
 	// 指针区分“未传”和显式 false：新建时未传即开启，更新时未传则保留原值。
 	AllowUserQuotaQuery *bool `json:"allow_user_quota_query"`
+	// [TM-FORK] 使用方：同样是指针，区分“未传”和显式空串——更新时未传则保留原值。
+	// 它会遮蔽内嵌 model.Token.Owner，所以读值一律走 request.Owner，不能读 token.Owner。
+	Owner *string `json:"owner"`
 }
 
 type tokenResponse struct {
@@ -308,6 +311,13 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorT(c, "Token name is too long")
 		return
 	}
+	// [TM-FORK] owner 是 fork 新增列（varchar(128)），上游没有对应校验：不校验则超长值在
+	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。
+	// 口径取 128 与列宽同值；按字节比较，128 字节最多折 128 字符，恒不超列的字符上限。
+	if request.Owner != nil && len(*request.Owner) > 128 {
+		common.ApiErrorT(c, "Token owner is too long")
+		return
+	}
 	params := tokenAuditParams(c)
 	params["name"] = token.Name
 	// 非无限额度时，检查额度值是否超出有效范围
@@ -364,6 +374,10 @@ func AddToken(c *gin.Context) {
 		AutoGroups:         token.AutoGroups,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
+	// [TM-FORK] 使用方：请求带了才写（未传即列默认值 ''），不能读 token.Owner——它被 request.Owner 遮蔽、恒为空串
+	if request.Owner != nil {
+		cleanToken.Owner = *request.Owner
+	}
 	err = cleanToken.Insert()
 	if err != nil {
 		common.ApiError(c, err)
@@ -417,6 +431,13 @@ func UpdateToken(c *gin.Context) {
 		common.ApiErrorT(c, "Token name is too long")
 		return
 	}
+	// [TM-FORK] owner 是 fork 新增列（varchar(128)），上游没有对应校验：不校验则超长值在
+	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。
+	// 口径取 128 与列宽同值；按字节比较，128 字节最多折 128 字符，恒不超列的字符上限。
+	if request.Owner != nil && len(*request.Owner) > 128 {
+		common.ApiErrorT(c, "Token owner is too long")
+		return
+	}
 	if !token.UnlimitedQuota {
 		if token.RemainQuota < 0 {
 			common.ApiErrorT(c, "Quota value cannot be negative")
@@ -450,6 +471,11 @@ func UpdateToken(c *gin.Context) {
 	} else {
 		// If you add more fields, please also update token.Update()
 		cleanToken.Name = token.Name
+		// [TM-FORK] 使用方：与 name 不同，未传则保留旧值（request.Owner 为 nil 时不动 owner），
+		// 否则上游前端编辑令牌的请求不带 owner，会把使用方清空
+		if request.Owner != nil {
+			cleanToken.Owner = *request.Owner
+		}
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
 		cleanToken.UnlimitedQuota = token.UnlimitedQuota
@@ -485,6 +511,8 @@ func UpdateToken(c *gin.Context) {
 			changed bool
 		}{
 			{"name", previous.Name != cleanToken.Name},
+			// [TM-FORK] 使用方：与上面的拷贝块成对，漏这行只改 owner 时 changed_fields 为空、审计失真
+			{"owner", previous.Owner != cleanToken.Owner},
 			{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
 			{"remain_quota", previous.RemainQuota != cleanToken.RemainQuota},
 			{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},

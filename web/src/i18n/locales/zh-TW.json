@@ -6889,6 +6889,7 @@
     "Token obtained from your Gotify application": "從您的 Gotify 套用程式獲取的 Token",
     "Token operation details": "權杖操作詳情",
     "Token or per-call pricing": "按 token 或按次計費",
+    "Token owner is too long": "令牌使用方過長",
     "Token price for audio input.": "音頻輸入 token 價格。",
     "Token price for audio output.": "音頻輸出 token 價格。",
     "Token price for cache reads.": "緩存讀取 token 價格。",

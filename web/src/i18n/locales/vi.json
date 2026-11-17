@@ -6889,6 +6889,7 @@
     "Token obtained from your Gotify application": "Mã thông báo thu được từ ứng dụng Gotify của bạn",
     "Token operation details": "Chi tiết thao tác mã thông báo",
     "Token or per-call pricing": "Tính phí theo token hoặc theo yêu cầu",
+    "Token owner is too long": "Tên người sử dụng token quá dài",
     "Token price for audio input.": "Giá token cho đầu vào âm thanh.",
     "Token price for audio output.": "Giá token cho đầu ra âm thanh.",
     "Token price for cache reads.": "Giá token cho lượt đọc cache.",
