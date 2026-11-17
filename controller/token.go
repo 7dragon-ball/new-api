@@ -37,6 +37,9 @@ type tokenRequest struct {
 	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
 	// 指针区分“未传”和显式 false：新建时未传即开启，更新时未传则保留原值。
 	AllowUserQuotaQuery *bool `json:"allow_user_quota_query"`
+	// [TM-FORK] 使用方：同样是指针，区分“未传”和显式空串——更新时未传则保留原值。
+	// 它会遮蔽内嵌 model.Token.Owner，所以读值一律走 request.Owner，不能读 token.Owner。
+	Owner *string `json:"owner"`
 }
 
 type tokenResponse struct {
@@ -309,8 +312,9 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	// [TM-FORK] owner 是 fork 新增列（varchar(128)），上游没有对应校验：不校验则超长值在
-	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。长度口径与上面的 name 一致（50 字节）。
-	if len(token.Owner) > 50 {
+	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。
+	// 口径取 128 与列宽同值；按字节比较，128 字节最多折 128 字符，恒不超列的字符上限。
+	if request.Owner != nil && len(*request.Owner) > 128 {
 		common.ApiErrorT(c, "Token owner is too long")
 		return
 	}
@@ -368,10 +372,12 @@ func AddToken(c *gin.Context) {
 		Group:              token.Group,
 		CrossGroupRetry:    token.CrossGroupRetry,
 		AutoGroups:         token.AutoGroups,
-		// [TM-FORK] 上游 cleanToken 是逐字段字面量，不补这行 owner 直接丢（Insert 走 Create，写全字段）
-		Owner: token.Owner,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
+	// [TM-FORK] 使用方：请求带了才写（未传即列默认值 ''），不能读 token.Owner——它被 request.Owner 遮蔽、恒为空串
+	if request.Owner != nil {
+		cleanToken.Owner = *request.Owner
+	}
 	err = cleanToken.Insert()
 	if err != nil {
 		common.ApiError(c, err)
@@ -426,8 +432,9 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	// [TM-FORK] owner 是 fork 新增列（varchar(128)），上游没有对应校验：不校验则超长值在
-	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。长度口径与上面的 name 一致（50 字节）。
-	if len(token.Owner) > 50 {
+	// MySQL/PostgreSQL 严格模式触发 22001 写库失败，SQLite 不校验列宽、静默写入。
+	// 口径取 128 与列宽同值；按字节比较，128 字节最多折 128 字符，恒不超列的字符上限。
+	if request.Owner != nil && len(*request.Owner) > 128 {
 		common.ApiErrorT(c, "Token owner is too long")
 		return
 	}
@@ -464,8 +471,11 @@ func UpdateToken(c *gin.Context) {
 	} else {
 		// If you add more fields, please also update token.Update()
 		cleanToken.Name = token.Name
-		// [TM-FORK] 上游这里是逐字段拷贝，不补这行 owner 保持旧值（请求里的新值被静默忽略）
-		cleanToken.Owner = token.Owner
+		// [TM-FORK] 使用方：与 name 不同，未传则保留旧值（request.Owner 为 nil 时不动 owner），
+		// 否则上游前端编辑令牌的请求不带 owner，会把使用方清空
+		if request.Owner != nil {
+			cleanToken.Owner = *request.Owner
+		}
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
 		cleanToken.UnlimitedQuota = token.UnlimitedQuota

@@ -642,7 +642,7 @@ func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 }
 
 func TestTokenOwnerPersistsAcrossCreateUpdateAndStatusToggle(t *testing.T) {
-	const ownerLimitBytes = 50
+	const ownerLimitBytes = 128
 
 	t.Run("create stores owner", func(t *testing.T) {
 		db := setupTokenControllerTestDB(t)
@@ -656,6 +656,20 @@ func TestTokenOwnerPersistsAcrossCreateUpdateAndStatusToggle(t *testing.T) {
 		var saved model.Token
 		require.NoError(t, db.Where("name = ?", "owner-create").First(&saved).Error)
 		assert.Equal(t, "team-alpha", saved.Owner)
+	})
+
+	t.Run("create without owner stores empty", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		body := map[string]any{"name": "owner-absent", "expired_time": -1, "unlimited_quota": true}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+		AddToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.Where("name = ?", "owner-absent").First(&saved).Error)
+		assert.Empty(t, saved.Owner)
 	})
 
 	t.Run("update rewrites owner", func(t *testing.T) {
@@ -699,13 +713,30 @@ func TestTokenOwnerPersistsAcrossCreateUpdateAndStatusToggle(t *testing.T) {
 		assert.Equal(t, "team-alpha", saved.Owner)
 	})
 
-	// 更新是全字段覆盖（与 name 一致）：请求里不带 owner 即落空值。
-	t.Run("update without owner clears it", func(t *testing.T) {
+	// 更新时「未传 owner」与「显式传空串」语义不同：未传保留旧值，避免上游前端编辑令牌把使用方清空。
+	t.Run("update without owner keeps it", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		token := seedToken(t, db, 1, "owner-keep", "owner-keep-key")
+		require.NoError(t, db.Model(token).Update("owner", "team-alpha").Error)
+
+		body := map[string]any{"id": token.Id, "name": "owner-keep", "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "group": "default"}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
+		UpdateToken(ctx)
+
+		response := decodeAPIResponse(t, recorder)
+		require.True(t, response.Success, response.Message)
+
+		var saved model.Token
+		require.NoError(t, db.First(&saved, token.Id).Error)
+		assert.Equal(t, "team-alpha", saved.Owner)
+	})
+
+	t.Run("explicit empty owner clears it", func(t *testing.T) {
 		db := setupTokenControllerTestDB(t)
 		token := seedToken(t, db, 1, "owner-clear", "owner-clear-key")
 		require.NoError(t, db.Model(token).Update("owner", "team-alpha").Error)
 
-		body := map[string]any{"id": token.Id, "name": "owner-clear", "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "group": "default"}
+		body := map[string]any{"id": token.Id, "name": "owner-clear", "owner": "", "expired_time": -1, "remain_quota": 100, "unlimited_quota": true, "group": "default"}
 		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
 		UpdateToken(ctx)
 

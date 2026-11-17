@@ -31,8 +31,9 @@ type Token struct {
 	AutoGroups         string         `json:"-" gorm:"type:text"`
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 	// [TM-FORK] 使用方：上游 Token 无此概念，fork 新增一列（与 name「用途」相互独立）。
-	// 结构体字段没法靠「复制原结构体」来二开，只能就地加；写入方见 controller 的两处拷贝块，须同步 Token.Update() 白名单。
-	Owner string `json:"owner" gorm:"type:varchar(128);index;default:''"`
+	// 结构体字段没法靠「复制原结构体」来二开，只能就地加；写入方见 controller 的 request.Owner 指针，
+	// 须同步 Token.Update() 白名单。不加索引：当前没有任何按 owner 过滤的服务端查询。
+	Owner string `json:"owner" gorm:"type:varchar(128);default:''"`
 	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
 	AllowUserQuotaQuery bool   `json:"allow_user_quota_query"`
 	CacheExpiresAt      int64  `json:"-" gorm:"-"`
