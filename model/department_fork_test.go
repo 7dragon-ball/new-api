@@ -1,12 +1,16 @@
 package model
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/utils/tests"
 )
@@ -84,4 +88,63 @@ func TestDepartmentNameUniqueIndexRejectsDuplicate(t *testing.T) {
 func truncateDepartments(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() { DB.Exec("DELETE FROM department") })
+}
+
+// 部门表在 PostgreSQL 上由 goose 迁移建（model/goose_fork.go）。这条用例钉住四件事：
+// 迁移能建出表和唯一索引、重复执行幂等、建出的表能挡住重名、非 PG 库直接拒绝。
+//
+// 需要 TEST_POSTGRES_DSN，与仓库里其它 PG 用例同一个开关。用独立 schema 隔离，
+// 因为用例要真的建表，而共享的测试库可能已经有 department。
+func TestForkMigrationsOnPostgres(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set TEST_POSTGRES_DSN to run the fork goose migration test")
+	}
+
+	previousDB := DB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	t.Cleanup(func() {
+		DB = previousDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+
+	schema := fmt.Sprintf("dept_goose_%d", time.Now().UnixNano())
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	// SET search_path 只对执行它的那条连接有效。锁成单连接，后续查询（含 goose 的）
+	// 才都落在隔离 schema 里，不会把表建到共享测试库的 public 下。
+	sqlDB.SetMaxOpenConns(1)
+
+	require.NoError(t, db.Exec("CREATE SCHEMA IF NOT EXISTS "+schema).Error)
+	require.NoError(t, db.Exec("SET search_path TO "+schema).Error)
+	t.Cleanup(func() { db.Exec("DROP SCHEMA " + schema + " CASCADE") })
+
+	DB = db
+	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
+
+	require.NoError(t, runForkMigrations())
+	require.True(t, db.Migrator().HasTable(&Department{}))
+	require.True(t, db.Migrator().HasIndex(&Department{}, "uk_department_name"))
+
+	// 幂等：多节点启动会各跑一次，第二次不能报错也不能重建表。
+	require.NoError(t, runForkMigrations())
+
+	dept := &Department{Name: "技术部"}
+	require.NoError(t, db.Create(dept).Error)
+	assert.NotZero(t, dept.Id)
+	assert.Error(t, db.Create(&Department{Name: "技术部"}).Error, "迁移建出的唯一索引必须生效")
+}
+
+// 非 PostgreSQL 的库不该跑 PG 方言 SQL。这条拦住「将来有人挪动调用点」的失误。
+func TestForkMigrationsRejectNonPostgres(t *testing.T) {
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	t.Cleanup(func() { common.SetDatabaseTypes(previousMain, previousLog) })
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+
+	err := runForkMigrations()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "PostgreSQL-only")
 }
