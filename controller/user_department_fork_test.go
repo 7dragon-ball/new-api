@@ -18,14 +18,13 @@ import (
 
 func setupDepartmentAssignTest(t *testing.T) (*model.User, model.Department) {
 	t.Helper()
-	_, identity, target := setupAdminUserTest(t)
+	_, _, target := setupAdminUserTest(t)
 	require.NoError(t, model.DB.Exec("DELETE FROM department").Error)
 	// UpdateUser 会刷新 authz 策略并 bump sync topic，测试环境需要备好这两处
 	require.NoError(t, model.DB.AutoMigrate(&model.SystemTask{}))
 	require.NoError(t, authz.Init(model.DB))
 	dept := model.Department{Name: "技术部"}
 	require.NoError(t, model.DB.Save(&dept).Error)
-	_ = identity
 	return target, dept
 }
 
@@ -76,6 +75,43 @@ func TestUpdateUserDepartmentRejectsUnknownUser(t *testing.T) {
 		`{"department_id":null}`, gin.Params{{Key: "id", Value: "999999"}}, UpdateUserDepartment)
 	assert.Equal(t, false, resp["success"])
 	assert.Equal(t, "User not found", resp["message"])
+}
+
+// 缺字段与显式 null 在 *int 解码后都是 nil，都会被当成「清空」。
+// 本接口只做改部门一件事，没办法从请求形状上区分「客户端忘了传」与「有意清空」，
+// 所以字段缺失必须报错 —— 否则 BFF 参数名拼错就会静默把部门清空。
+func TestUpdateUserDepartmentRejectsMissingField(t *testing.T) {
+	target, dept := setupDepartmentAssignTest(t)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).Update("department_id", dept.Id).Error)
+
+	for _, body := range []string{`{}`, `{"department":1}`, `{"department_id_typo":1}`} {
+		_, resp := departmentRequest(t, http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
+			body, gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
+		assert.Equal(t, false, resp["success"], "body=%s 必须报错而不是清空部门", body)
+		assert.Equal(t, "Invalid parameters", resp["message"], "body=%s", body)
+
+		stored, err := model.GetUserById(target.Id, false)
+		require.NoError(t, err)
+		require.NotNil(t, stored.DepartmentId, "body=%s 被拒时部门不得被清空", body)
+		assert.Equal(t, dept.Id, *stored.DepartmentId, "body=%s", body)
+	}
+}
+
+// 显式 null 才是清空；类型不符、0、负数、小数都必须被拒且不改动原值。
+func TestUpdateUserDepartmentRejectsMalformedValue(t *testing.T) {
+	target, dept := setupDepartmentAssignTest(t)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).Update("department_id", dept.Id).Error)
+
+	for _, body := range []string{`{"department_id":"1"}`, `{"department_id":0}`, `{"department_id":-3}`, `{"department_id":1.5}`} {
+		_, resp := departmentRequest(t, http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
+			body, gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
+		assert.Equal(t, false, resp["success"], "body=%s", body)
+
+		stored, err := model.GetUserById(target.Id, false)
+		require.NoError(t, err)
+		require.NotNil(t, stored.DepartmentId, "body=%s 被拒时部门不得变化", body)
+		assert.Equal(t, dept.Id, *stored.DepartmentId, "body=%s", body)
+	}
 }
 
 func TestUpdateUserDepartmentRejectsBadId(t *testing.T) {
@@ -184,5 +220,3 @@ func TestUpdateUserDepartmentAllowsLowerRoleTarget(t *testing.T) {
 		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
 	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
 }
-
-var _ = common.RoleRootUser

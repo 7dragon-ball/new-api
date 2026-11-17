@@ -25,7 +25,7 @@ func setupUserSearchControllerTest(t *testing.T) (*model.User, service.AuthIdent
 }
 
 func TestSearchUsersRejectsInvalidDepartmentId(t *testing.T) {
-	_, identity := setupUserSearchControllerTest(t)
+	setupUserSearchControllerTest(t)
 	for _, raw := range []string{"abc", "0", "-3"} {
 		response, resp := departmentRequest(t, http.MethodGet,
 			"/api/user/search?department_id="+raw, "", nil, SearchUsers)
@@ -33,7 +33,6 @@ func TestSearchUsersRejectsInvalidDepartmentId(t *testing.T) {
 		assert.Equal(t, false, resp["success"], "department_id=%s 必须显式报错而不是静默忽略", raw)
 		assert.Equal(t, "Invalid parameters", resp["message"], "department_id=%s", raw)
 	}
-	_ = identity
 }
 
 func TestSearchUsersUnknownDepartmentReturnsEmptyPage(t *testing.T) {
@@ -48,7 +47,7 @@ func TestSearchUsersUnknownDepartmentReturnsEmptyPage(t *testing.T) {
 }
 
 func TestSearchUsersUsernameFilterIsExact(t *testing.T) {
-	_, identity := setupUserSearchControllerTest(t)
+	setupUserSearchControllerTest(t)
 	require.NoError(t, model.DB.Create(&model.User{
 		Username: "bob", Password: "password123", DisplayName: "Bob",
 		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "bob-aff",
@@ -60,7 +59,6 @@ func TestSearchUsersUsernameFilterIsExact(t *testing.T) {
 	items := resp["data"].(map[string]any)["items"].([]any)
 	require.Len(t, items, 1)
 	assert.Equal(t, "managed-user", items[0].(map[string]any)["username"])
-	_ = identity
 }
 
 func TestCreateUserReturnsIdAndStoresDepartment(t *testing.T) {

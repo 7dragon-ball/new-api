@@ -57,7 +57,9 @@ func TestSearchUsersDisplayNameIsExactMatch(t *testing.T) {
 	assert.Equal(t, "zs1", users[0].Username)
 }
 
-func TestSearchUsersDefaultExcludesSoftDeletedFromItemsAndTotal(t *testing.T) {
+// 未指定 status 时保持上游口径：软删用户既进 items 也进 total。
+// 管理端要靠这一档看到已注销账号，默认过滤掉会让「注销后由管理员处理」断在第一步。
+func TestSearchUsersDefaultIncludesSoftDeletedInItemsAndTotal(t *testing.T) {
 	truncateTables(t)
 	insertFilterUser(t, "alive", "活着", nil)
 	gone := insertFilterUser(t, "gone", "已注销", nil)
@@ -65,9 +67,8 @@ func TestSearchUsersDefaultExcludesSoftDeletedFromItemsAndTotal(t *testing.T) {
 
 	users, total, err := SearchUsers("", "", nil, nil, nil, "", "", 0, 10)
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, total, "total 必须与 items 同源，否则列表出现空页")
-	assert.Len(t, users, 1)
-	assert.Equal(t, "alive", users[0].Username)
+	assert.EqualValues(t, 2, total, "total 必须与 items 同源，否则列表出现空页")
+	assert.Len(t, users, 2)
 }
 
 func TestSearchUsersStatusMinusOneReturnsOnlySoftDeleted(t *testing.T) {
