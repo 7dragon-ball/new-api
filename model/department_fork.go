@@ -1,7 +1,6 @@
 package model
 
 import (
-	"errors"
 	"strings"
 	"unicode/utf8"
 
@@ -10,9 +9,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// [FORK] 部门名归一后为空或超长。message 会被 ApiError 原样渲染进响应体的
-// `message` 字段，前端直接展示，所以这句话本身就是给运营看的文案。
-var ErrDepartmentNameInvalid = errors.New("Department name must be 1-30 characters (spaces are trimmed)")
+// [FORK] 部门名归一后为空或超长。用 common.NewMessage 而不是 errors.New：这句话
+// 既是响应体的 message，也是前端 locale 文件里的 key（message_key），非英文界面
+// 才翻译得出来；与本文件的 ErrDepartmentNotFound 同一种写法。
+var ErrDepartmentNameInvalid = common.NewMessage("Department name must be 1-30 characters (spaces are trimmed)")
 
 // [FORK] 部门不存在。建号、改归属、删部门三条路径共用这一个错误值。
 // 用 common.NewMessage：它会经 common.ApiError 一并带上 message_key，

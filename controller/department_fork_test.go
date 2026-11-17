@@ -67,6 +67,8 @@ func TestCreateDepartmentRejectsInvalidName(t *testing.T) {
 		_, resp := departmentRequest(t, http.MethodPost, "/api/department/", body, nil, CreateDepartment)
 		assert.Equal(t, false, resp["success"], "body=%s", body)
 		assert.Equal(t, "Department name must be 1-30 characters (spaces are trimmed)", resp["message"], "body=%s", body)
+		// 带上 message_key，非英文界面才翻译得出来（其余错误都由 ApiErrorT/NewMessage 带）。
+		assert.Equal(t, "Department name must be 1-30 characters (spaces are trimmed)", resp["message_key"], "body=%s", body)
 	}
 }
 
