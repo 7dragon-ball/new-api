@@ -117,9 +117,13 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 
 - **有意不加外键**：外键的 RESTRICT 看不见 `deleted_at`，被软删除的用户仍会挡住部门删除。
   「还有几个用户」这条检查由 `DeleteDepartment` 自己数未软删的行。
+- **没有外键就得自己保证引用完整性**：删部门与改归属都先 `SELECT ... FOR UPDATE` 锁住部门行
+  （`model.LockDepartmentWithTx`），否则「数出 0 个成员 → 删除」与并发的「改归属到本部门」
+  会交错，留下指向已删部门的孤儿归属。SQLite 不支持该语法，由它的单写者模型兜底。
 - `users.department_id` 声明成 `*int` 而不是 `int`：GORM 零值跳过会让可空 FK 写不进 NULL。
 - **不复用 `PUT /api/user/` 改部门**：那是上游自带前端在用的整行替换接口，请求体不带部门时会被
-  整行覆盖清空。部门改归属走独立的 `PUT /api/user/:id/department`。
+  整行覆盖清空。部门改归属走独立的 `PUT /api/user/:id/department`，且请求体**必须**显式带
+  `department_id`（要清空就传 `null`）；字段缺失报错而不是当成清空，避免参数名拼错静默清空部门。
 - 部门用量聚合的三个数据源各自聚合成 CTE 再 LEFT JOIN：摊平成多表 JOIN 会做
   `users × tokens × quota_data` 笛卡尔积，有 N 把秘钥的用户用量被放大 N 倍。
 
@@ -142,14 +146,14 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 
 ## 改了哪些文件
 
-共 22 个文件（9 个被改、13 个新增），+2101/-62。
+共 23 个文件（10 个上游文件被改、12 个新增、1 个改名），+2217/−23（不含 `fork/` 目录本身）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
 | 文件 | 改动 | 风险 |
 |---|---|---|
 | `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` 与 `DepartmentId` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，三组定制都改它 |
-| `controller/user.go` | `CreateUser` 允许 root 建 root 并接受部门；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选；新增 `UpdateUserDepartment` | **高** |
+| `controller/user.go` | `CreateUser` 允许 root 建 root 并接受部门；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
 | `router/api-router.go` | 三处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments` | 中，三组都插在同一文件 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 4 项 | 低 |
 | `service/security_verification.go` | proof action 白名单加 2 项 | 低 |
@@ -157,13 +161,14 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 | `model/task_cas_test.go` | 测试的 `AutoMigrate` 同样加 `&Department{}` | 低 |
 | `model/user_pagination_test.go` | `SearchUsers` 签名变化，补两个参数 | 低 |
 | `controller/security_enrollment_test.go` | 绑定清单加用例 | 低 |
+| `model/user_authentication_test.go` | 补 `deleteUserAuthenticationData` 的用例（只清目标用户、软删行、失败传播） | 低 |
 
 **本 fork 新增（文件名带 `_fork` 后缀，上游不可能改，merge 时不会冲突）**
 
 | 文件 | 内容 |
 |---|---|
-| `model/department_fork.go` | `Department` 模型、名字归一与校验 |
-| `controller/department_fork.go` | 四个 CRUD handler + `isDuplicateKey` |
+| `model/department_fork.go` | `Department` 模型、名字归一与校验、`LockDepartmentWithTx` / `EnsureDepartmentExistsWithTx` |
+| `controller/department_fork.go` | 四个 CRUD handler + `PUT /api/user/:id/department` + `isDuplicateKey` |
 | `controller/department_usage_fork.go` | 部门用量聚合 handler |
 | `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go` | controller 包测试 |
 | `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go` | model 包测试 |
@@ -182,16 +187,16 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [TM-FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 46 处、10 个文件：
+当前共 49 处、10 个文件：
 
 | 文件 | 处数 |
 |---|---|
 | `model/user.go` | 14 |
-| `controller/user.go` | 11 |
+| `controller/user.go` | 10 |
 | `model/user_last_called_fork_test.go` | 6 |
-| `controller/department_fork.go` | 5 |
+| `controller/department_fork.go` | 6 |
+| `model/department_fork.go` | 6 |
 | `router/api-router.go` | 3 |
-| `model/department_fork.go` | 3 |
 | `controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`service/security_verification.go` | 各 1 |
 
 ```bash
@@ -201,6 +206,10 @@ grep -rn "\[TM-FORK\]" --include="*.go" .
 `model/main.go` 的 `&Department{}` 与 `model/user_pagination_test.go`、`model/task_cas_test.go`
 的改动没有加标记——它们是机械连带（表要迁移、签名要跟着改），单看那一行就能看懂，加标记反而
 增加 merge 冲突面。判断是否漏改时，用上表的文件清单核对，不要只看 grep 结果。
+
+**新增文件放哪**：`UpdateUserDepartment` 曾经写在 `controller/user.go`（上游文件）里，后来搬到
+`controller/department_fork.go`。它是纯新增 handler，同包就能拿到 `canManageTargetRole` 与
+`recordManageAuditFor`，留在 `_fork` 文件里能让 `user.go` 这个冲突最高的文件少一段。
 
 ## 上游升级
 
@@ -231,6 +240,9 @@ merge 无冲突时直接进验证。有冲突时按下面的原则处理。
 - `adminUserManageActions` 是白名单，上游新增 action 时**取并集**。
 - 部门相关的手写 SQL（删除计数、用量聚合）都写 `department`（单数），
   `Department.TableName()` 必须保持单数，否则上游若改动默认命名策略会静默错表。
+- 删部门与改归属的部门行锁（`model.LockDepartmentWithTx`）不能省。部门有意不加外键，
+  这把锁是唯一挡住「孤儿归属」的东西；上游若改 `lockForUpdate`，两处调用点要一起验证
+  （`TestLockDepartmentWithTxEmitsRowLock` 会直接变红）。
 - `SearchUsers` 的参数列表是定制扩展过的。上游若重构它（例如换成 options 结构体），
   跟着上游的新签名走，把 `departmentID`/`username`/`displayName` 作为新字段塞进去，不要保留旧签名。
 - `model/user.go` 里 `User` 结构体的对齐格式差异：只保留字段新增，不要为消掉格式 diff 去重排上游字段。
@@ -275,7 +287,7 @@ verify passed
 
 ```bash
 docker run --rm \
-  -v /绝对路径/new-api:/src -v tm-gomod:/go/pkg/mod -w /src \
+  -v /绝对路径/new-api:/src -v newapi-gomod:/go/pkg/mod -w /src \
   -e GOWORK=off -e GOPROXY=https://goproxy.cn,direct \
   -e TEST_POSTGRES_DSN='postgres://user:pass@host:5432/newapi_test?sslmode=disable' \
   golang:1.26.10-alpine \
@@ -289,28 +301,28 @@ docker run --rm \
 ### 构建镜像
 
 ```bash
-fork/scripts/build.sh                              # 默认 tag：rc.49-tm3
+fork/scripts/build.sh                              # 默认 tag：构建日期-提交短号，如 20261117-600d1f3aa
 fork/scripts/build.sh /path/to/new-api my-tag-1    # 自定义源码路径与 tag
 ```
 
 构建时间包含一次 `bun install` 加前端构建（Dockerfile 第一阶段），不能跳过。
 
-> **tag 约定见 `token-master2/deploy/.env.example`**：`tm1`=多 root，`tm2`=加最近调用，
-> `tm3`=加部门。源码里三组定制恒在，所以默认 tag 是 `rc.49-tm3`。**不要打 `tm1`/`tm2`**——
-> 源码不会退回中间状态，打小号 tag 只会让部署侧误判，跑起来部门列、部门筛选与聚合接口整块 404。
+> **默认 tag 是 `<构建日期>-<HEAD 短号>`**，在源码目录里现算，记录这次镜像对应哪个提交。
+> 源码里三组定制（多 root、最近调用、部门）恒在，tag 不再编码定制组，也不再沿用上游版本号。
+> 工作区有未提交改动时 tag 只反映 HEAD，不反映改动，别用它反推镜像内容。
 
 国内网络通常拉不到 registry 与 Go proxy，用环境变量显式传代理，**不要**指望 shell 里的
 `HTTPS_PROXY` 自动生效：
 
 ```bash
-TM_BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.sh
+BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.sh
 ```
 
 宿主机上的 `127.0.0.1:xxxx` 进了容器指向容器自身，传进去等于没配。要填**容器可达**的地址
 （colima 下一般是宿主内网 IP）。
 
-> **tag 里的 `rc.49` 只是沿用部署侧命名习惯，不代表源码基线是上游 `v1.0.0-rc.49`。**
-> 上线前必须跑完整回归。本 fork 的基线提交是 `6ef123cd5`。
+> **tag 里的日期是构建当天的日期，`600d1f3aa` 是构建时的 HEAD 短号**，都不代表源码基线是上游
+> 某个版本。上线前必须跑完整回归。本 fork 的基线提交是 `6ef123cd5`。
 
 ## 新增接口能力
 
@@ -320,11 +332,13 @@ TM_BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.
 - `GET /api/user/`、`GET /api/user/search`、`GET /api/user/:id` 的响应里 `User` 多了
   `last_called_at`（秒级 Unix 时间，`0` 表示从未调用）与 `department_id`（`null` 表示未分配）。
 - `GET /api/user/search` 多了三个精确筛选参数：`department_id`、`username`、`display_name`。
-  非法 `department_id` 返回 400 而不是静默忽略。
+  非法 `department_id` 显式报错而不是静默忽略。注意响应是 **HTTP 200 + `success: false`**
+  （`common.ApiErrorT` → `common.ApiError` 固定 200，与上游所有控制台错误一致），
+  调用方要按 `success` 判成败，不能按 4xx 判。
 - `POST /api/user/` 接受 `department_id`，并在响应 `data.id` 里回传新用户 id。
 - `GET|POST|PUT /api/department/`、`DELETE /api/department/:id`：部门字典读写。
 - `PUT /api/user/:id/department`：改单个用户的部门归属，请求体 `{"department_id": <id>}`，
-  传 `null` 表示清空。
+  传 `null` 表示清空；**不带该字段返回 `Invalid parameters`**，不会被当成清空。
 - `GET /api/data/departments?start_timestamp=&end_timestamp=`：部门用量聚合，
   返回 `members`/`keys`/`calls`/`tokens`/`quota`。
 
@@ -351,7 +365,7 @@ TM_BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.
 | 现象 | 说明 |
 |---|---|
 | root 之间可互相重置密码、互相禁用、互相撤销 root | step-up 只证明「操作者是某个 root」，不区分是哪一个。这是多 root 的固有代价，不是缺陷。全部动作进上游审计。 |
-| `grant_root` 不吊销目标会话 | 与上游升权一致（上游只在降级时吊销）。降权会即时生效，因为鉴权读取实时角色。 |
+| `grant_root` 会吊销目标会话 | role 变更走 `UpdateWithTx` 的 `authChanged` 分支，递增 auth version → `Update` 调 `RevokeAllUserSessions`。上游 `promote` 走同一路径，所以升权也会踢下线；目标用户需要重新登录。降权同理，且即时生效（鉴权读实时角色）。 |
 | 渠道测试固定取「第一个 root」当测试用户 | 多 root 下取到哪个不确定，行为可接受。 |
 | 渠道通知默认发给所有未显式配置的 root | 多 root 后收件人变多，行为可接受。 |
 | `CountEnabledRootUsers` 生产代码里没有调用点 | 守卫走的是加锁路径。该函数留给排查与测试用。 |
