@@ -42,6 +42,7 @@ fork/
 controller/department_fork.go            # 不是 controller/fork/department.go
 controller/department_fork_test.go
 model/department_fork.go
+model/goose_fork.go
 ```
 
 不建 `controller/fork/` 子目录，原因是 **Go 的包边界是目录**：子目录里的文件即使写
@@ -50,6 +51,40 @@ model/department_fork.go
 且对编译、测试、merge 零影响。
 
 改**上游已有文件**的部分仍然靠 `// [FORK]` 标记（见「标记约定」）。
+
+### 数据库迁移（goose）
+
+**PostgreSQL 上需要 AutoMigrate 之外的 schema 变更统一走内嵌 goose 迁移**，当前第一份是
+`department` 表；其余表仍由 `migrateDB()` 的 AutoMigrate 建。两者在同一时点执行：
+`migrateDB()` 先跑 goose，再跑 AutoMigrate。
+
+```
+model/goose_fork.go                      # //go:embed + goose.NewProvider + Up()
+model/migrations/postgres/*.sql          # 只有 PG 一份，收录该目录下全部迁移
+```
+
+`runForkMigrations()` 按方言目录整体执行，不认识具体表名：以后新增一张表只要往
+`model/migrations/postgres/` 加一份 SQL，Go 代码一行都不用改。
+
+- **goose 是 Go 库，不是独立容器。** 用 `github.com/pressly/goose/v3` 的 Provider API，
+  直接复用 `DB.DB()` 那条连接池。本 fork 单镜像部署，外部迁移容器会让「表是否存在」
+  取决于 compose 启动顺序，比 AutoMigrate 更脆弱。
+- **只写 PostgreSQL 一份 SQL。** 本 fork 只跑 PG（见「数据库」），所以不写 SQLite / MySQL
+  分支——多一份方言 SQL 就多一份要同步维护、却没人验证的东西。`department` 已从
+  `migrateDB()` 的 AutoMigrate 列表移除，非 PG 的库会缺这张表；本 fork 不承诺 PG 之外能启动。
+  测试库是例外：各测试自己 AutoMigrate 建表，不走 goose。
+- **迁移文件名用 `YYYYMMDDHHMMSS_<动词>_<对象>.sql`**，与 `token-master2-dept/migrations/`
+  一致，不用 goose 默认的 `00001_` 序号。序号的坑是两人同时加迁移会撞号，而时间戳天然有序。
+  已执行的迁移**不能改名、不能改内容** —— goose 用文件名里的版本号记「已应用」。
+- **SQL 一律 `IF NOT EXISTS`。** 已在跑的 PG 库里 `department` 表是旧版 AutoMigrate 建的，
+  迁移必须在那类库上变成空操作，否则升级即失败。也正因如此，首次切换到 goose 不需要
+  baseline 步骤：goose 只是把版本号写进 `goose_db_version`，表本身没变。
+- **版本表名是 goose 默认的 `goose_db_version`**，与上游的 GORM 表都不撞名。
+- 新增 PG 迁移：往 `model/migrations/postgres/` 加文件 → 用 `TEST_POSTGRES_DSN` 跑
+  `TestForkMigrationsOnPostgres`。没有 PG 实例时这条用例会 SKIP，**不算验证过**。
+
+`fork/README.md` 之外**没有**额外的迁移文档；`token-master2-dept/` 的 goose 迁移与本仓库无关，
+那是业务库 `token_master` 的。
 
 ## 分支与远端
 
@@ -125,13 +160,24 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
   `department_id`（要清空就传 `null`）；字段缺失报错而不是当成清空，避免参数名拼错静默清空部门。
 - 部门用量聚合的三个数据源各自聚合成 CTE 再 LEFT JOIN：摊平成多表 JOIN 会做
   `users × tokens × quota_data` 笛卡尔积，有 N 把秘钥的用户用量被放大 N 倍。
+- **`department` 表在 PG 上由 goose 迁移建，不在 AutoMigrate 列表里**（见「数据库迁移（goose）」）。
+  AutoMigrate 只会加列，改约束与回填数据都做不了，部门表下一步就要加约束与回填，
+  所以一次性交给迁移工具。本 fork 不承诺 PG 之外的库，因此没有为其它方言保留 AutoMigrate 兜底。
 
 **发布顺序**：必须先部署含这些接口的新版 BFF，再执行删掉 `token_master.department` 与
-`user_profile.department_id` 的 goose 迁移。旧版 BFF 仍在读写那两列，列一删就立刻报错。
+`user_profile.department_id` 的 goose 迁移（那是业务库的迁移，在 `token-master2-dept/migrations/`，
+与本仓库内嵌的 goose 是两套）。旧版 BFF 仍在读写那两列，列一删就立刻报错。
+
+`new_api` 库这一侧不需要额外步骤：`department` 表与 `users.department_id` 都随新版镜像启动
+自动就位（前者由内嵌 goose 迁移建，后者仍由 AutoMigrate 加列）。
 
 ## 数据库
 
-本 fork 实际运行的库是 PostgreSQL，自动化测试用 SQLite 内存库，**MySQL 不在本 fork 的运行范围内**。
+本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
+
+部门表的 goose 迁移**只写 PostgreSQL 一份**（见「数据库迁移（goose）」）。`department` 已从
+AutoMigrate 列表移除，因此用 SQLite / MySQL 跑生产启动会缺这张表——这是有意的，本 fork 不为
+PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrate 建表，从不调用 `migrateDB()`。
 
 需要留意的是：上游 new-api 本身支持 SQLite / MySQL ≥ 5.7.8 / PostgreSQL ≥ 9.6，仓库根的
 `AGENTS.md` 也要求改动对三库兼容。本 fork 的手写 SQL 与错误判定目前**只按 PG + SQLite 两支写**：
@@ -140,12 +186,12 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
   `UNIQUE constraint failed` 文本，没有 MySQL 的 `1062`；
 - 同一文件的 `LIKE ... ESCAPE '\'` 转义写法也只保证 PG 与 SQLite。
 
-因此若要把本 fork 部署到 MySQL，这两处必须先补 MySQL 分支并做三库实测。仅在当前 PG 部署下
+因此若要把本 fork 部署到 MySQL，这几处必须先补 MySQL 分支并做三库实测。仅在当前 PG 部署下
 运行不受影响。
 
 ## 改了哪些文件
 
-共 23 个文件（10 个上游文件被改、12 个新增、1 个改名），+2217/−23（不含 `fork/` 目录本身）。
+共 29 个文件（12 个上游文件被改、17 个新增），+2431/−62（不含 `fork/` 目录本身）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
@@ -156,7 +202,7 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 | `router/api-router.go` | 三处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments` | 中，三组都插在同一文件 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 4 项 | 低 |
 | `service/security_verification.go` | proof action 白名单加 2 项 | 低 |
-| `model/main.go` | `AutoMigrate` 列表加 `&Department{}` | 低 |
+| `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
 | `model/task_cas_test.go` | 测试的 `AutoMigrate` 同样加 `&Department{}` | 低 |
 | `model/user_pagination_test.go` | `SearchUsers` 签名变化，补两个参数 | 低 |
 | `controller/security_enrollment_test.go` | 绑定清单加用例 | 低 |
@@ -167,6 +213,8 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 | 文件 | 内容 |
 |---|---|
 | `model/department_fork.go` | `Department` 模型、名字归一与校验、`LockDepartmentWithTx` / `EnsureDepartmentExistsWithTx` |
+| `model/goose_fork.go` | 内嵌 PG 迁移的 goose 集成：`Provider.Up()`、非 PG 库直接拒绝 |
+| `model/migrations/postgres/*.sql` | 部门表建表迁移（仅 PG） |
 | `controller/department_fork.go` | 四个 CRUD handler + `PUT /api/user/:id/department` + `isDuplicateKey` |
 | `controller/department_usage_fork.go` | 部门用量聚合 handler |
 | `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go` | controller 包测试 |
@@ -186,7 +234,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 48 处、10 个文件：
+当前共 50 处、12 个文件：
 
 | 文件 | 处数 |
 |---|---|
@@ -196,15 +244,15 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `controller/department_fork.go` | 6 |
 | `model/department_fork.go` | 6 |
 | `router/api-router.go` | 3 |
-| `controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`service/security_verification.go` | 各 1 |
+| `model/main.go`、`model/goose_fork.go`、`controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`service/security_verification.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
 ```
 
-`model/main.go` 的 `&Department{}` 与 `model/user_pagination_test.go`、`model/task_cas_test.go`
-的改动没有加标记——它们是机械连带（表要迁移、签名要跟着改），单看那一行就能看懂，加标记反而
-增加 merge 冲突面。判断是否漏改时，用上表的文件清单核对，不要只看 grep 结果。
+`model/main.go` 里 `migrateDB()` 那一行、`model/user_pagination_test.go`、`model/task_cas_test.go`
+的改动没有全部加标记——它们是机械连带（先跑 goose、签名要跟着改），单看那一行就能看懂，
+加标记反而增加 merge 冲突面。判断是否漏改时，用上表的文件清单核对，不要只看 grep 结果。
 
 **新增文件放哪**：`UpdateUserDepartment` 曾经写在 `controller/user.go`（上游文件）里，后来搬到
 `controller/department_fork.go`。它是纯新增 handler，同包就能拿到 `canManageTargetRole` 与
@@ -246,6 +294,11 @@ merge 无冲突时直接进验证。有冲突时按下面的原则处理。
 - `SearchUsers` 的参数列表是定制扩展过的。上游若重构它（例如换成 options 结构体），
   跟着上游的新签名走，把 `departmentID`/`username`/`displayName` 作为新字段塞进去，不要保留旧签名。
 - `model/user.go` 里 `User` 结构体的对齐格式差异：只保留字段新增，不要为消掉格式 diff 去重排上游字段。
+- **上游若开始用 goose 或其它迁移工具**：不要直接采纳。本 fork 的 goose 接线
+  （`model/goose_fork.go` 与 `model/migrations/`）与 `goose_db_version` 表必须与上游方案共存或合并，
+  否则同一次启动会建两套版本表。先确认上游的版本表名与方言，再决定是并进去还是改本 fork 的路径。
+- **`model/main.go` 的 AutoMigrate 列表**：上游新增模型时正常取并集，但**不要**把
+  `&Department{}` 加回去——部门表归 goose 管，两套机制同时管一张表会导致每次重启都尝试改列。
 
 ### 验证
 
@@ -272,7 +325,7 @@ gofmt -l controller model service middleware     # CI 不查格式，本地补�
   `golang:1.26.10-alpine` 容器里跑上面这几条——注意 Docker 内存低于 4G 时 `go build ./...`
   容易被 OOM kill，`signal: killed` 就是这个原因，不是编译错误。
 
-仅编译通过不算升级成功——下面「测试覆盖不到」那四项仍需人工验证。
+仅编译通过不算升级成功——下面「测试覆盖不到」那五项仍需人工验证。
 
 ### 并发用例（可选，需要 Postgres）
 
@@ -346,9 +399,9 @@ docker build \
 目标用户存在且状态合法。部门的写操作与改归属都受 `canManageTargetRole` 约束（同级或更高角色的
 账号不可操作）。
 
-## 测试覆盖不到的四点
+## 测试覆盖不到的五点
 
-自动化测试覆盖了不变量、写路径与接口行为，但以下四项只能人工验证：
+自动化测试覆盖了不变量、写路径与接口行为，但以下五项只能人工验证：
 
 1. **`revoke_root` 的 Casbin override 清理**：现有测试无法区分「走了 `demote` 分支」与「走了
    `else` 分支」，两条都会把 role 写成 1。唯一手段是在 Postgres 上直接查 `casbin_rule`
@@ -359,6 +412,11 @@ docker build \
    零成员部门不丢失，但真实库里「一个用户多把秘钥」「跨部门迁移后历史流水仍记在旧账上」等
    形态要拿生产数据抽样核对。特别地，`keys` 只统计成员**当前**拥有的有效秘钥数。
 4. **前端渲染**：本仓库前端未改动，若在自己前端展示这些字段/接口，属另一侧的验证。
+5. **goose 迁移只有 PG 一份，且需要真实 PG 才能验证。** `TestForkMigrationsOnPostgres`
+   验证建表、唯一索引、重复执行幂等，但它要求 `TEST_POSTGRES_DSN`，没配时 SKIP——
+   **SKIP 不等于通过**。上线前必须对真实 PG 跑一次，覆盖「空库启动」与「已有 department 表
+   （旧版 AutoMigrate 建的）启动」两种形态，并确认 `goose_db_version` 里记下了版本、
+   `\d department` 与旧表结构一致。
 
 ## 已知限制（有意不修）
 
