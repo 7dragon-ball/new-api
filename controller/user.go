@@ -371,7 +371,8 @@ func SearchUsers(c *gin.Context) {
 	if v := strings.TrimSpace(c.Query("department_id")); v != "" {
 		parsed, err := strconv.Atoi(v)
 		if err != nil || parsed <= 0 {
-			// 非法 id 直接 400，不静默忽略：否则「筛了但没筛」会让运营以为部门下真的没用户。
+			// 非法 id 显式报错，不静默忽略：否则「筛了但没筛」会让运营以为部门下真的没用户。
+			// 注意这是 common.ApiErrorT，响应仍是 HTTP 200 + success:false（见 common/gin.go 的 ApiError）。
 			common.ApiErrorT(c, "Invalid parameters")
 			return
 		}
@@ -1053,20 +1054,14 @@ func CreateUser(c *gin.Context) {
 		// [TM-FORK] 部门归属随建号一并写上游，与 users 同一事务
 		DepartmentId: user.DepartmentId,
 	}
-	// [TM-FORK] 部门不存在是最常见的可预见失败，在开启事务前挡掉（被拒时 users 表不得新增行）
-	if user.DepartmentId != nil {
-		var exists int64
-		if err := model.DB.Model(&model.Department{}).Where("id = ?", *user.DepartmentId).Count(&exists).Error; err != nil {
-			common.ApiError(c, err)
-			return
-		}
-		if exists == 0 {
-			common.ApiErrorT(c, "Department not found")
-			return
-		}
-	}
+	// [TM-FORK] 部门存在性校验与建号放进同一事务，被拒时 users 表不得新增行。
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if user.DepartmentId != nil {
+			if err := model.EnsureDepartmentExistsWithTx(tx, *user.DepartmentId); err != nil {
+				return err
+			}
+		}
 		if err := cleanUser.InsertWithTx(tx, 0); err != nil {
 			return err
 		}
@@ -1389,62 +1384,6 @@ type UpdateUserSettingRequest struct {
 	ChannelNotifyEnabled             *bool   `json:"channel_notify_enabled,omitempty"`
 	AcceptUnsetModelRatioModel       bool    `json:"accept_unset_model_ratio_model"`
 	RecordIpLog                      bool    `json:"record_ip_log"`
-}
-
-// [TM-FORK] PUT /api/user/:id/department  请求体 {"department_id": 2} 或 {"department_id": null}
-// 独立接口而不复用 PUT /api/user/：后者是整行替换语义，上游 UI 不传 department_id 就会把它清空。
-func UpdateUserDepartment(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil || id <= 0 {
-		common.ApiErrorT(c, "Invalid parameters")
-		return
-	}
-	originUser, err := model.GetUserById(id, false)
-	if err != nil {
-		common.ApiErrorT(c, "User not found")
-		return
-	}
-	// 与 UpdateUser / ManageUser / DeleteUser 同一条边界：同级或更高角色的账号不可操作。
-	// 漏掉这一句时，role=10 的管理员能改 role=100 的部门，而它连读该用户都会被拒。
-	if !canManageTargetRole(c.GetInt("role"), originUser.Role) {
-		common.ApiErrorT(c, "No permission to update users of same or higher permission level")
-		return
-	}
-	var req struct {
-		DepartmentID *int `json:"department_id"`
-	}
-	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
-		common.ApiErrorT(c, "Invalid parameters")
-		return
-	}
-	// null 表示清空，跳过部门存在性校验
-	if req.DepartmentID != nil {
-		var exists int64
-		if err := model.DB.Model(&model.Department{}).Where("id = ?", *req.DepartmentID).Count(&exists).Error; err != nil {
-			common.ApiError(c, err)
-			return
-		}
-		if exists == 0 {
-			common.ApiErrorT(c, "Department not found")
-			return
-		}
-	}
-	// 直接写列，绕开 UpdateWithTx：那里是全字段 Updates，会把整行按内存值回写。
-	// 显式 nil 写成 NULL 是这里唯一的目的。
-	if err := model.DB.Model(&model.User{}).Where("id = ?", id).
-		Update("department_id", req.DepartmentID).Error; err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	// 审计参数传解引用后的值而不是 *int：auditContentEN 用 %v 渲染模板里的占位符，
-	// 传指针会让 Content 写成 "0xc0004a21b0"（清空时是 "<nil>"）。
-	auditDepartmentID := any(nil)
-	if req.DepartmentID != nil {
-		auditDepartmentID = *req.DepartmentID
-	}
-	recordManageAuditFor(c, id, "user.department_update",
-		map[string]any{"id": id, "department_id": auditDepartmentID})
-	common.ApiSuccess(c, nil)
 }
 
 func UpdateUserSetting(c *gin.Context) {

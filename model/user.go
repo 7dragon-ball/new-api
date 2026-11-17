@@ -490,16 +490,12 @@ func SearchUsers(keyword string, group string, role *int, status *int, departmen
 	if displayName != "" {
 		query = query.Where("display_name = ?", displayName)
 	}
-	// [TM-FORK] status 未指定时只返回未删除用户，total 与 items 同源。
-	// 原实现用 Unscoped() 把软删除用户也算进 total，管理端必须自己相减修正。
 	if status != nil {
 		if *status == -1 {
 			query = query.Where("deleted_at IS NOT NULL")
 		} else {
 			query = query.Where("deleted_at IS NULL").Where("status = ?", *status)
 		}
-	} else {
-		query = query.Where("deleted_at IS NULL")
 	}
 
 	// 获取总数

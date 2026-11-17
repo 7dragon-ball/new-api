@@ -4,9 +4,34 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/utils/tests"
 )
+
+// 锁必须真的发 FOR UPDATE。GORM v2 会静默忽略旧的 Set("gorm:query_option")，
+// lockForUpdate 是唯一正确的写法；这条用例钉住 LockDepartmentWithTx 走的是它。
+func TestLockDepartmentWithTxEmitsRowLock(t *testing.T) {
+	dummyDB, err := gorm.Open(tests.DummyDialector{}, &gorm.Config{DryRun: true})
+	require.NoError(t, err)
+
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypeSQLite)
+	t.Cleanup(func() { common.SetDatabaseTypes(previousMain, previousLog) })
+
+	var captured string
+	require.NoError(t, dummyDB.Callback().Query().After("gorm:query").Register("test:capture_lock_sql", func(db *gorm.DB) {
+		captured = db.Statement.SQL.String()
+	}))
+	_, err = LockDepartmentWithTx(dummyDB, 7)
+	require.NoError(t, err)
+
+	sql := strings.ReplaceAll(captured, "`", "")
+	assert.Contains(t, sql, "FROM department")
+	assert.Contains(t, sql, "FOR UPDATE", "锁必须在 SQL 里，否则并发删部门检查形同虚设")
+}
 
 func TestDepartmentTableNameIsSingular(t *testing.T) {
 	// 手写 SQL（删除计数、部门用量聚合）都写 department，靠 TableName 钉死单数。
