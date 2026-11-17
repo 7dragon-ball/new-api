@@ -18,9 +18,7 @@
 - **上游前进后旧补丁整体失效**。补丁记的是导出时的上游上下文，上游一重构，全部补丁同时变红，
   而不是只有真正冲突的那几块变红。
 
-直接改源码之后，merge 时 git 的合并算法按行处理，只有真正重叠的行才冲突。实测（2026-11-16）：
-从基线 `6ef123cd5` 合并 `upstream/main` 的 11 个提交、63 个文件，**零冲突**——上游这段时间没有
-碰我们改过的任何一个文件。这是直接改源码的常态收益，补丁方式做不到。
+直接改源码之后，merge 时 git 的合并算法按行处理，只有真正重叠的行才冲突。
 
 代价是 `// [TM-FORK]` 标记成了唯一线索，因此每处改动都必须在标记的上一行说清「为什么和上游不同」。
 
@@ -35,6 +33,24 @@ fork/
 ```
 
 上游自带的 `docs/` 与本目录无关，需要的信息都在这里。
+
+### 新增文件放在哪
+
+**新增文件留在它所属的包里，文件名加 `_fork` 后缀**（测试文件是 `xxx_fork_test.go`，
+因为 Go 要求 `_test.go` 必须在末尾）：
+
+```
+controller/department_fork.go            # 不是 controller/fork/department.go
+controller/department_fork_test.go
+model/department_fork.go
+```
+
+不建 `controller/fork/` 子目录，原因是 **Go 的包边界是目录**：子目录里的文件即使写
+`package controller`，也是另一个包，拿不到 `recordManageAudit`、`parseFlowQuotaTimeRange`
+这些上游未导出的符号；包内测试也无法跟随。`_fork` 后缀让文件留在同包，`ls` 一眼可辨，
+且对编译、测试、merge 零影响。
+
+改**上游已有文件**的部分仍然靠 `// [TM-FORK]` 标记（见「标记约定」）。
 
 ## 分支与远端
 
@@ -110,6 +126,20 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 **发布顺序**：必须先部署含这些接口的新版 BFF，再执行删掉 `token_master.department` 与
 `user_profile.department_id` 的 goose 迁移。旧版 BFF 仍在读写那两列，列一删就立刻报错。
 
+## 数据库
+
+本 fork 实际运行的库是 PostgreSQL，自动化测试用 SQLite 内存库，**MySQL 不在本 fork 的运行范围内**。
+
+需要留意的是：上游 new-api 本身支持 SQLite / MySQL ≥ 5.7.8 / PostgreSQL ≥ 9.6，仓库根的
+`AGENTS.md` 也要求改动对三库兼容。本 fork 的手写 SQL 与错误判定目前**只按 PG + SQLite 两支写**：
+
+- `controller/department_fork.go` 的 `isDuplicateKey` 只认 Postgres 的 `23505` 与 SQLite 的
+  `UNIQUE constraint failed` 文本，没有 MySQL 的 `1062`；
+- 同一文件的 `LIKE ... ESCAPE '\'` 转义写法也只保证 PG 与 SQLite。
+
+因此若要把本 fork 部署到 MySQL，这两处必须先补 MySQL 分支并做三库实测。仅在当前 PG 部署下
+运行不受影响。
+
 ## 改了哪些文件
 
 共 22 个文件（9 个被改、13 个新增），+2101/-62。
@@ -128,10 +158,17 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 | `model/user_pagination_test.go` | `SearchUsers` 签名变化，补两个参数 | 低 |
 | `controller/security_enrollment_test.go` | 绑定清单加用例 | 低 |
 
-**本 fork 新增（上游不可能改，merge 时不会冲突）**
+**本 fork 新增（文件名带 `_fork` 后缀，上游不可能改，merge 时不会冲突）**
 
-`model/department.go`、`controller/department.go`、`controller/department_usage.go`，以及 10 个
-新增的 `*_test.go`（另有 3 个上游测试文件被改签名或补迁移）。上游若在这些路径放了同名文件，
+| 文件 | 内容 |
+|---|---|
+| `model/department_fork.go` | `Department` 模型、名字归一与校验 |
+| `controller/department_fork.go` | 四个 CRUD handler + `isDuplicateKey` |
+| `controller/department_usage_fork.go` | 部门用量聚合 handler |
+| `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go` | controller 包测试 |
+| `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go` | model 包测试 |
+
+（另有 3 个上游测试文件被改签名或补迁移。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 
 `model/user.go` 里有一段 `User` 结构体的整段对齐格式化 diff（加字段导致列宽变化），属噪声，
@@ -151,11 +188,11 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 |---|---|
 | `model/user.go` | 14 |
 | `controller/user.go` | 11 |
-| `model/user_last_called_test.go` | 6 |
-| `controller/department.go` | 5 |
-| `model/department.go` | 3 |
+| `model/user_last_called_fork_test.go` | 6 |
+| `controller/department_fork.go` | 5 |
 | `router/api-router.go` | 3 |
-| `controller/audit.go`、`controller/department_usage.go`、`controller/security_enrollment_test.go`、`service/security_verification.go` | 各 1 |
+| `model/department_fork.go` | 3 |
+| `controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`service/security_verification.go` | 各 1 |
 
 ```bash
 grep -rn "\[TM-FORK\]" --include="*.go" .
