@@ -366,7 +366,7 @@ func SearchUsers(c *gin.Context) {
 			status = &parsed
 		}
 	}
-	// [TM-FORK] 部门 / 账号 / 显示名精确筛选
+	// [FORK] 部门 / 账号 / 显示名精确筛选
 	var departmentID *int
 	if v := strings.TrimSpace(c.Query("department_id")); v != "" {
 		parsed, err := strconv.Atoi(v)
@@ -1031,7 +1031,7 @@ func CreateUser(c *gin.Context) {
 		user.DisplayName = user.Username
 	}
 	myRole := c.GetInt("role")
-	// [TM-FORK] 多 root：root 可以创建同级（root）账号；其他角色仍不得创建同级或更高。
+	// [FORK] 多 root：root 可以创建同级（root）账号；其他角色仍不得创建同级或更高。
 	if user.Role >= myRole && myRole != common.RoleRootUser {
 		common.ApiErrorT(c, "Cannot create users with permission level equal to or higher than yourself")
 		return
@@ -1051,10 +1051,10 @@ func CreateUser(c *gin.Context) {
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
 		Role:        user.Role, // 保持管理员设置的角色
-		// [TM-FORK] 部门归属随建号一并写上游，与 users 同一事务
+		// [FORK] 部门归属随建号一并写上游，与 users 同一事务
 		DepartmentId: user.DepartmentId,
 	}
-	// [TM-FORK] 部门存在性校验与建号放进同一事务，被拒时 users 表不得新增行。
+	// [FORK] 部门存在性校验与建号放进同一事务，被拒时 users 表不得新增行。
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
 		if user.DepartmentId != nil {
@@ -1083,7 +1083,7 @@ func CreateUser(c *gin.Context) {
 
 	auditParams["username"] = cleanUser.Username
 	recordManageAuditFor(c, cleanUser.Id, "user.create", auditParams)
-	// [TM-FORK] 返回新用户 id：BFF 建号后要立刻写 token_master.user_profile.phone，
+	// [FORK] 返回新用户 id：BFF 建号后要立刻写 token_master.user_profile.phone，
 	// 原来只能靠 /api/user/search 按 username 精确匹配回查，匹配不上就丢档案。
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -1145,13 +1145,13 @@ func ManageUser(c *gin.Context) {
 	}
 	switch req.Action {
 	case "disable":
-		// [TM-FORK] 多 root：不再按「目标是 root」硬拒；由模型层不变量保证
+		// [FORK] 多 root：不再按「目标是 root」硬拒；由模型层不变量保证
 		// 不会禁用掉最后一个启用的 root（见 ensureEnabledRootSurvivesWithTx）。
 		user.Status = common.UserStatusDisabled
 	case "enable":
 		user.Status = common.UserStatusEnabled
 	case "delete":
-		// [TM-FORK] 同上：删除保护移入 model.User.delete。
+		// [FORK] 同上：删除保护移入 model.User.delete。
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserDelete, service.AdminUserContext{UserID: user.Id})
 		if authorization == nil {
 			return
@@ -1198,7 +1198,7 @@ func ManageUser(c *gin.Context) {
 			return
 		}
 		user.Role = common.RoleCommonUser
-	// [TM-FORK] 多 root：产品里的「管理员」= role 100。提为 root / 撤销 root 独立成
+	// [FORK] 多 root：产品里的「管理员」= role 100。提为 root / 撤销 root 独立成
 	// 两个 action，而不是复用 promote/demote：
 	//   - promote/demote 的语义与审计模板（controller/audit.go:25 的
 	//     "Performed ${action} on user ..."）都是「普通管理员(10)」，上游自带前端
@@ -1206,7 +1206,7 @@ func ManageUser(c *gin.Context) {
 	//     仍会发这两个 action；
 	//   - 新增 action 是纯增量，回滚只需删这两个 case 与白名单里的两项。
 	case "grant_root":
-		// [TM-FORK] 与 promote 同口径：只有 root 能产出 root。少了这一条，
+		// [FORK] 与 promote 同口径：只有 root 能产出 root。少了这一条，
 		// role=10（上游 promote 造出的普通管理员）可以把自己或任何人提成 root——
 		// canManageTargetRole(10, 1) 为真，且 admin.user.manage 的 proof
 		// （service/security_verification.go 的 state.Role < RoleAdminUser）也放行 10。
@@ -1234,7 +1234,7 @@ func ManageUser(c *gin.Context) {
 	if authorization == nil {
 		return
 	}
-	// [TM-FORK] revoke_root 必须走 demote 这条分支：它负责清理该用户的 Casbin
+	// [FORK] revoke_root 必须走 demote 这条分支：它负责清理该用户的 Casbin
 	// 逐用户 override（authz.ClearUserAuthorizationInTx）。root 是 superuser，override
 	// 对它无意义，但降级为普通用户后这些旧 override 会立刻变成真实权限。
 	if req.Action == "demote" || req.Action == "revoke_root" {

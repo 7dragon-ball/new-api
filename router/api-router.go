@@ -164,7 +164,7 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.POST("/", controller.CreateUser)
 				adminRoute.POST("/manage", controller.ManageUser)
 				adminRoute.PUT("/", controller.UpdateUser)
-				// [TM-FORK] 改部门归属：独立接口，避免整行替换语义清空部门
+				// [FORK] 改部门归属：独立接口，避免整行替换语义清空部门
 				adminRoute.PUT("/:id/department", controller.UpdateUserDepartment)
 				adminRoute.DELETE("/:id", controller.DeleteUser)
 				adminRoute.DELETE("/:id/reset_passkey", controller.AdminResetPasskey)
@@ -366,7 +366,7 @@ func SetApiRouter(router *gin.Engine) {
 		dataRoute.GET("/self", middleware.UserAuth(), controller.GetUserQuotaDates)
 		dataRoute.GET("/flow", middleware.AdminAuth(), controller.GetAllFlowQuotaDates)
 		dataRoute.GET("/flow/self", middleware.UserAuth(), controller.GetUserFlowQuotaDates)
-		// [TM-FORK] 部门用量聚合（按部门池统计成员 / 秘钥 / 调用 / 额度）
+		// [FORK] 部门用量聚合（按部门池统计成员 / 秘钥 / 调用 / 额度）
 		dataRoute.GET("/departments", middleware.AdminAuth(), controller.GetDepartmentUsage)
 
 		logRoute.Use(middleware.CORS(), middleware.CriticalRateLimit())
@@ -388,7 +388,7 @@ func SetApiRouter(router *gin.Engine) {
 			prefillGroupRoute.DELETE("/:id", controller.DeletePrefillGroup)
 		}
 
-		// [TM-FORK] 部门字典
+		// [FORK] 部门字典
 		departmentRoute := apiRouter.Group("/department")
 		departmentRoute.Use(middleware.AdminAuth())
 		{

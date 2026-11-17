@@ -107,14 +107,14 @@ type User struct {
 	LinuxDOId            string         `json:"linux_do_id" gorm:"column:linux_do_id;index"`
 	Setting              string         `json:"setting" gorm:"type:text;column:setting"`
 	Remark               string         `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
-	// [TM-FORK] 组织归属：部门由 token-master 管理端维护，随用户一起返回。
+	// [FORK] 组织归属：部门由 token-master 管理端维护，随用户一起返回。
 	// 指针是必需的，不是风格选择：GORM 对零值会跳过，int 的 0 永远清不掉部门，nil 才表示「未分配」。
 	// 不加 omitempty：nil 要序列化成 null，否则前端分不清「未分配」与「字段没返回」。
 	DepartmentId   *int   `json:"department_id" gorm:"index"`
 	StripeCustomer string `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
 	CreatedAt      int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
 	LastLoginAt    int64  `json:"last_login_at" gorm:"default:0;column:last_login_at"`
-	// [TM-FORK] 上游只有 last_login_at（登录）与 quota_data.created_at（写入时被抹成整点），都不足以回答「最近一次调用」。
+	// [FORK] 上游只有 last_login_at（登录）与 quota_data.created_at（写入时被抹成整点），都不足以回答「最近一次调用」。
 	LastCalledAt     int64                      `json:"last_called_at" gorm:"default:0;column:last_called_at"`
 	AuthVersion      int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
 	AdminPermissions map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
@@ -441,7 +441,7 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 	return users, total, nil
 }
 
-// [TM-FORK] 新增 departmentID / username / displayName 三个可选精确条件。
+// [FORK] 新增 departmentID / username / displayName 三个可选精确条件。
 func SearchUsers(keyword string, group string, role *int, status *int, departmentID *int, username string, displayName string, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
 	var users []*User
 	var total int64
@@ -480,7 +480,7 @@ func SearchUsers(keyword string, group string, role *int, status *int, departmen
 	if role != nil {
 		query = query.Where("role = ?", *role)
 	}
-	// [TM-FORK] 管理端的部门 / 账号 / 显示名精确筛选
+	// [FORK] 管理端的部门 / 账号 / 显示名精确筛选
 	if departmentID != nil {
 		query = query.Where("department_id = ?", *departmentID)
 	}
@@ -823,12 +823,12 @@ func (user *User) Update(updatePassword bool) error {
 	return nil
 }
 
-// [TM-FORK] 多 root：系统必须始终保留至少一个启用的超级管理员。
+// [FORK] 多 root：系统必须始终保留至少一个启用的超级管理员。
 // 用 common.NewMessage 而不是 errors.New，让文案经 common.ApiError 直接透出，
 // 与上游对用户可见错误的写法一致（见 model/user.go 的 "ID is empty!"）。
 var ErrLastEnabledRootUser = common.NewMessage("Cannot remove the last enabled administrator. Enable or promote another administrator first.")
 
-// [TM-FORK] CountEnabledRootUsers 返回启用且未软删除的 super admin 数量。
+// [FORK] CountEnabledRootUsers 返回启用且未软删除的 super admin 数量。
 // 仅用于诊断与测试；判定「是否最后一个 root」必须用 ensureEnabledRootSurvivesWithTx，
 // 因为先 COUNT 再写会漏掉并发窗口。
 func CountEnabledRootUsers(tx *gorm.DB) (int64, error) {
@@ -839,7 +839,7 @@ func CountEnabledRootUsers(tx *gorm.DB) (int64, error) {
 	return count, err
 }
 
-// [TM-FORK] lockEnabledRootIDsWithTx 锁定当前全部「启用且未软删除」的 root 行并返回 id（升序）。
+// [FORK] lockEnabledRootIDsWithTx 锁定当前全部「启用且未软删除」的 root 行并返回 id（升序）。
 // 必须锁整组而不是只 COUNT：两个并发请求各自只读计数会同时看到 2 并双双通过；
 // 先按 id 顺序加行锁，第二个事务会阻塞到第一个提交，随后读到 1 并被拒。
 // 按 id 排序是为了让并发事务以相同顺序取锁，避免死锁。
@@ -852,7 +852,7 @@ func lockEnabledRootIDsWithTx(tx *gorm.DB) ([]int, error) {
 	return ids, err
 }
 
-// [TM-FORK] ensureEnabledRootSurvivesWithTx 校验：把 targetID 的 role 改成 newRole、
+// [FORK] ensureEnabledRootSurvivesWithTx 校验：把 targetID 的 role 改成 newRole、
 // status 改成 newStatus（removing=true 表示删除该用户）之后，系统里必须仍至少有一个
 // 启用的 root。newRole / newStatus 传 0 表示「本次不改该字段」，与 UpdateWithTx 的
 // 既有语义一致（零值不落库）。调用方必须已处于事务中，且必须在任何写之前调用。
@@ -909,7 +909,7 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		(newUser.Role != 0 && current.Role != newUser.Role) ||
 		(newUser.Status != 0 && current.Status != newUser.Status) ||
 		(newUser.Group != "" && current.Group != newUser.Group)
-	// [TM-FORK] 多 root 不变量：只有「目标当前是 root，且这次要把它改成非 root
+	// [FORK] 多 root 不变量：只有「目标当前是 root，且这次要把它改成非 root
 	// 或改成禁用」时才需要校验。外层的 current.Role 判断只是廉价预筛，真正的
 	// 判定（目标是否仍是启用中的 root、剩下几个）在加锁后的数据上重做。
 	if current.Role == common.RoleRootUser &&
@@ -934,7 +934,7 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		"aff_quota",
 		"aff_history",
 		"auth_version",
-		// [TM-FORK] 最近调用时刻只由扣费路径维护。编辑用户时整行覆盖会把它
+		// [FORK] 最近调用时刻只由扣费路径维护。编辑用户时整行覆盖会把它
 		// 写回调用方读到的旧值，必须在任何写路径上排除。
 		"last_called_at",
 	).Updates(newUser).Error; err != nil {
@@ -1060,7 +1060,7 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 				return err
 			}
 		}
-		// [TM-FORK] 多 root：这里要读 role 与 status 两个字段，且自删/管理员删除两条路径都要用。
+		// [FORK] 多 root：这里要读 role 与 status 两个字段，且自删/管理员删除两条路径都要用。
 		var current struct {
 			Role   int
 			Status int
@@ -1564,7 +1564,7 @@ func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 		map[string]any{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"request_count": gorm.Expr("request_count + ?", count),
-			// [TM-FORK] 与扣费同一行、同一次 UPDATE 写入，避免多一次往返。
+			// [FORK] 与扣费同一行、同一次 UPDATE 写入，避免多一次往返。
 			"last_called_at": common.GetTimestamp(),
 		},
 	).Error
@@ -1584,7 +1584,7 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 		return
 	}
 
-	// [TM-FORK] 只有请求数变化才算一次调用。这个落点同时承担三类写入：
+	// [FORK] 只有请求数变化才算一次调用。这个落点同时承担三类写入：
 	// 充值/兑换（只改 quota）、退款结算（只改 used_quota）、真实计费（两者都改）。
 	// 用 request_count 判别：「一次调用」必然伴随一次请求数累加，退款是相反的减法。
 	updates := map[string]any{

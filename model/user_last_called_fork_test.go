@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// [TM-FORK] 最近调用时刻：非批量路径应写进 users.last_called_at
+// [FORK] 最近调用时刻：非批量路径应写进 users.last_called_at
 func TestUpdateUserUsedQuotaAndRequestCountTouchesLastCalledAt(t *testing.T) {
 	truncateTables(t)
 	user := &User{
@@ -28,7 +28,7 @@ func TestUpdateUserUsedQuotaAndRequestCountTouchesLastCalledAt(t *testing.T) {
 	assert.Equal(t, 1, got.RequestCount)
 }
 
-// [TM-FORK] UpdateUserUsedQuota 只被退款/结算调用，代表「抵扣回退」而不是调用
+// [FORK] UpdateUserUsedQuota 只被退款/结算调用，代表「抵扣回退」而不是调用
 func TestUpdateUserUsedQuotaDoesNotTouchLastCalledAt(t *testing.T) {
 	truncateTables(t)
 	user := &User{
@@ -47,7 +47,7 @@ func TestUpdateUserUsedQuotaDoesNotTouchLastCalledAt(t *testing.T) {
 	assert.Equal(t, int64(1700000000), got.LastCalledAt, "退款不是调用，不得刷新最近调用时刻")
 }
 
-// [TM-FORK] 批量刷新落点同样要写
+// [FORK] 批量刷新落点同样要写
 func TestBatchFlushTouchesLastCalledAt(t *testing.T) {
 	truncateTables(t)
 	user := &User{
@@ -65,7 +65,7 @@ func TestBatchFlushTouchesLastCalledAt(t *testing.T) {
 	assert.Equal(t, 70, got.UsedQuota)
 }
 
-// [TM-FORK] 批量模式下，纯额度变更（管理员充值 / 兑换码）不得算作一次调用
+// [FORK] 批量模式下，纯额度变更（管理员充值 / 兑换码）不得算作一次调用
 func TestBatchFlushQuotaOnlyDoesNotTouchLastCalledAt(t *testing.T) {
 	truncateTables(t)
 	user := &User{
@@ -84,7 +84,7 @@ func TestBatchFlushQuotaOnlyDoesNotTouchLastCalledAt(t *testing.T) {
 	assert.Equal(t, int64(1700000000), got.LastCalledAt, "充值不是调用，不得刷新最近调用时刻")
 }
 
-// [TM-FORK] 批量模式下，退款结算（只减 used_quota、不动请求数）不得算作一次调用
+// [FORK] 批量模式下，退款结算（只减 used_quota、不动请求数）不得算作一次调用
 func TestBatchFlushRefundDoesNotTouchLastCalledAt(t *testing.T) {
 	truncateTables(t)
 	user := &User{
@@ -103,7 +103,7 @@ func TestBatchFlushRefundDoesNotTouchLastCalledAt(t *testing.T) {
 	assert.Equal(t, int64(1700000000), got.LastCalledAt, "退款不是调用，不得刷新最近调用时刻")
 }
 
-// [TM-FORK] 编辑用户（整行覆盖）不得改写 last_called_at
+// [FORK] 编辑用户（整行覆盖）不得改写 last_called_at
 func TestUpdateWithTxKeepsLastCalledAt(t *testing.T) {
 	truncateTables(t)
 	user := &User{

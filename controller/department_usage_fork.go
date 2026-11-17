@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// [TM-FORK] GET /api/data/departments?start_timestamp=&end_timestamp=
+// [FORK] GET /api/data/departments?start_timestamp=&end_timestamp=
 // 部门池按时间区间聚合用量。三个来源分别聚合成 CTE 再 LEFT JOIN，
 // 不能摊平成一条多表 JOIN：users × tokens × quota_data 会做笛卡尔积，
 // 有 N 把秘钥的用户调用量会被放大 N 倍（count(DISTINCT ...) 只会掩盖症状）。

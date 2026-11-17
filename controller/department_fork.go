@@ -13,7 +13,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// [TM-FORK] GET /api/department/?keyword=
+// [FORK] GET /api/department/?keyword=
 // 无 keyword 时返回全量（部门是几十级的小字典，无需分页）。
 func GetDepartments(c *gin.Context) {
 	keyword := strings.TrimSpace(c.Query("keyword"))
@@ -32,7 +32,7 @@ func GetDepartments(c *gin.Context) {
 	common.ApiSuccess(c, departments)
 }
 
-// [TM-FORK] POST /api/department/  请求体 {"name": "技术部"}
+// [FORK] POST /api/department/  请求体 {"name": "技术部"}
 func CreateDepartment(c *gin.Context) {
 	var req struct {
 		Name string `json:"name"`
@@ -55,7 +55,7 @@ func CreateDepartment(c *gin.Context) {
 	common.ApiSuccess(c, &dept)
 }
 
-// [TM-FORK] PUT /api/department/  请求体 {"id": 1, "name": "技术部"}
+// [FORK] PUT /api/department/  请求体 {"id": 1, "name": "技术部"}
 // id 走请求体：路径是集合级 PUT，与上游 prefill_group 的形状一致。
 func UpdateDepartment(c *gin.Context) {
 	var req struct {
@@ -86,7 +86,7 @@ func UpdateDepartment(c *gin.Context) {
 	common.ApiSuccess(c, &dept)
 }
 
-// [TM-FORK] DELETE /api/department/:id
+// [FORK] DELETE /api/department/:id
 func DeleteDepartment(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
@@ -127,7 +127,7 @@ func DeleteDepartment(c *gin.Context) {
 	common.ApiSuccess(c, nil)
 }
 
-// [TM-FORK] PUT /api/user/:id/department  请求体 {"department_id": 2} 或 {"department_id": null}
+// [FORK] PUT /api/user/:id/department  请求体 {"department_id": 2} 或 {"department_id": null}
 // 独立接口而不复用 PUT /api/user/：后者是整行替换语义，上游 UI 不传 department_id 就会把它清空。
 // 放在 department_fork.go 而不是 user.go：这是纯新增 handler，同包可拿到 canManageTargetRole
 // 与 recordManageAuditFor；user.go 是三组定制共同修改、merge 冲突风险最高的文件。
@@ -199,7 +199,7 @@ func UpdateUserDepartment(c *gin.Context) {
 	common.ApiSuccess(c, nil)
 }
 
-// [TM-FORK] 唯一索引冲突判定。Postgres 走错误码，SQLite（测试）走错误文本。
+// [FORK] 唯一索引冲突判定。Postgres 走错误码，SQLite（测试）走错误文本。
 func isDuplicateKey(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

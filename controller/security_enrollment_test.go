@@ -786,7 +786,7 @@ func TestSecurityEnrollmentOperationContext(t *testing.T) {
 		{"admin user zero", "admin.user.delete", `{"user_id":0}`, service.ErrVerificationContextInvalid},
 		{"admin user extra field", "admin.user.update", `{"user_id":7,"password":"x"}`, service.ErrVerificationContextInvalid},
 		{"admin manage", "admin.user.manage", `{"user_id":7,"action":"promote"}`, nil},
-		// [TM-FORK] 多 root 新增 action 的绑定用例
+		// [FORK] 多 root 新增 action 的绑定用例
 		{"admin manage grant_root", "admin.user.manage", `{"user_id":7,"action":"grant_root"}`, nil},
 		{"admin manage revoke_root", "admin.user.manage", `{"user_id":7,"action":"revoke_root"}`, nil},
 		{"admin manage quota", "admin.user.manage", `{"user_id":7,"action":"add_quota"}`, service.ErrVerificationContextInvalid},

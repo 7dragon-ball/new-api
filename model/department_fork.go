@@ -10,16 +10,16 @@ import (
 	"gorm.io/gorm"
 )
 
-// [TM-FORK] 部门名归一后为空或超长。message 会被 ApiError 原样渲染进响应体的
+// [FORK] 部门名归一后为空或超长。message 会被 ApiError 原样渲染进响应体的
 // `message` 字段，前端直接展示，所以这句话本身就是给运营看的文案。
 var ErrDepartmentNameInvalid = errors.New("Department name must be 1-30 characters (spaces are trimmed)")
 
-// [TM-FORK] 部门不存在。建号、改归属、删部门三条路径共用这一个错误值。
+// [FORK] 部门不存在。建号、改归属、删部门三条路径共用这一个错误值。
 // 用 common.NewMessage：它会经 common.ApiError 一并带上 message_key，
 // 与 model/user.go 的 ErrLastEnabledRootUser 同一写法（也保留了原先 ApiErrorT 的响应形状）。
 var ErrDepartmentNotFound = common.NewMessage("Department not found")
 
-// [TM-FORK] 锁定部门行并返回它（不存在时返回 nil）。改归属与删部门都必须先拿这把锁：
+// [FORK] 锁定部门行并返回它（不存在时返回 nil）。改归属与删部门都必须先拿这把锁：
 // 部门有意不加外键，没有数据库层的引用保护，「数成员 → 删除」与「改归属 → 提交」
 // 在无锁时会交错，留下指向已删部门的孤儿归属。调用方必须在事务内调用。
 // SQLite 不支持 FOR UPDATE（lockForUpdate 会跳过），由它的单写者模型兜底。
@@ -34,7 +34,7 @@ func LockDepartmentWithTx(tx *gorm.DB, id int) (*Department, error) {
 	return departments[0], nil
 }
 
-// [TM-FORK] 建号与改归属共用的部门存在性校验。走锁而不是 COUNT，让「校验通过」
+// [FORK] 建号与改归属共用的部门存在性校验。走锁而不是 COUNT，让「校验通过」
 // 与「本事务提交」之间不会被执行中的删部门插入。调用方必须在事务内调用。
 func EnsureDepartmentExistsWithTx(tx *gorm.DB, id int) error {
 	dept, err := LockDepartmentWithTx(tx, id)
@@ -47,7 +47,7 @@ func EnsureDepartmentExistsWithTx(tx *gorm.DB, id int) error {
 	return nil
 }
 
-// [TM-FORK] 部门字典：单层扁平，一人一部门。
+// [FORK] 部门字典：单层扁平，一人一部门。
 // 显式固定表名为单数 department：GORM 默认会复数化成 departments，而手写 SQL
 // （删除计数、部门用量聚合）都写 department。
 func (Department) TableName() string { return "department" }
@@ -59,7 +59,7 @@ type Department struct {
 	UpdatedAt int64  `json:"updated_at" gorm:"autoUpdateTime"`
 }
 
-// [TM-FORK] 写入前归一：唯一索引生效的前提是库里存的已经归一。
+// [FORK] 写入前归一：唯一索引生效的前提是库里存的已经归一。
 // 只在 Save / Create 路径生效；改名必须用 tx.Save(&dept) 而不是 Updates(map)，
 // 否则这个赋值写不进 SET 子句，重名检查随即失效。
 func (d *Department) BeforeSave(tx *gorm.DB) error {

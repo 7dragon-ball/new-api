@@ -47,7 +47,7 @@ var auditContentTemplates = map[string]string{
 	"user.reset_passkey":        "Reset the user passkey",
 	"option.update":             "Updated system setting ${key}",
 
-	// [TM-FORK] 部门字典（部门归属已迁进网关库，CRUD 由本 fork 提供）
+	// [FORK] 部门字典（部门归属已迁进网关库，CRUD 由本 fork 提供）
 	"department.create":      "Created department ${name} (ID: ${id})",
 	"department.update":      "Renamed department to ${name} (ID: ${id})",
 	"department.delete":      "Deleted department ${name} (ID: ${id})",
