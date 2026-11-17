@@ -7,7 +7,7 @@ set -euo pipefail
 
 SRC="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 # 复用同一个 module cache，避免每次重下依赖（首次约 2-4 分钟）
-MODCACHE_VOLUME="${TM_GOMOD_VOLUME:-tm-gomod}"
+MODCACHE_VOLUME="${GOMOD_VOLUME:-newapi-gomod}"
 
 docker run --rm \
   -v "$SRC":/src \
