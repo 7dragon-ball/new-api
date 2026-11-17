@@ -362,6 +362,8 @@ func AddToken(c *gin.Context) {
 		Group:              token.Group,
 		CrossGroupRetry:    token.CrossGroupRetry,
 		AutoGroups:         token.AutoGroups,
+		// [TM-FORK] 使用方：请求体透传到落库（Insert 走 Create，写全字段）
+		Owner: token.Owner,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
 	err = cleanToken.Insert()
@@ -450,6 +452,8 @@ func UpdateToken(c *gin.Context) {
 	} else {
 		// If you add more fields, please also update token.Update()
 		cleanToken.Name = token.Name
+		// [TM-FORK] 使用方：与 Token.Update() 白名单成对，缺这行则使用方被清空
+		cleanToken.Owner = token.Owner
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
 		cleanToken.UnlimitedQuota = token.UnlimitedQuota
