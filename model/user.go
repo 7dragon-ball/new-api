@@ -77,41 +77,47 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
-	Id                   int                        `json:"id"`
-	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
-	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=128"`
-	HasPassword          bool                       `json:"-" gorm:"-:all"`
-	OriginalPassword     string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
-	DisplayName          string                     `json:"display_name" gorm:"index" validate:"max=20"`
-	Role                 int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
-	Status               int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
-	Email                string                     `json:"email" gorm:"index" validate:"max=50"`
-	GitHubId             string                     `json:"github_id" gorm:"column:github_id;index"`
-	DiscordId            string                     `json:"discord_id" gorm:"column:discord_id;index"`
-	OidcId               string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
-	WeChatId             string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
-	TelegramId           string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
-	VerificationCode     string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
-	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
-	AccessTokenCreatedAt *int64                     `json:"-" gorm:"type:bigint;column:access_token_created_at"`    // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
-	Quota                int                        `json:"quota" gorm:"type:int;default:0"`
-	UsedQuota            int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
-	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
-	Group                string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
-	AffCode              string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
-	AffCount             int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
-	AffQuota             int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
-	AffHistoryQuota      int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
-	InviterId            int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
-	DeletedAt            gorm.DeletedAt             `gorm:"index"`
-	LinuxDOId            string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
-	Setting              string                     `json:"setting" gorm:"type:text;column:setting"`
-	Remark               string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
-	StripeCustomer       string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
-	CreatedAt            int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
-	LastLoginAt          int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
-	AuthVersion          int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
-	AdminPermissions     map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+	Id                   int            `json:"id"`
+	Username             string         `json:"username" gorm:"unique;index" validate:"max=20"`
+	Password             string         `json:"password" gorm:"not null;" validate:"min=8,max=128"`
+	HasPassword          bool           `json:"-" gorm:"-:all"`
+	OriginalPassword     string         `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
+	DisplayName          string         `json:"display_name" gorm:"index" validate:"max=20"`
+	Role                 int            `json:"role" gorm:"type:int;default:1"`   // admin, common
+	Status               int            `json:"status" gorm:"type:int;default:1"` // enabled, disabled
+	Email                string         `json:"email" gorm:"index" validate:"max=50"`
+	GitHubId             string         `json:"github_id" gorm:"column:github_id;index"`
+	DiscordId            string         `json:"discord_id" gorm:"column:discord_id;index"`
+	OidcId               string         `json:"oidc_id" gorm:"column:oidc_id;index"`
+	WeChatId             string         `json:"wechat_id" gorm:"column:wechat_id;index"`
+	TelegramId           string         `json:"telegram_id" gorm:"column:telegram_id;index"`
+	VerificationCode     string         `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
+	AccessToken          *string        `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
+	AccessTokenCreatedAt *int64         `json:"-" gorm:"type:bigint;column:access_token_created_at"`    // Deprecated: 旧版面板访问令牌，仅在升级后的过渡期内使用；删除 users.access_token 列时一并移除。
+	Quota                int            `json:"quota" gorm:"type:int;default:0"`
+	UsedQuota            int            `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
+	RequestCount         int            `json:"request_count" gorm:"type:int;default:0;"`               // request number
+	Group                string         `json:"group" gorm:"type:varchar(64);default:'default'"`
+	AffCode              string         `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
+	AffCount             int            `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
+	AffQuota             int            `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
+	AffHistoryQuota      int            `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
+	InviterId            int            `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+	DeletedAt            gorm.DeletedAt `gorm:"index"`
+	LinuxDOId            string         `json:"linux_do_id" gorm:"column:linux_do_id;index"`
+	Setting              string         `json:"setting" gorm:"type:text;column:setting"`
+	Remark               string         `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
+	// [FORK] 组织归属：部门由 token-master 管理端维护，随用户一起返回。
+	// 指针是必需的，不是风格选择：GORM 对零值会跳过，int 的 0 永远清不掉部门，nil 才表示「未分配」。
+	// 不加 omitempty：nil 要序列化成 null，否则前端分不清「未分配」与「字段没返回」。
+	DepartmentId   *int   `json:"department_id" gorm:"index"`
+	StripeCustomer string `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	CreatedAt      int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+	LastLoginAt    int64  `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+	// [FORK] 上游只有 last_login_at（登录）与 quota_data.created_at（写入时被抹成整点），都不足以回答「最近一次调用」。
+	LastCalledAt     int64                      `json:"last_called_at" gorm:"default:0;column:last_called_at"`
+	AuthVersion      int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
+	AdminPermissions map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
 }
 
 func (user *User) ToBaseUser() *UserBase {
@@ -435,7 +441,8 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 	return users, total, nil
 }
 
-func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
+// [FORK] 新增 departmentID / username / displayName 三个可选精确条件。
+func SearchUsers(keyword string, group string, role *int, status *int, departmentID *int, username string, displayName string, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
 	var users []*User
 	var total int64
 	var err error
@@ -472,6 +479,16 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	}
 	if role != nil {
 		query = query.Where("role = ?", *role)
+	}
+	// [FORK] 管理端的部门 / 账号 / 显示名精确筛选
+	if departmentID != nil {
+		query = query.Where("department_id = ?", *departmentID)
+	}
+	if username != "" {
+		query = query.Where("username = ?", username)
+	}
+	if displayName != "" {
+		query = query.Where("display_name = ?", displayName)
 	}
 	if status != nil {
 		if *status == -1 {
@@ -806,6 +823,72 @@ func (user *User) Update(updatePassword bool) error {
 	return nil
 }
 
+// [FORK] 多 root：系统必须始终保留至少一个启用的超级管理员。
+// 用 common.NewMessage 而不是 errors.New，让文案经 common.ApiError 直接透出，
+// 与上游对用户可见错误的写法一致（见 model/user.go 的 "ID is empty!"）。
+var ErrLastEnabledRootUser = common.NewMessage("Cannot remove the last enabled administrator. Enable or promote another administrator first.")
+
+// [FORK] CountEnabledRootUsers 返回启用且未软删除的 super admin 数量。
+// 仅用于诊断与测试；判定「是否最后一个 root」必须用 ensureEnabledRootSurvivesWithTx，
+// 因为先 COUNT 再写会漏掉并发窗口。
+func CountEnabledRootUsers(tx *gorm.DB) (int64, error) {
+	var count int64
+	err := tx.Model(&User{}).
+		Where("role = ? AND status = ?", common.RoleRootUser, common.UserStatusEnabled).
+		Count(&count).Error
+	return count, err
+}
+
+// [FORK] lockEnabledRootIDsWithTx 锁定当前全部「启用且未软删除」的 root 行并返回 id（升序）。
+// 必须锁整组而不是只 COUNT：两个并发请求各自只读计数会同时看到 2 并双双通过；
+// 先按 id 顺序加行锁，第二个事务会阻塞到第一个提交，随后读到 1 并被拒。
+// 按 id 排序是为了让并发事务以相同顺序取锁，避免死锁。
+func lockEnabledRootIDsWithTx(tx *gorm.DB) ([]int, error) {
+	var ids []int
+	err := lockForUpdate(tx.Model(&User{})).
+		Where("role = ? AND status = ?", common.RoleRootUser, common.UserStatusEnabled).
+		Order("id").
+		Pluck("id", &ids).Error
+	return ids, err
+}
+
+// [FORK] ensureEnabledRootSurvivesWithTx 校验：把 targetID 的 role 改成 newRole、
+// status 改成 newStatus（removing=true 表示删除该用户）之后，系统里必须仍至少有一个
+// 启用的 root。newRole / newStatus 传 0 表示「本次不改该字段」，与 UpdateWithTx 的
+// 既有语义一致（零值不落库）。调用方必须已处于事务中，且必须在任何写之前调用。
+func ensureEnabledRootSurvivesWithTx(tx *gorm.DB, targetID int, newRole int, newStatus int, removing bool) error {
+	ids, err := lockEnabledRootIDsWithTx(tx)
+	if err != nil {
+		return err
+	}
+	targetIsRoot := false
+	for _, id := range ids {
+		if id == targetID {
+			targetIsRoot = true
+			break
+		}
+	}
+	// 目标此刻不是「启用中的 root」→ 本次改动不减少可用管理员数，不设限。
+	if !targetIsRoot {
+		return nil
+	}
+	roleAfter := common.RoleRootUser
+	if newRole != 0 {
+		roleAfter = newRole
+	}
+	statusAfter := common.UserStatusEnabled
+	if newStatus != 0 {
+		statusAfter = newStatus
+	}
+	if !removing && roleAfter == common.RoleRootUser && statusAfter == common.UserStatusEnabled {
+		return nil
+	}
+	if len(ids) > 1 {
+		return nil
+	}
+	return ErrLastEnabledRootUser
+}
+
 func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
 	if updatePassword {
@@ -826,6 +909,16 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		(newUser.Role != 0 && current.Role != newUser.Role) ||
 		(newUser.Status != 0 && current.Status != newUser.Status) ||
 		(newUser.Group != "" && current.Group != newUser.Group)
+	// [FORK] 多 root 不变量：只有「目标当前是 root，且这次要把它改成非 root
+	// 或改成禁用」时才需要校验。外层的 current.Role 判断只是廉价预筛，真正的
+	// 判定（目标是否仍是启用中的 root、剩下几个）在加锁后的数据上重做。
+	if current.Role == common.RoleRootUser &&
+		((newUser.Role != 0 && newUser.Role != common.RoleRootUser) ||
+			(newUser.Status != 0 && newUser.Status != common.UserStatusEnabled)) {
+		if err = ensureEnabledRootSurvivesWithTx(tx, user.Id, newUser.Role, newUser.Status, false); err != nil {
+			return err
+		}
+	}
 	if authChanged {
 		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
@@ -841,6 +934,12 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		"aff_quota",
 		"aff_history",
 		"auth_version",
+		// [FORK] 最近调用时刻只由扣费路径维护。编辑用户时整行覆盖会把它
+		// 写回调用方读到的旧值，必须在任何写路径上排除。
+		"last_called_at",
+		// [FORK] 部门归属只由 PUT /api/user/:id/department 单列维护。整行覆盖会把
+		// 调用方快照里的旧部门回写，静默回滚并发发生的改归属。
+		"department_id",
 	).Updates(newUser).Error; err != nil {
 		return err
 	}
@@ -963,12 +1062,23 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
 			}
-			var role int
-			if err := tx.Model(&User{}).Where("id = ?", user.Id).Select("role").Scan(&role).Error; err != nil {
+		}
+		// [FORK] 多 root：这里要读 role 与 status 两个字段，且自删/管理员删除两条路径都要用。
+		var current struct {
+			Role   int
+			Status int
+		}
+		if err := tx.Model(&User{}).Where("id = ?", user.Id).Select("role", "status").Scan(&current).Error; err != nil {
+			return err
+		}
+		// 自删路径保持上游语义：root 不能通过 DELETE /api/user/self 删除自己。
+		if identity != nil && current.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
+		}
+		// 管理员删除路径：不能删掉最后一个启用的 root。
+		if current.Role == common.RoleRootUser && current.Status == common.UserStatusEnabled {
+			if err := ensureEnabledRootSurvivesWithTx(tx, user.Id, 0, 0, true); err != nil {
 				return err
-			}
-			if role == common.RoleRootUser {
-				return ErrCannotDeleteRootUser
 			}
 		}
 		var err error
@@ -1441,6 +1551,7 @@ func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
 }
 
 // UpdateUserUsedQuota adjusts accumulated usage without changing request count.
+// Only refund/settlement paths call this, so it must not refresh last_called_at.
 func UpdateUserUsedQuota(id int, quota int) {
 	if common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
@@ -1456,6 +1567,8 @@ func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 		map[string]any{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"request_count": gorm.Expr("request_count + ?", count),
+			// [FORK] 与扣费同一行、同一次 UPDATE 写入，避免多一次往返。
+			"last_called_at": common.GetTimestamp(),
 		},
 	).Error
 	if err != nil {
@@ -1474,13 +1587,19 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 		return
 	}
 
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]any{
-			"quota":         gorm.Expr("quota + ?", quota),
-			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
-			"request_count": gorm.Expr("request_count + ?", requestCount),
-		},
-	).Error
+	// [FORK] 只有请求数变化才算一次调用。这个落点同时承担三类写入：
+	// 充值/兑换（只改 quota）、退款结算（只改 used_quota）、真实计费（两者都改）。
+	// 用 request_count 判别：「一次调用」必然伴随一次请求数累加，退款是相反的减法。
+	updates := map[string]any{
+		"quota":         gorm.Expr("quota + ?", quota),
+		"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
+		"request_count": gorm.Expr("request_count + ?", requestCount),
+	}
+	if requestCount > 0 {
+		updates["last_called_at"] = common.GetTimestamp()
+	}
+
+	err := DB.Model(&User{}).Where("id = ?", id).Updates(updates).Error
 	if err != nil {
 		common.SysLog(common.LogText("failed to batch update user quota, used quota and request count: %s", err.Error()))
 	}

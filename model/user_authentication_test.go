@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/pquerna/otp/totp"
@@ -136,6 +139,184 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, "2", committed)
 	assert.False(t, server.Exists(getUserCacheKey(user.Id)))
+}
+
+func seedUserAuthenticationRecords(t *testing.T, userId int) {
+	t.Helper()
+	require.NoError(t, DB.Create(&ExternalIdentityClaim{
+		Provider: ExternalIdentityProviderTelegram,
+		Subject:  fmt.Sprintf("telegram-%d", userId),
+		UserId:   userId,
+	}).Error)
+	require.NoError(t, DB.Create(&TwoFA{UserId: userId, Secret: "secret", IsEnabled: true}).Error)
+	require.NoError(t, DB.Create(&TwoFABackupCode{UserId: userId, CodeHash: fmt.Sprintf("backup-code-%d", userId)}).Error)
+	require.NoError(t, DB.Create(&UserSession{
+		SID:             fmt.Sprintf("session-%d", userId),
+		UserID:          userId,
+		Version:         1,
+		UserAuthVersion: 1,
+		Status:          UserSessionStatusActive,
+		RefreshHash:     "refresh-hash",
+		LoginMethod:     "password",
+		LastActiveAt:    1,
+		ExpiresAt:       2,
+	}).Error)
+	require.NoError(t, DB.Create(&AuthFlow{
+		TokenHash: fmt.Sprintf("auth-flow-%d", userId),
+		Purpose:   AuthFlowPurposeTwoFALogin,
+		UserId:    userId,
+		ExpiresAt: time.Now().Add(time.Minute),
+	}).Error)
+	require.NoError(t, DB.Create(&PasskeyCredential{
+		UserID:       userId,
+		CredentialID: fmt.Sprintf("credential-%d", userId),
+		PublicKey:    "public-key",
+	}).Error)
+	require.NoError(t, DB.Create(&Token{UserId: userId, Key: fmt.Sprintf("token-%d", userId)}).Error)
+	require.NoError(t, DB.Create(&UserOAuthBinding{
+		UserId:         userId,
+		ProviderId:     userId,
+		ProviderUserId: fmt.Sprintf("provider-user-%d", userId),
+	}).Error)
+}
+
+func TestDeleteUserAuthenticationDataPurgesOnlyTargetUser(t *testing.T) {
+	truncateTables(t)
+
+	target := User{Username: "auth-purge-target", Password: "password", AffCode: "auth-purge-target"}
+	other := User{Username: "auth-purge-other", Password: "password", AffCode: "auth-purge-other"}
+	require.NoError(t, DB.Create(&target).Error)
+	require.NoError(t, DB.Create(&other).Error)
+	seedUserAuthenticationRecords(t, target.Id)
+	seedUserAuthenticationRecords(t, other.Id)
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return deleteUserAuthenticationData(tx, target.Id)
+	}))
+	// Purging an already cleaned account must not fail.
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return deleteUserAuthenticationData(tx, target.Id)
+	}))
+
+	for _, record := range []struct {
+		name  string
+		model any
+	}{
+		{"external identity claim", &ExternalIdentityClaim{}},
+		{"two fa backup code", &TwoFABackupCode{}},
+		{"two fa", &TwoFA{}},
+		{"user session", &UserSession{}},
+		{"auth flow", &AuthFlow{}},
+		{"passkey credential", &PasskeyCredential{}},
+		{"token", &Token{}},
+		{"oauth binding", &UserOAuthBinding{}},
+	} {
+		var targetCount, otherCount int64
+		require.NoError(t, DB.Unscoped().Model(record.model).Where("user_id = ?", target.Id).Count(&targetCount).Error)
+		require.NoError(t, DB.Unscoped().Model(record.model).Where("user_id = ?", other.Id).Count(&otherCount).Error)
+		assert.Zero(t, targetCount, record.name)
+		assert.EqualValues(t, 1, otherCount, record.name)
+	}
+}
+
+func TestDeleteUserAuthenticationDataPurgesSoftDeletedRecords(t *testing.T) {
+	truncateTables(t)
+
+	user := User{Username: "auth-purge-soft-deleted", Password: "password"}
+	require.NoError(t, DB.Create(&user).Error)
+
+	// Soft-deleted authentication rows must not survive the purge, otherwise a
+	// re-registered account could inherit a stale factor or token.
+	softDeleted := []any{
+		&TwoFA{UserId: user.Id, Secret: "secret", IsEnabled: true},
+		&TwoFABackupCode{UserId: user.Id, CodeHash: "soft-deleted-backup-code"},
+		&PasskeyCredential{UserID: user.Id, CredentialID: "soft-deleted-credential", PublicKey: "public-key"},
+		&Token{UserId: user.Id, Key: "soft-deleted-token"},
+	}
+	for _, record := range softDeleted {
+		require.NoError(t, DB.Create(record).Error)
+		require.NoError(t, DB.Delete(record).Error)
+	}
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return deleteUserAuthenticationData(tx, user.Id)
+	}))
+
+	for _, record := range []struct {
+		name  string
+		model any
+	}{
+		{"two fa", &TwoFA{}},
+		{"two fa backup code", &TwoFABackupCode{}},
+		{"passkey credential", &PasskeyCredential{}},
+		{"token", &Token{}},
+	} {
+		var count int64
+		require.NoError(t, DB.Unscoped().Model(record.model).Where("user_id = ?", user.Id).Count(&count).Error)
+		assert.Zero(t, count, record.name)
+	}
+}
+
+func TestDeleteUserAuthenticationDataRejectsInvalidTarget(t *testing.T) {
+	truncateTables(t)
+
+	require.Error(t, deleteUserAuthenticationData(nil, 42))
+
+	// A zero user id is rejected before any authentication row is touched.
+	require.NoError(t, DB.Create(&Token{Key: "unowned-token"}).Error)
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		return deleteUserAuthenticationData(tx, 0)
+	})
+	require.Error(t, err)
+
+	var count int64
+	require.NoError(t, DB.Unscoped().Model(&Token{}).Where("user_id = ?", 0).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestDeleteUserAuthenticationDataPropagatesDeleteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		models      []any
+		wantFailure string
+	}{
+		{
+			name:        "authentication table delete fails",
+			models:      []any{&ExternalIdentityClaim{}},
+			wantFailure: "two_fa_backup_codes",
+		},
+		{
+			name: "oauth binding delete fails",
+			models: []any{
+				&ExternalIdentityClaim{}, &TwoFABackupCode{}, &TwoFA{}, &UserSession{},
+				&AuthFlow{}, &PasskeyCredential{}, &Token{},
+			},
+			wantFailure: "user_oauth_bindings",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newIsolatedAuthPurgeDB(t, tc.models...)
+
+			err := db.Transaction(func(tx *gorm.DB) error {
+				return deleteUserAuthenticationData(tx, 7)
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantFailure)
+		})
+	}
+}
+
+func newIsolatedAuthPurgeDB(t *testing.T, models ...any) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "auth-purge.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, sqlDB.Close())
+	})
+	require.NoError(t, db.AutoMigrate(models...))
+	return db
 }
 
 func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {

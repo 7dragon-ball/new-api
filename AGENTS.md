@@ -96,6 +96,15 @@ Inside `relaykit/`, use `kitutil.*` from `relaykit/relayconvert/kitutil/json.go`
 
 **Database compatibility:** All database code MUST work with SQLite, MySQL >= 5.7.8, and PostgreSQL >= 9.6 simultaneously.
 
+**Fork deviation — the `department` feature is PostgreSQL-only.** This is a deliberate exception to the rules below, recorded so it is a written convention rather than a runtime surprise:
+
+- `department` is created by the embedded goose migration (`model/goose_fork.go`, `model/migrations/postgres/`) and is **not** in the `AutoMigrate` list in `migrateDB()`. On SQLite or MySQL, startup succeeds but every department endpoint fails at runtime (`no such table: department`; MySQL error `1146`): `GET|POST|PUT /api/department/`, `DELETE /api/department/:id`, `GET /api/user/search?department_id=`, `PUT /api/user/:id/department`, `GET /api/data/departments`. `users.department_id` is still created on all three databases because `User` remains AutoMigrated, so the column exists without the dictionary table it points at.
+- Do NOT add `&Department{}` back to the `AutoMigrate` list while goose owns the table; two mechanisms managing one table make every restart attempt an `ALTER TABLE`.
+- `controller/department_fork.go`'s `isDuplicateKey` has no MySQL `1062` branch, and its `LIKE ... ESCAPE '\'` escaping is only verified for PostgreSQL and SQLite.
+- `controller/department_usage_fork.go` writes its aggregation as `WITH ... CTE`, which MySQL supports only from 8.0 — above the minimum this project allows. Supporting MySQL means rewriting those CTEs as derived tables.
+
+Supporting a non-PostgreSQL database therefore requires adding a `&Department{}` fallback for that database, closing the three gaps above, and running the full three-database matrix. The MySQL configuration examples shipped with the repository (`docker-compose.yml:30`, `.env.example:29`) describe a deployment this fork does not support.
+
 - Any change that can affect database behavior MUST be verified before the work is considered complete. This includes ORM/database-driver dependency changes, connection/DSN/protocol or prepared-statement configuration, models and GORM tags, migrations and `AutoMigrate`, constraints and indexes, `Scanner`/`Valuer`/serializer behavior, raw SQL, transactions, and row locking.
 - Required database verification MUST exercise real SQLite, MySQL, and PostgreSQL instances. Unit tests, mocks, a successful build, code inspection, or testing only one dialect are not substitutes. Use at least one supported version of each engine; changes that depend on version-specific behavior must also cover the minimum supported version.
 - Treat GORM core and its database dialect/driver packages as a compatible version set. Any change to one of them requires checking upstream compatibility and running the complete three-database verification matrix; do not upgrade only the core package and infer that existing drivers remain compatible.

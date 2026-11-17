@@ -323,6 +323,16 @@ func is64BitIntegerType(dbType common.DatabaseType, dataType string) bool {
 }
 
 func migrateDB() error {
+	// [FORK] PostgreSQL 上需要 AutoMigrate 之外的 schema 变更统一走 goose
+	// （model/goose_fork.go），排在 AutoMigrate 之前：迁移失败立刻中止启动，
+	// 不会先跑完几十张表的 AutoMigrate 才崩。其余表仍走 AutoMigrate。
+	// 本 fork 只支持 PG 部署：department 已从下面的 AutoMigrate 列表移除，
+	// 非 PG 的库启动时会缺这张表，属预期（见 fork/README.md「数据库」）。
+	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		if err := runForkMigrations(); err != nil {
+			return err
+		}
+	}
 	if err := migrateTokenKeyUniqueness(DB); err != nil {
 		return err
 	}

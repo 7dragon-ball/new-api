@@ -366,9 +366,23 @@ func SearchUsers(c *gin.Context) {
 			status = &parsed
 		}
 	}
+	// [FORK] 部门 / 账号 / 显示名精确筛选
+	var departmentID *int
+	if v := strings.TrimSpace(c.Query("department_id")); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed <= 0 {
+			// 非法 id 显式报错，不静默忽略：否则「筛了但没筛」会让运营以为部门下真的没用户。
+			// 注意这是 common.ApiErrorT，响应仍是 HTTP 200 + success:false（见 common/gin.go 的 ApiError）。
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		departmentID = &parsed
+	}
+	username := strings.TrimSpace(c.Query("username"))
+	displayName := strings.TrimSpace(c.Query("display_name"))
 	pageInfo := common.GetPageQuery(c)
 	sortOptions := model.NewUserSortOptions(c.Query("sort_by"), c.Query("sort_order"))
-	users, total, err := model.SearchUsers(keyword, group, role, status, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
+	users, total, err := model.SearchUsers(keyword, group, role, status, departmentID, username, displayName, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), sortOptions)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1017,7 +1031,8 @@ func CreateUser(c *gin.Context) {
 		user.DisplayName = user.Username
 	}
 	myRole := c.GetInt("role")
-	if user.Role >= myRole {
+	// [FORK] 多 root：root 可以创建同级（root）账号；其他角色仍不得创建同级或更高。
+	if user.Role >= myRole && myRole != common.RoleRootUser {
 		common.ApiErrorT(c, "Cannot create users with permission level equal to or higher than yourself")
 		return
 	}
@@ -1036,9 +1051,17 @@ func CreateUser(c *gin.Context) {
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
 		Role:        user.Role, // 保持管理员设置的角色
+		// [FORK] 部门归属随建号一并写上游，与 users 同一事务
+		DepartmentId: user.DepartmentId,
 	}
+	// [FORK] 部门存在性校验与建号放进同一事务，被拒时 users 表不得新增行。
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if user.DepartmentId != nil {
+			if err := model.EnsureDepartmentExistsWithTx(tx, *user.DepartmentId); err != nil {
+				return err
+			}
+		}
 		if err := cleanUser.InsertWithTx(tx, 0); err != nil {
 			return err
 		}
@@ -1060,9 +1083,12 @@ func CreateUser(c *gin.Context) {
 
 	auditParams["username"] = cleanUser.Username
 	recordManageAuditFor(c, cleanUser.Id, "user.create", auditParams)
+	// [FORK] 返回新用户 id：BFF 建号后要立刻写 token_master.user_profile.phone，
+	// 原来只能靠 /api/user/search 按 username 精确匹配回查，匹配不上就丢档案。
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
+		"data":    gin.H{"id": cleanUser.Id},
 	})
 	return
 }
@@ -1119,18 +1145,13 @@ func ManageUser(c *gin.Context) {
 	}
 	switch req.Action {
 	case "disable":
+		// [FORK] 多 root：不再按「目标是 root」硬拒；由模型层不变量保证
+		// 不会禁用掉最后一个启用的 root（见 ensureEnabledRootSurvivesWithTx）。
 		user.Status = common.UserStatusDisabled
-		if user.Role == common.RoleRootUser {
-			common.ApiErrorT(c, "Cannot disable super administrator user")
-			return
-		}
 	case "enable":
 		user.Status = common.UserStatusEnabled
 	case "delete":
-		if user.Role == common.RoleRootUser {
-			common.ApiErrorT(c, "Cannot delete super administrator account")
-			return
-		}
+		// [FORK] 同上：删除保护移入 model.User.delete。
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserDelete, service.AdminUserContext{UserID: user.Id})
 		if authorization == nil {
 			return
@@ -1177,6 +1198,33 @@ func ManageUser(c *gin.Context) {
 			return
 		}
 		user.Role = common.RoleCommonUser
+	// [FORK] 多 root：产品里的「管理员」= role 100。提为 root / 撤销 root 独立成
+	// 两个 action，而不是复用 promote/demote：
+	//   - promote/demote 的语义与审计模板（controller/audit.go:25 的
+	//     "Performed ${action} on user ..."）都是「普通管理员(10)」，上游自带前端
+	//     web/src/features/users/components/data-table-row-actions.tsx:237,246
+	//     仍会发这两个 action；
+	//   - 新增 action 是纯增量，回滚只需删这两个 case 与白名单里的两项。
+	case "grant_root":
+		// [FORK] 与 promote 同口径：只有 root 能产出 root。少了这一条，
+		// role=10（上游 promote 造出的普通管理员）可以把自己或任何人提成 root——
+		// canManageTargetRole(10, 1) 为真，且 admin.user.manage 的 proof
+		// （service/security_verification.go 的 state.Role < RoleAdminUser）也放行 10。
+		if myRole != common.RoleRootUser {
+			common.ApiErrorT(c, "Regular administrators cannot grant super administrator")
+			return
+		}
+		if user.Role == common.RoleRootUser {
+			common.ApiErrorT(c, "This user is already a super administrator")
+			return
+		}
+		user.Role = common.RoleRootUser
+	case "revoke_root":
+		if user.Role != common.RoleRootUser {
+			common.ApiErrorT(c, "This user is not a super administrator")
+			return
+		}
+		user.Role = common.RoleCommonUser
 	default:
 		common.ApiErrorT(c, "Invalid parameters")
 		return
@@ -1186,7 +1234,10 @@ func ManageUser(c *gin.Context) {
 	if authorization == nil {
 		return
 	}
-	if req.Action == "demote" {
+	// [FORK] revoke_root 必须走 demote 这条分支：它负责清理该用户的 Casbin
+	// 逐用户 override（authz.ClearUserAuthorizationInTx）。root 是 superuser，override
+	// 对它无意义，但降级为普通用户后这些旧 override 会立刻变成真实权限。
+	if req.Action == "demote" || req.Action == "revoke_root" {
 		if err := model.DB.Transaction(func(tx *gorm.DB) error {
 			if err := user.UpdateWithTx(tx, false); err != nil {
 				return err

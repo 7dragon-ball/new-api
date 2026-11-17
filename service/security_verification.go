@@ -50,7 +50,9 @@ const (
 
 // adminUserManageActions are the ManageUser actions that change a user's
 // status or role. Quota adjustments are not gated and deletion has its own scope.
-var adminUserManageActions = []string{"disable", "enable", "promote", "demote"}
+// [FORK] grant_root / revoke_root 是多 root 方案新增的 action，必须在此登记，
+// 否则 BindVerificationOperation 会以 ErrVerificationContextInvalid 拒绝绑定。
+var adminUserManageActions = []string{"disable", "enable", "promote", "demote", "grant_root", "revoke_root"}
 
 var (
 	ErrVerificationFailed         = errors.New("Verification failed. Please try again.")

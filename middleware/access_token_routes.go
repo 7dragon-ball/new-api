@@ -117,6 +117,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/user/":                                  accessTokenScopeRule("user:write"),
 	"POST /api/user/manage":                            accessTokenScopeRule("user:write"),
 	"PUT /api/user/":                                   accessTokenScopeRule("user:write"),
+	"PUT /api/user/:id/department":                     accessTokenScopeRule("user:write"),
 	"DELETE /api/user/:id":                             accessTokenScopeRule("user:write"),
 	"DELETE /api/user/:id/reset_passkey":               accessTokenScopeRule("user:write"),
 	"GET /api/user/2fa/stats":                          accessTokenScopeRule("user:read"),
@@ -253,6 +254,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/data/self":                        accessTokenScopeRule("usage:read"),
 	"GET /api/data/flow":                        accessTokenScopeRule("log:read"),
 	"GET /api/data/flow/self":                   accessTokenScopeRule("usage:read"),
+	"GET /api/data/departments":                 accessTokenScopeRule("log:read"),
 
 	// router/api-router.go: /api/group, /api/prefill_group
 	"GET /api/group/":               accessTokenScopeRule("group:read"),
@@ -260,6 +262,12 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/prefill_group/":      accessTokenScopeRule("group:write"),
 	"PUT /api/prefill_group/":       accessTokenScopeRule("group:write"),
 	"DELETE /api/prefill_group/:id": accessTokenScopeRule("group:write"),
+
+	// router/api-router.go: /api/department
+	"GET /api/department/":       accessTokenScopeRule("user:read"),
+	"POST /api/department/":      accessTokenScopeRule("user:write"),
+	"PUT /api/department/":       accessTokenScopeRule("user:write"),
+	"DELETE /api/department/:id": accessTokenScopeRule("user:write"),
 
 	// router/api-router.go: /api/mj, /api/task
 	"GET /api/mj/self":                 accessTokenScopeRule("usage:read"),
