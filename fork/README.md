@@ -4,7 +4,7 @@
 后端定制：支持多个超级管理员（root）、在 `users` 表记录真实的最近调用时刻、把部门归属从业务库
 搬到 `new_api` 库。
 
-**定制直接写在源码里，以 `// [TM-FORK]` 标记。** 没有补丁目录，也没有 `git am` 重放步骤。
+**定制直接写在源码里，以 `// [FORK]` 标记。** 没有补丁目录，也没有 `git am` 重放步骤。
 本文件是唯一的定制登记册：哪几处与上游不同、为什么不同、merge 上游时怎么保住它们。
 
 ## 为什么改成直接改源码
@@ -20,17 +20,16 @@
 
 直接改源码之后，merge 时 git 的合并算法按行处理，只有真正重叠的行才冲突。
 
-代价是 `// [TM-FORK]` 标记成了唯一线索，因此每处改动都必须在标记的上一行说清「为什么和上游不同」。
+代价是 `// [FORK]` 标记成了唯一线索，因此每处改动都必须在标记的上一行说清「为什么和上游不同」。
 
 ## 仓库布局
 
 ```
 fork/
-├── README.md          # 本文件：定制登记册 + merge 流程
-└── scripts/
-    ├── verify.sh      # 容器内编译 + vet + gofmt + 子包测试
-    └── build.sh       # docker build 出镜像
+└── README.md          # 本文件：定制登记册 + merge 流程
 ```
+
+构建与验证都不需要额外脚本，用仓库自带的 `Dockerfile`、`Makefile` 即可，见「验证」与「构建镜像」。
 
 上游自带的 `docs/` 与本目录无关，需要的信息都在这里。
 
@@ -50,7 +49,7 @@ model/department_fork.go
 这些上游未导出的符号；包内测试也无法跟随。`_fork` 后缀让文件留在同包，`ls` 一眼可辨，
 且对编译、测试、merge 零影响。
 
-改**上游已有文件**的部分仍然靠 `// [TM-FORK]` 标记（见「标记约定」）。
+改**上游已有文件**的部分仍然靠 `// [FORK]` 标记（见「标记约定」）。
 
 ## 分支与远端
 
@@ -184,14 +183,14 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 每处改动或紧邻的一组改动上方（只标改动块，不给整个函数加标记）：
 
 ```go
-// [TM-FORK] <一句话说明为什么这块和上游不同>
+// [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 49 处、10 个文件：
+当前共 48 处、10 个文件：
 
 | 文件 | 处数 |
 |---|---|
-| `model/user.go` | 14 |
+| `model/user.go` | 13 |
 | `controller/user.go` | 10 |
 | `model/user_last_called_fork_test.go` | 6 |
 | `controller/department_fork.go` | 6 |
@@ -200,7 +199,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`service/security_verification.go` | 各 1 |
 
 ```bash
-grep -rn "\[TM-FORK\]" --include="*.go" .
+grep -rn "\[FORK\]" --include="*.go" .
 ```
 
 `model/main.go` 的 `&Department{}` 与 `model/user_pagination_test.go`、`model/task_cas_test.go`
@@ -225,7 +224,8 @@ git remote add upstream https://github.com/QuantumNous/new-api.git
 git fetch upstream main --no-tags
 git checkout -b upgrade/<日期或上游提交号>
 git merge upstream/main
-fork/scripts/verify.sh
+mkdir -p web/dist && touch web/dist/index.html   # 根包 //go:embed web/dist，见「验证」
+make test
 ```
 
 merge 无冲突时直接进验证。有冲突时按下面的原则处理。
@@ -235,7 +235,7 @@ merge 无冲突时直接进验证。有冲突时按下面的原则处理。
 按概率降序：`model/user.go` → `controller/user.go` 的 `ManageUser` switch → `router/api-router.go`
 → `SearchUsers`/`GetAllUsers`（部门筛选改了查询构造）→ 白名单与审计 map。
 
-- **先接受上游版本，再按 `// [TM-FORK]` 逐块重落。** 不要保留整段旧代码试图「合并语义」。
+- **先接受上游版本，再按 `// [FORK]` 逐块重落。** 不要保留整段旧代码试图「合并语义」。
 - 守卫**永远**在事务内、永远在写之前，不因上游重构挪到控制器。
 - `adminUserManageActions` 是白名单，上游新增 action 时**取并集**。
 - 部门相关的手写 SQL（删除计数、用量聚合）都写 `department`（单数），
@@ -249,34 +249,28 @@ merge 无冲突时直接进验证。有冲突时按下面的原则处理。
 
 ### 验证
 
+用仓库自带的入口，与 CI（`.github/workflows/ci.yml`）同一套命令：
+
 ```bash
-fork/scripts/verify.sh
+mkdir -p web/dist && touch web/dist/index.html   # 根包 //go:embed web/dist，见下
+go vet ./... && go build ./...                   # 根模块
+(cd relaykit && go vet ./... && go build ./...)  # 子模块各自独立可编译
+(cd tokenkit && go vet ./... && go build ./...)
+make test                                        # 根模块 + relaykit + tokenkit 全部包
+gofmt -l controller model service middleware     # CI 不查格式，本地补一刀
 ```
 
-在本机没有 Go 的情况下也能跑——脚本把仓库挂进 `golang:1.26.10-alpine` 容器执行：`go build`
-（controller/model/service/middleware/router）、`go vet`、`gofmt -l`，以及
-`go test ./model/ ./controller/ ./service/`。
+`make test` 覆盖所有包，包括 `middleware/`、`router/` 与两个子模块；这比只测
+`model`/`controller`/`service` 三个包更严。
 
-两个已知限制：
+两点必须知道：
 
-- **不构建根包。** `main.go` 有 `//go:embed web/dist`，而 `web/dist` 在 `.gitignore` 里、只在
-  Dockerfile 第一阶段构建前端后才存在。裸 `go build ./...` 必然失败，属预期。
-- **必须在 Docker 可挂载的路径下执行。** macOS 上临时目录通常不在 Docker Desktop / colima 的
-  共享列表里，挂载后 `/src` 是空的。在正常仓库路径下执行即可；worktree 在
-  `.claude/worktrees/` 下，同样可以。
-
-实测输出：
-
-```
-==> build
-==> vet
-==> gofmt
-==> test
-ok  	github.com/QuantumNous/new-api/model	11.285s
-ok  	github.com/QuantumNous/new-api/controller	53.941s
-ok  	github.com/QuantumNous/new-api/service	13.864s
-verify passed
-```
+- **`web/dist` 先占位。** `main.go` 用 `//go:embed web/dist` 硬编前端产物，而该目录在
+  `.gitignore` 里、只在 Dockerfile 第一阶段构建前端后才存在。不占位时 `go build ./...` 必然失败，
+  这不是代码问题。`make test` 会自己跳过根包，所以只跑测试可以不占位。
+- **本机需要 Go 1.26.10**（见 `go.mod`）。没装的话要么 `brew install go`，要么把仓库挂进
+  `golang:1.26.10-alpine` 容器里跑上面这几条——注意 Docker 内存低于 4G 时 `go build ./...`
+  容易被 OOM kill，`signal: killed` 就是这个原因，不是编译错误。
 
 仅编译通过不算升级成功——下面「测试覆盖不到」那四项仍需人工验证。
 
@@ -300,29 +294,35 @@ docker run --rm \
 
 ### 构建镜像
 
+仓库根的 `Dockerfile` 就是生产镜像的定义（第一阶段 bun 构建 `web/dist`，第二阶段编 Go），
+直接 `docker build` 即可：
+
 ```bash
-fork/scripts/build.sh                              # 默认 tag：构建日期-提交短号，如 20261117-600d1f3aa
-fork/scripts/build.sh /path/to/new-api my-tag-1    # 自定义源码路径与 tag
+cd <源码目录>
+docker build -t new-api:$(date +%Y%m%d)-$(git rev-parse --short HEAD) .
 ```
 
-构建时间包含一次 `bun install` 加前端构建（Dockerfile 第一阶段），不能跳过。
+tag 用 `<构建日期>-<HEAD 短号>`，一眼看出镜像来自哪天哪个提交。构建时间包含一次
+`bun install` 加前端构建，不能跳过。
 
-> **默认 tag 是 `<构建日期>-<HEAD 短号>`**，在源码目录里现算，记录这次镜像对应哪个提交。
-> 源码里三组定制（多 root、最近调用、部门）恒在，tag 不再编码定制组，也不再沿用上游版本号。
+> 源码里三组定制（多 root、最近调用、部门）恒在，tag 不编码定制组，也不跟随上游版本号。
 > 工作区有未提交改动时 tag 只反映 HEAD，不反映改动，别用它反推镜像内容。
 
-国内网络通常拉不到 registry 与 Go proxy，用环境变量显式传代理，**不要**指望 shell 里的
+国内网络通常拉不到 registry 与 Go proxy，用 `--build-arg` 显式传代理，**不要**指望 shell 里的
 `HTTPS_PROXY` 自动生效：
 
 ```bash
-BUILD_PROXY=http://<容器可达的宿主机 IP>:<端口> fork/scripts/build.sh
+docker build \
+  --build-arg HTTP_PROXY=http://<容器可达的宿主机 IP>:<端口> \
+  --build-arg HTTPS_PROXY=http://<容器可达的宿主机 IP>:<端口> \
+  -t new-api:$(date +%Y%m%d)-$(git rev-parse --short HEAD) .
 ```
 
 宿主机上的 `127.0.0.1:xxxx` 进了容器指向容器自身，传进去等于没配。要填**容器可达**的地址
 （colima 下一般是宿主内网 IP）。
 
-> **tag 里的日期是构建当天的日期，`600d1f3aa` 是构建时的 HEAD 短号**，都不代表源码基线是上游
-> 某个版本。上线前必须跑完整回归。本 fork 的基线提交是 `6ef123cd5`。
+> **tag 是构建时的快照，不代表源码基线是上游某个版本。** 上线前必须跑完整回归。
+> 本 fork 的基线提交是 `6ef123cd5`。
 
 ## 新增接口能力
 
