@@ -43,6 +43,41 @@ func TestUserDepartmentIdRoundTrips(t *testing.T) {
 	assert.Equal(t, 7, *got.DepartmentId)
 }
 
+// [FORK] 部门归属由专用接口（PUT /api/user/:id/department）单列维护。
+// 其它管理动作走 UpdateWithTx 的整行 Updates，会把调用方内存里的旧快照按列回写。
+func TestUpdateWithTxKeepsConcurrentDepartmentChange(t *testing.T) {
+	setupUserUpdateTestState(t)
+	require.NoError(t, DB.Exec("DELETE FROM department").Error)
+	deptA := Department{Name: "竞态部门A"}
+	require.NoError(t, DB.Save(&deptA).Error)
+	deptB := Department{Name: "竞态部门B"}
+	require.NoError(t, DB.Save(&deptB).Error)
+
+	user := &User{
+		Username: "dept-race", Password: "password123",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default",
+		DepartmentId: &deptA.Id,
+	}
+	require.NoError(t, DB.Create(user).Error)
+
+	// 管理员 B 读到旧快照（此时部门是 A）
+	stale, err := GetUserById(user.Id, true)
+	require.NoError(t, err)
+
+	// 管理员 A 用专用接口把归属改成 B：单列更新，不读整行
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Update("department_id", deptB.Id).Error)
+
+	// B 随后执行 disable，走 UpdateWithTx 的整行 Updates
+	stale.Status = common.UserStatusDisabled
+	require.NoError(t, stale.Update(false))
+
+	var got User
+	require.NoError(t, DB.First(&got, user.Id).Error)
+	assert.Equal(t, common.UserStatusDisabled, got.Status)
+	require.NotNil(t, got.DepartmentId)
+	assert.Equal(t, deptB.Id, *got.DepartmentId, "整行更新不得把部门归属写回旧快照")
+}
+
 func TestUserDepartmentIdCanBeClearedToNull(t *testing.T) {
 	truncateTables(t)
 	id := 9

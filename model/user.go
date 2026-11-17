@@ -937,6 +937,9 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		// [FORK] 最近调用时刻只由扣费路径维护。编辑用户时整行覆盖会把它
 		// 写回调用方读到的旧值，必须在任何写路径上排除。
 		"last_called_at",
+		// [FORK] 部门归属只由 PUT /api/user/:id/department 单列维护。整行覆盖会把
+		// 调用方快照里的旧部门回写，静默回滚并发发生的改归属。
+		"department_id",
 	).Updates(newUser).Error; err != nil {
 		return err
 	}

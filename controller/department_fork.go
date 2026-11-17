@@ -181,7 +181,8 @@ func UpdateUserDepartment(c *gin.Context) {
 				return model.ErrDepartmentNotFound
 			}
 		}
-		// 直接写列，绕开 UpdateWithTx：那里是全字段 Updates，会把整行按内存值回写。
+		// 直接写列，绕开 UpdateWithTx：那里对结构体走 Updates，GORM 会跳过零值，
+		// *int 的 nil 正在被跳过之列，清空部门的请求会静默失效（返回 success 但列没变）。
 		// 显式 nil 写成 NULL 是这里唯一的目的。
 		return tx.Model(&model.User{}).Where("id = ?", id).Update("department_id", departmentID).Error
 	}); err != nil {
