@@ -172,7 +172,7 @@ OAuth state、2FA pending、Passkey ceremony、Telegram bind 等临时状态存�
 - `admin.user.delete`（`{"user_id"}`）：`DELETE /api/user/:id` 与 `POST /api/user/manage` 的 `delete`；
 - `admin.user.manage`（`{"user_id","action"}`，action 为 `disable` / `enable` / `promote` / `demote` / `grant_root` / `revoke_root`）：`POST /api/user/manage`；额度调整 `add_quota` 不要求 Proof；
 - `admin.user.update`（`{"user_id"}`）：`PUT /api/user/` 在请求包含新密码或 `admin_permissions` 时要求；仅修改显示名、分组、备注不要求；
-- `admin.user.management`（`{"user_id","changes","role","department_id"}`）：`PUT /api/user/` 的 body 带 `role` 或 `department_id` 键时进入合并编辑分派，仅在角色真正变化（目标 `role` 与库中不同）时要求。`changes` 是 `role` / `department` 的排序去重数组；未改角色时 `role` 为 0，`department_id: null` 表示清空部门。部门单独改动、以及整对象回写但 `role` / `department_id` 未变时不要求 proof，与 `PUT /api/user/:id/department` 同口径。密码与权限矩阵必须拆到带 `admin.user.update` proof 的独立请求；
+- `admin.user.management`（`{"user_id","changes","role","department_id"}`）：`PUT /api/user/` 的 body 带 `role` 或 `department_id` 键时进入合并编辑分派，仅在角色真正变化（目标 `role` 与库中不同）时要求。`changes` 是 `role` / `department` 的排序去重数组；未改角色时 `role` 为 0，`department_id: null` 表示清空部门。部门单独改动不要求 proof，与 `PUT /api/user/:id/department` 同口径。整对象回写（body 含 `username`）时 `department_id` 是调用方读到的旧快照，一律忽略不写库；改归属请用单列端点或只发 `id` / `role` / `department_id`。密码与权限矩阵必须拆到带 `admin.user.update` proof 的独立请求；
 - `admin.user.create`（`{"role"}`）：`POST /api/user/` 创建管理员角色时要求；创建普通用户不要求；
 - `admin.user.passkey.reset`（`{"user_id"}`）：`DELETE /api/user/:id/reset_passkey`；
 - `admin.user.2fa.disable`（`{"user_id"}`）：`DELETE /api/user/:id/2fa`；

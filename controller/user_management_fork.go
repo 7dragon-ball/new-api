@@ -23,8 +23,10 @@ import (
 //
 // 语义是「传了哪个键就改哪个」：department_id 显式传 null 表示清空部门，
 // role 为零值或与库中相同表示不改角色（兼容整行回写的旧客户端）。
-// 部门与 PUT /api/user/:id/department 同口径：不要求 step-up proof，审计同为
-// user.department_update；只有真正改角色才要求 admin.user.management proof。
+// 整对象回写（带 username 等资料列）里的 department_id 是调用方读到的旧快照，
+// 不视为改部门；显式改归属请走 PUT /api/user/:id/department 或只发
+// id/role/department_id。部门不要求 step-up proof，审计同为 user.department_update；
+// 只有真正改角色才要求 admin.user.management proof。
 
 // handleUserManagementUpdate 在接管时返回 true（已写完响应），否则返回 false
 // 让上游继续。分流要读 body 判键，而上游用 common.DecodeJson 读一次即尽，
@@ -62,6 +64,11 @@ func handleUserManagementUpdate(c *gin.Context) bool {
 func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[string]common.RawMessage) {
 	_, hasRole := keys["role"]
 	departmentRaw, hasDepartment := keys["department_id"]
+	// 整对象回写会带上调用方此前读到的 department_id；它落后于并发改归属时，
+	// 写回会把部门静默改脏且不留审计。这类请求只按资料列与角色处理，部门一律忽略。
+	if _, wholeObject := keys["username"]; hasDepartment && wholeObject {
+		hasDepartment = false
+	}
 
 	originUser, err := model.GetUserById(updatedUser.Id, false)
 	if err != nil {
@@ -196,14 +203,8 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		auditParams["password_reset"] = updatePassword
 		auditParams["admin_permissions_updated"] = updatedUser.AdminPermissions != nil
 	}
-	// 部门改动单独记 user.department_update，和 PUT /api/user/:id/department 同口径；
-	// 整对象回写时部门值未变，不产生审计噪音。
-	departmentChanged := hasDepartment
-	if hasDepartment && departmentID != nil && originUser.DepartmentId != nil {
-		departmentChanged = *departmentID != *originUser.DepartmentId
-	} else if hasDepartment && departmentID == nil && originUser.DepartmentId == nil {
-		departmentChanged = false
-	}
+	// 部门是否真的变化在事务内按当前行判定，避免拿事务外快照比较出错。
+	departmentChanged := false
 
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
@@ -227,11 +228,23 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 				return err
 			}
 		}
-		// 部门列单列写：map/Update 不会把 nil 当零值跳过，清空能落成 NULL。
 		if hasDepartment {
+			var current struct{ DepartmentId *int }
 			if err := tx.Model(&model.User{}).Where("id = ?", updatedUser.Id).
-				Update("department_id", departmentID).Error; err != nil {
+				Select("department_id").First(&current).Error; err != nil {
 				return err
+			}
+			same := departmentID == nil && current.DepartmentId == nil
+			if departmentID != nil && current.DepartmentId != nil {
+				same = *departmentID == *current.DepartmentId
+			}
+			if !same {
+				// 单列写：map/Update 不会把 nil 当零值跳过，清空能落成 NULL。
+				if err := tx.Model(&model.User{}).Where("id = ?", updatedUser.Id).
+					Update("department_id", departmentID).Error; err != nil {
+					return err
+				}
+				departmentChanged = true
 			}
 		}
 		touched, err := updateAdminPermissionsForUserInTx(c, tx, updatedUser.Id, effectiveRole, updatedUser.AdminPermissions)
@@ -301,7 +314,17 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 			"id": updatedUser.Id, "department_id": auditDepartmentID,
 		})
 	}
-	if updatePassword || updatedUser.AdminPermissions != nil {
+	if len(profileUpdates) > 0 || updatedUser.AdminPermissions != nil {
+		// 审计只记列名，不记值；group 会改变计费与可用模型，必须可追溯。
+		changedFields := make([]string, 0, len(profileUpdates)+1)
+		for column := range profileUpdates {
+			changedFields = append(changedFields, column)
+		}
+		if updatedUser.AdminPermissions != nil {
+			changedFields = append(changedFields, "admin_permissions")
+		}
+		slices.Sort(changedFields)
+		auditParams["changed_fields"] = changedFields
 		recordManageAuditFor(c, updatedUser.Id, "user.update", auditParams)
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})

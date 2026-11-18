@@ -51,7 +51,7 @@ func unifiedUpdateRequest(t *testing.T, body, proof string, identity service.Aut
 }
 
 func unifiedUpdateBody(id, role, departmentID int) string {
-	return fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"managed-user","group":"default","role":%d,"department_id":%d}`, id, role, departmentID)
+	return fmt.Sprintf(`{"id":%d,"role":%d,"department_id":%d}`, id, role, departmentID)
 }
 
 func TestUnifiedUpdateAppliesRoleAndDepartmentTogether(t *testing.T) {
@@ -103,8 +103,7 @@ func TestUnifiedUpdateDemotesAndClearsDepartment(t *testing.T) {
 		UserID: target.Id, Changes: []string{"department", "role"},
 		Role: common.RoleCommonUser,
 	})
-	body := fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"managed-user","group":"default","role":%d,"department_id":null}`,
-		target.Id, common.RoleCommonUser)
+	body := fmt.Sprintf(`{"id":%d,"role":%d,"department_id":null}`, target.Id, common.RoleCommonUser)
 
 	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
 	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
@@ -302,14 +301,16 @@ func TestUnifiedUpdateDepartmentWithoutProof(t *testing.T) {
 	assert.Equal(t, float64(dept.Id), auditParamsOf(t, entry)["department_id"])
 }
 
-// 整对象回写的老客户端会带上未变化的 role/department_id，不得被新 scope 拦下。
-func TestUnifiedUpdateWholeObjectWritebackWithoutProof(t *testing.T) {
-	identity, target, dept := setupUnifiedUpdateTest(t)
+// 整对象回写的老客户端带上此前读到的旧部门，不得覆盖并发改过的归属。
+func TestUnifiedUpdateWholeObjectWritebackKeepsCurrentDepartment(t *testing.T) {
+	identity, target, staleDept := setupUnifiedUpdateTest(t)
+	currentDept := model.Department{Name: "运营部"}
+	require.NoError(t, model.DB.Save(&currentDept).Error)
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).
-		Update("department_id", dept.Id).Error)
+		Update("department_id", currentDept.Id).Error)
 
 	body := fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"managed-user","group":"default","role":%d,"department_id":%d}`,
-		target.Id, common.RoleCommonUser, dept.Id)
+		target.Id, common.RoleCommonUser, staleDept.Id)
 	_, resp := unifiedUpdateRequest(t, body, "", identity, common.RoleRootUser)
 	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
 
@@ -317,7 +318,31 @@ func TestUnifiedUpdateWholeObjectWritebackWithoutProof(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, common.RoleCommonUser, stored.Role)
 	require.NotNil(t, stored.DepartmentId)
-	assert.Equal(t, dept.Id, *stored.DepartmentId)
+	assert.Equal(t, currentDept.Id, *stored.DepartmentId, "整对象回写中的旧快照不得改回部门")
+	var audits int64
+	require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("action = ?", "user.department_update").Count(&audits).Error)
+	assert.Zero(t, audits, "被忽略的部门快照不应留下改归属审计")
+}
+
+// 资料列真正落库时必须写 user.update 审计，且只记列名不记值。
+func TestUnifiedUpdateProfileChangeRecordsAudit(t *testing.T) {
+	identity, target, _ := setupUnifiedUpdateTest(t)
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"role"}, Role: common.RoleRootUser,
+	})
+	body := fmt.Sprintf(`{"id":%d,"role":%d,"display_name":"Audited Name","group":"vip"}`, target.Id, common.RoleRootUser)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	var entry model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "user.update").Order("id DESC").First(&entry).Error)
+	params := auditParamsOf(t, entry)
+	assert.Equal(t, float64(target.Id), params["id"])
+	assert.ElementsMatch(t, []any{"display_name", "group"}, params["changed_fields"])
+	auditJSON, err := common.Marshal(entry)
+	require.NoError(t, err)
+	assert.NotContains(t, string(auditJSON), "Audited Name")
 }
 
 // 合并路径撤销 root 必须与 ManageUser 同口径：user.manage/revoke_root 审计与 admin_demote 吊销原因。
@@ -491,8 +516,7 @@ func TestUnifiedUpdatePartialProfileKeysDoNotRewriteOtherColumns(t *testing.T) {
 	t.Cleanup(func() { model.DB = previous })
 
 	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
-		UserID: target.Id, Changes: []string{"department", "role"},
-		Role: common.RoleRootUser, DepartmentID: &dept.Id,
+		UserID: target.Id, Changes: []string{"role"}, Role: common.RoleRootUser,
 	})
 	body := fmt.Sprintf(`{"id":%d,"username":"managed-user","role":%d,"department_id":%d}`,
 		target.Id, common.RoleRootUser, dept.Id)
