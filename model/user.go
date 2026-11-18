@@ -937,8 +937,9 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		// [FORK] 最近调用时刻只由扣费路径维护。编辑用户时整行覆盖会把它
 		// 写回调用方读到的旧值，必须在任何写路径上排除。
 		"last_called_at",
-		// [FORK] 部门归属只由 PUT /api/user/:id/department 单列维护。整行覆盖会把
-		// 调用方快照里的旧部门回写，静默回滚并发发生的改归属。
+		// [FORK] 部门归属只由 PUT /api/user/:id/department 与 PUT /api/user/ 的
+		// 合并路径单列维护，两者都不要求 proof、审计同为 user.department_update。
+		// 整行覆盖会把调用方快照里的旧部门回写，静默回滚并发发生的改归属。
 		"department_id",
 	).Updates(newUser).Error; err != nil {
 		return err
@@ -998,6 +999,40 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 		}
 	}
 	if err = tx.Model(&current).Updates(updates).Error; err != nil {
+		return err
+	}
+	return tx.First(user, user.Id).Error
+}
+
+// [FORK] 只写请求里显式出现的资料列。事务外补齐的快照值仅用于校验，不能
+// 整份写回，否则会静默回滚并发发生的资料修改。
+func (user *User) EditProfileWithTx(tx *gorm.DB, updates map[string]any) error {
+	if plain, ok := updates["password"].(string); ok && plain != "" {
+		hashed, err := common.HashAccountPassword(plain)
+		if err != nil {
+			return err
+		}
+		updates["password"] = hashed
+	}
+	current := User{}
+	if err := tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
+	authChanged := false
+	if password, ok := updates["password"]; ok && current.Password != password {
+		authChanged = true
+	}
+	if group, ok := updates["group"]; ok && current.Group != group {
+		authChanged = true
+	}
+	if authChanged {
+		version, err := IncrementUserAuthVersionWithTx(tx, user.Id)
+		if err != nil {
+			return err
+		}
+		user.AuthVersion = version
+	}
+	if err := tx.Model(&current).Updates(updates).Error; err != nil {
 		return err
 	}
 	return tx.First(user, user.Id).Error

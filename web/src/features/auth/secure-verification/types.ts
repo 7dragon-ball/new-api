@@ -43,6 +43,7 @@ export type SecurityProofScope =
   | 'admin.user.update'
   | 'admin.user.delete'
   | 'admin.user.manage'
+  | 'admin.user.management'
   | 'admin.user.passkey.reset'
   | 'admin.user.2fa.disable'
   | 'admin.user.binding.clear'
@@ -65,6 +66,18 @@ export type VerificationOperation =
         | 'admin.user.passkey.reset'
         | 'admin.user.2fa.disable'
       context: { user_id: number }
+    }
+  | {
+      scope: 'admin.user.management'
+      context: {
+        user_id: number
+        /** 排序去重后的改动列；后端固定校验这四个键，缺一不可。 */
+        changes: ('role' | 'department')[]
+        /** 目标角色；未改角色时固定传 0。 */
+        role: number
+        /** 目标部门；清空传 null，未改部门时也固定传 null。 */
+        department_id: number | null
+      }
     }
   | {
       scope: 'admin.user.manage'

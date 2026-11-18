@@ -48,6 +48,11 @@ const (
 	verificationScopeAdminUserPrefix       = "admin.user."
 )
 
+// [FORK] 单独成块，避免 gofmt 因新常量名变长而重排上游的常量对齐。
+// 合并编辑用户在一次请求里同时改角色与部门，proof 必须绑定本次要改的
+// 字段和目标值，不能用只绑 user_id 的 admin.user.update 代替。
+const VerificationScopeAdminUserManagement = "admin.user.management"
+
 // adminUserManageActions are the ManageUser actions that change a user's
 // status or role. Quota adjustments are not gated and deletion has its own scope.
 // [FORK] grant_root / revoke_root 是多 root 方案新增的 action，必须在此登记，
@@ -212,6 +217,13 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 			return VerificationBinding{}, ErrVerificationContextInvalid
 		}
 		normalized = context
+	case VerificationScopeAdminUserManagement:
+		// [FORK] 校验规则在 security_verification_fork.go，这里只留一行分派。
+		bound, err := bindAdminUserManagementContext(operation, fields)
+		if err != nil {
+			return VerificationBinding{}, err
+		}
+		normalized = bound
 	case VerificationScopeAdminUserBindingClear:
 		var context AdminUserBindingContext
 		if len(fields) != 2 || common.Unmarshal(operation.Context, &context) != nil || context.UserID <= 0 || context.ProviderID < 0 {
@@ -331,7 +343,7 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 		VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
-		VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
+		VerificationScopeAdminUserManage, VerificationScopeAdminUserManagement, VerificationScopeAdminUserPasskeyReset,
 		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
 		if scope == VerificationScopeAccountDelete && state.Role == common.RoleRootUser {
 			return nil, ErrVerificationForbidden
@@ -396,7 +408,7 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 			switch scope {
 			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
-				VerificationScopeAdminUserManage, VerificationScopeAdminUserPasskeyReset,
+				VerificationScopeAdminUserManage, VerificationScopeAdminUserManagement, VerificationScopeAdminUserPasskeyReset,
 				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
 				methods[i].Available, methods[i].Reason = false, "Password authentication is disabled."
 			}

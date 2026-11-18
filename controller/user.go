@@ -664,6 +664,12 @@ func GetUserModels(c *gin.Context) {
 }
 
 func UpdateUser(c *gin.Context) {
+	// [FORK] 合并编辑用户（角色 / 部门）见 user_management_fork.go：body 带
+	// role 或 department_id 键时由它接管，其余请求继续走下面的上游原逻辑。
+	// 上游函数体保持原样，升级时不会有大规模冲突。
+	if handleUserManagementUpdate(c) {
+		return
+	}
 	var updatedUser model.User
 	err := common.DecodeJson(c.Request.Body, &updatedUser)
 	if err != nil || updatedUser.Id == 0 {
