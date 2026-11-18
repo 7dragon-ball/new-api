@@ -1003,6 +1003,40 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	return tx.First(user, user.Id).Error
 }
 
+// [FORK] 只写请求里显式出现的资料列。事务外补齐的快照值仅用于校验，不能
+// 整份写回，否则会静默回滚并发发生的资料修改。
+func (user *User) EditProfileWithTx(tx *gorm.DB, updates map[string]any) error {
+	if plain, ok := updates["password"].(string); ok && plain != "" {
+		hashed, err := common.HashAccountPassword(plain)
+		if err != nil {
+			return err
+		}
+		updates["password"] = hashed
+	}
+	current := User{}
+	if err := tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
+	authChanged := false
+	if password, ok := updates["password"]; ok && current.Password != password {
+		authChanged = true
+	}
+	if group, ok := updates["group"]; ok && current.Group != group {
+		authChanged = true
+	}
+	if authChanged {
+		version, err := IncrementUserAuthVersionWithTx(tx, user.Id)
+		if err != nil {
+			return err
+		}
+		user.AuthVersion = version
+	}
+	if err := tx.Model(&current).Updates(updates).Error; err != nil {
+		return err
+	}
+	return tx.First(user, user.Id).Error
+}
+
 func (user *User) ClearBinding(bindingType string) error {
 	if user.Id == 0 {
 		return errors.New("user id is empty")

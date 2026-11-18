@@ -334,3 +334,126 @@ func TestUnifiedUpdatePartialBodyDoesNotWriteProfileColumns(t *testing.T) {
 		}
 	}
 }
+
+// R1: 管理范围 proof 只绑定角色/部门。请求体夹带非空密码必须拒绝，
+// 否则一份改部门的 proof 就能顺带重置目标账号密码，且审计看不出来。
+func TestUnifiedUpdateRejectsPasswordWithManagementProof(t *testing.T) {
+	identity, target, dept := setupUnifiedUpdateTest(t)
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"department"}, DepartmentID: &dept.Id,
+	})
+	body := fmt.Sprintf(`{"id":%d,"department_id":%d,"password":"fresh-password-9"}`, target.Id, dept.Id)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	assert.Equal(t, false, resp["success"], "message=%v", resp["message"])
+
+	var row struct{ Password string }
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).
+		Select("password").First(&row).Error)
+	assert.Equal(t, target.Password, row.Password, "密码不得被管理范围 proof 顺带重置")
+
+	stored, err := model.GetUserById(target.Id, false)
+	require.NoError(t, err)
+	assert.Nil(t, stored.DepartmentId, "整次请求应被拒绝，部门也不落库")
+}
+
+// R1: 角色 + 密码的组合同样必须拆分，管理范围 proof 里没有密码槽位。
+func TestUnifiedUpdateRejectsPasswordWithRoleChangeProof(t *testing.T) {
+	identity, target, _ := setupUnifiedUpdateTest(t)
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"role"}, Role: common.RoleRootUser,
+	})
+	body := fmt.Sprintf(`{"id":%d,"role":%d,"password":"fresh-password-9"}`, target.Id, common.RoleRootUser)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	assert.Equal(t, false, resp["success"], "message=%v", resp["message"])
+
+	stored, err := model.GetUserById(target.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.RoleCommonUser, stored.Role, "整次请求应被拒绝，角色也不落库")
+}
+
+// R1: 权限矩阵虽已绑进 proof，但合并路径仍应拆到 admin.user.update。
+func TestUnifiedUpdateRejectsPermissionMatrixWithManagementProof(t *testing.T) {
+	identity, target, dept := setupUnifiedUpdateTest(t)
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"department"}, DepartmentID: &dept.Id,
+		AdminPermissions: map[string]map[string]bool{"users": {"read": true}},
+	})
+	body := fmt.Sprintf(`{"id":%d,"department_id":%d,"admin_permissions":{"users":{"read":true}}}`, target.Id, dept.Id)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	assert.Equal(t, false, resp["success"], "message=%v", resp["message"])
+
+	var rules int64
+	require.NoError(t, model.DB.Model(&model.CasbinRule{}).
+		Where("v0 = ?", authz.UserSubject(target.Id)).Count(&rules).Error)
+	assert.Zero(t, rules, "权限矩阵不得搭管理范围 proof 的便车")
+
+	stored, err := model.GetUserById(target.Id, false)
+	require.NoError(t, err)
+	assert.Nil(t, stored.DepartmentId, "整次请求应被拒绝，部门也不落库")
+}
+
+// C1: 只传部分资料键时，缺失列不得用事务外读到的旧快照整份写回。
+func TestUnifiedUpdatePartialProfileKeysDoNotRewriteOtherColumns(t *testing.T) {
+	identity, target, dept := setupUnifiedUpdateTest(t)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).Updates(map[string]any{
+		"display_name": "Concurrent Name",
+		"group":        "vip",
+		"remark":       "concurrent note",
+	}).Error)
+
+	recorder := &updateSQLRecorder{Interface: logger.Default.LogMode(logger.Silent)}
+	previous := model.DB
+	model.DB = previous.Session(&gorm.Session{Logger: recorder})
+	t.Cleanup(func() { model.DB = previous })
+
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"department", "role"},
+		Role: common.RoleRootUser, DepartmentID: &dept.Id,
+	})
+	body := fmt.Sprintf(`{"id":%d,"username":"managed-user","role":%d,"department_id":%d}`,
+		target.Id, common.RoleRootUser, dept.Id)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	for _, sql := range recorder.sqls {
+		if !strings.Contains(strings.ToUpper(sql), "UPDATE") {
+			continue
+		}
+		assert.NotContains(t, sql, "display_name", "未传的资料列不得写入: %s", sql)
+		assert.NotContains(t, sql, "remark", "未传的资料列不得写入: %s", sql)
+	}
+	stored, err := model.GetUserById(target.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, "Concurrent Name", stored.DisplayName)
+	assert.Equal(t, "vip", stored.Group)
+	assert.Equal(t, "concurrent note", stored.Remark)
+}
+
+// C1: password 键存在但值为空时，不得触发资料列整份写回。
+func TestUnifiedUpdateEmptyPasswordDoesNotRewriteProfileColumns(t *testing.T) {
+	identity, target, dept := setupUnifiedUpdateTest(t)
+	recorder := &updateSQLRecorder{Interface: logger.Default.LogMode(logger.Silent)}
+	previous := model.DB
+	model.DB = previous.Session(&gorm.Session{Logger: recorder})
+	t.Cleanup(func() { model.DB = previous })
+
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"department"}, DepartmentID: &dept.Id,
+	})
+	body := fmt.Sprintf(`{"id":%d,"department_id":%d,"password":""}`, target.Id, dept.Id)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	for _, sql := range recorder.sqls {
+		if !strings.Contains(strings.ToUpper(sql), "UPDATE") {
+			continue
+		}
+		assert.NotContains(t, sql, "password", "空密码不得触发密码写入: %s", sql)
+		assert.NotContains(t, sql, "display_name", "空密码不得触发资料列写回: %s", sql)
+	}
+}

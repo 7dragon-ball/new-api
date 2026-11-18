@@ -67,7 +67,7 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		return
 	}
 	// 部分字段请求（BFF 常见）只发 id/role/department_id。用库中当前值补齐
-	// 资料列：既让下面的校验通过，也保证 EditWithTx 不会把没传的列写成零值。
+	// 资料列仅供下面的校验使用；实际落库只写 keys 里真正出现的列。
 	if _, ok := keys["username"]; !ok {
 		updatedUser.Username = originUser.Username
 	}
@@ -94,16 +94,6 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		common.ApiErrorT(c, "No permission to update users of same or higher permission level")
 		return
 	}
-	// 没回写资料时完全跳过 EditWithTx：补齐值来自事务外的快照，整份写回会
-	// 静默回滚并发发生的资料修改。
-	hasProfileFields := false
-	for _, key := range []string{"username", "display_name", "group", "remark", "password"} {
-		if _, ok := keys[key]; ok {
-			hasProfileFields = true
-			break
-		}
-	}
-
 	// 部门：显式 null 清空，正整数设置；键不存在则完全不动。
 	var departmentID *int
 	if hasDepartment && common.GetJsonType(departmentRaw) != "null" {
@@ -139,6 +129,23 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 	}
 
 	updatePassword := updatedUser.Password != ""
+	// 只写请求里显式出现的资料列；空密码不算改动，补齐的快照值不参与落库。
+	profileUpdates := map[string]any{}
+	if _, ok := keys["username"]; ok {
+		profileUpdates["username"] = updatedUser.Username
+	}
+	if _, ok := keys["display_name"]; ok {
+		profileUpdates["display_name"] = updatedUser.DisplayName
+	}
+	if _, ok := keys["group"]; ok {
+		profileUpdates["group"] = updatedUser.Group
+	}
+	if _, ok := keys["remark"]; ok {
+		profileUpdates["remark"] = updatedUser.Remark
+	}
+	if updatePassword {
+		profileUpdates["password"] = updatedUser.Password
+	}
 	auditParams := map[string]any{
 		"username": originUser.Username,
 		"id":       updatedUser.Id,
@@ -153,6 +160,12 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		changes = append(changes, "department")
 	}
 	slices.Sort(changes)
+	// 管理范围 proof 只绑角色/部门；密码与权限矩阵必须拆到 admin.user.update，
+	// 否则一份改部门的 proof 就能顺带重置凭据，且审计不会留下痕迹。
+	if len(changes) > 0 && (updatePassword || updatedUser.AdminPermissions != nil) {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
 	ctx := service.AdminUserManagementContext{
 		UserID:           updatedUser.Id,
 		Changes:          changes,
@@ -203,9 +216,9 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 				return err
 			}
 		}
-		// 资料列沿用上游白名单语义，避免整行覆盖写回 quota / last_called_at 等列。
-		if hasProfileFields {
-			if err := updatedUser.EditWithTx(tx, updatePassword); err != nil {
+		// 只写显式出现的资料列，避免把事务外快照整份写回。
+		if len(profileUpdates) > 0 {
+			if err := updatedUser.EditProfileWithTx(tx, profileUpdates); err != nil {
 				return err
 			}
 		}
@@ -221,9 +234,9 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		if err != nil {
 			return err
 		}
-		// EditWithTx 末尾会把最新的 auth_version 读回；跳过它时要自己刷新，
+		// 没写资料列时没人回读 auth_version，这里自己刷新，
 		// 否则下面的会话吊销判断看不到改角色推进的版本号。
-		if !hasProfileFields {
+		if len(profileUpdates) == 0 {
 			return tx.First(updatedUser, updatedUser.Id).Error
 		}
 		return nil
