@@ -128,7 +128,8 @@ func DeleteDepartment(c *gin.Context) {
 }
 
 // [FORK] PUT /api/user/:id/department  请求体 {"department_id": 2} 或 {"department_id": null}
-// 独立接口而不复用 PUT /api/user/：后者是整行替换语义，上游 UI 不传 department_id 就会把它清空。
+// 部门专用单列端点。PUT /api/user/ 的合并路径也写 department_id，但两者口径一致：
+// 都不要求 proof、审计同为 user.department_update，且共用 model 层的部门行锁与存在性校验。
 // 放在 department_fork.go 而不是 user.go：这是纯新增 handler，同包可拿到 canManageTargetRole
 // 与 recordManageAuditFor；user.go 是三组定制共同修改、merge 冲突风险最高的文件。
 func UpdateUserDepartment(c *gin.Context) {

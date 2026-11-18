@@ -23,6 +23,8 @@ import (
 //
 // 语义是「传了哪个键就改哪个」：department_id 显式传 null 表示清空部门，
 // role 为零值或与库中相同表示不改角色（兼容整行回写的旧客户端）。
+// 部门与 PUT /api/user/:id/department 同口径：不要求 step-up proof，审计同为
+// user.department_update；只有真正改角色才要求 admin.user.management proof。
 
 // handleUserManagementUpdate 在接管时返回 true（已写完响应），否则返回 false
 // 让上游继续。分流要读 body 判键，而上游用 common.DecodeJson 读一次即尽，
@@ -150,7 +152,7 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		"username": originUser.Username,
 		"id":       updatedUser.Id,
 	}
-	// 一次 proof 绑住本次要改的全部字段与目标值；绑不了「清空全部权限」，
+	// 一次 proof 绑住本次要改的角色与部门目标值；绑不了「清空全部权限」，
 	// 所以上面先拒绝了空矩阵。
 	changes := make([]string, 0, 2)
 	if roleChanged {
@@ -161,8 +163,8 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 	}
 	slices.Sort(changes)
 	// 管理范围 proof 只绑角色/部门；密码与权限矩阵必须拆到 admin.user.update，
-	// 否则一份改部门的 proof 就能顺带重置凭据，且审计不会留下痕迹。
-	if len(changes) > 0 && (updatePassword || updatedUser.AdminPermissions != nil) {
+	// 否则一份改角色的 proof 就能顺带重置凭据，且审计不会留下痕迹。
+	if roleChanged && (updatePassword || updatedUser.AdminPermissions != nil) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -175,22 +177,17 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 	if roleChanged {
 		ctx.Role = updatedUser.Role
 	}
-	if len(changes) > 0 {
+	var verificationMethod string
+	if roleChanged {
+		// 部门与单列端点同口径，不要求 proof；只有真正改角色才 step-up。
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserManagement, ctx)
 		if authorization == nil {
 			return
 		}
-		auditParams["verification_method"] = authorization.Method
-		// 前端审计明细只认 changed_fields；目标值一并记下，便于追溯改成了什么。
-		auditParams["changed_fields"] = changes
-		if roleChanged {
-			auditParams["role"] = updatedUser.Role
-		}
-		if hasDepartment {
-			auditParams["department_id"] = departmentID
-		}
+		verificationMethod = authorization.Method
 	} else if updatePassword || updatedUser.AdminPermissions != nil {
-		// 只带 role 键但值是 no-op：与上游一样，改密码/矩阵才要 step-up。
+		// role 键为 no-op 或只改部门时夹带凭据：与上游一样走 admin.user.update。
+		// 整对象回写的老客户端带上未变的 role/department_id，不会被新 scope 拦下。
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserUpdate, service.AdminUserContext{UserID: updatedUser.Id})
 		if authorization == nil {
 			return
@@ -198,6 +195,14 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		auditParams["verification_method"] = authorization.Method
 		auditParams["password_reset"] = updatePassword
 		auditParams["admin_permissions_updated"] = updatedUser.AdminPermissions != nil
+	}
+	// 部门改动单独记 user.department_update，和 PUT /api/user/:id/department 同口径；
+	// 整对象回写时部门值未变，不产生审计噪音。
+	departmentChanged := hasDepartment
+	if hasDepartment && departmentID != nil && originUser.DepartmentId != nil {
+		departmentChanged = *departmentID != *originUser.DepartmentId
+	} else if hasDepartment && departmentID == nil && originUser.DepartmentId == nil {
+		departmentChanged = false
 	}
 
 	authzTouched := false
@@ -255,7 +260,12 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 		}
 	}
 	if updatedUser.AuthVersion > originUser.AuthVersion {
-		if _, err := model.RevokeAllUserSessions(updatedUser.Id, "admin_user_update"); err != nil {
+		// 撤销 root 与 ManageUser 的 revoke_root 同口径，审计报表按 reason 过滤时不会漏。
+		revokeReason := "admin_user_update"
+		if roleChanged && originUser.Role == common.RoleRootUser && updatedUser.Role == common.RoleCommonUser {
+			revokeReason = "admin_demote"
+		}
+		if _, err := model.RevokeAllUserSessions(updatedUser.Id, revokeReason); err != nil {
 			common.SysLog(common.LogText("failed to revoke sessions for user %d: %s", updatedUser.Id, err.Error()))
 		}
 	}
@@ -267,6 +277,32 @@ func updateUserManagement(c *gin.Context, updatedUser *model.User, keys map[stri
 			common.SysLog(common.LogText("failed to invalidate tokens cache for user %d: %s", updatedUser.Id, err.Error()))
 		}
 	}
-	recordManageAuditFor(c, updatedUser.Id, "user.update", auditParams)
+	if roleChanged {
+		// 与 ManageUser 的 grant_root/revoke_root 同口径，避免按 action 过滤时漏掉这条路径。
+		manageAction := "grant_root"
+		if originUser.Role == common.RoleRootUser {
+			manageAction = "revoke_root"
+		}
+		recordManageAuditFor(c, updatedUser.Id, "user.manage", map[string]any{
+			"action":              manageAction,
+			"username":            originUser.Username,
+			"id":                  updatedUser.Id,
+			"role":                updatedUser.Role,
+			"verification_method": verificationMethod,
+		})
+	}
+	if departmentChanged {
+		// 占位符用 %v 渲染，传指针会写出地址；清空时为 nil。
+		var auditDepartmentID any
+		if departmentID != nil {
+			auditDepartmentID = *departmentID
+		}
+		recordManageAuditFor(c, updatedUser.Id, "user.department_update", map[string]any{
+			"id": updatedUser.Id, "department_id": auditDepartmentID,
+		})
+	}
+	if updatePassword || updatedUser.AdminPermissions != nil {
+		recordManageAuditFor(c, updatedUser.Id, "user.update", auditParams)
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 }

@@ -43,6 +43,7 @@ export type SecurityProofScope =
   | 'admin.user.update'
   | 'admin.user.delete'
   | 'admin.user.manage'
+  | 'admin.user.management'
   | 'admin.user.passkey.reset'
   | 'admin.user.2fa.disable'
   | 'admin.user.binding.clear'
@@ -65,6 +66,15 @@ export type VerificationOperation =
         | 'admin.user.passkey.reset'
         | 'admin.user.2fa.disable'
       context: { user_id: number }
+    }
+  | {
+      scope: 'admin.user.management'
+      context: {
+        user_id: number
+        changes: ('role' | 'department')[]
+        role?: number
+        department_id?: number | null
+      }
     }
   | {
       scope: 'admin.user.manage'

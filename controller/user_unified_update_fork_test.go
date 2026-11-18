@@ -247,8 +247,19 @@ func TestUnifiedUpdateSingleKeyDispatch(t *testing.T) {
 	})
 }
 
-// 前端审计明细只识别 changed_fields；目标值也要留痕，否则看不出改成了什么。
-func TestUnifiedUpdateAuditRecordsChangedFields(t *testing.T) {
+func auditParamsOf(t *testing.T, entry model.AuditLog) map[string]any {
+	t.Helper()
+	require.NotNil(t, entry.Other.Op)
+	encoded, err := common.Marshal(entry.Other.Op.Params)
+	require.NoError(t, err)
+	var params map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &params))
+	return params
+}
+
+// 部门与角色分别按 user.department_update / user.manage 审计，
+// 与单列端点和 ManageUser 的 action 口径一致。
+func TestUnifiedUpdateAuditActions(t *testing.T) {
 	identity, target, dept := setupUnifiedUpdateTest(t)
 	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
 		UserID: target.Id, Changes: []string{"department", "role"},
@@ -258,16 +269,86 @@ func TestUnifiedUpdateAuditRecordsChangedFields(t *testing.T) {
 	_, resp := unifiedUpdateRequest(t, unifiedUpdateBody(target.Id, common.RoleRootUser, dept.Id), proof, identity, common.RoleRootUser)
 	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
 
-	var entry model.AuditLog
-	require.NoError(t, model.LOG_DB.Where("action = ?", "user.update").Order("id DESC").First(&entry).Error)
-	require.NotNil(t, entry.Other.Op)
-	encoded, err := common.Marshal(entry.Other.Op.Params)
+	var manageEntry model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "user.manage").Order("id DESC").First(&manageEntry).Error)
+	manageParams := auditParamsOf(t, manageEntry)
+	assert.Equal(t, "grant_root", manageParams["action"])
+	assert.Equal(t, float64(target.Id), manageParams["id"])
+	assert.Equal(t, float64(common.RoleRootUser), manageParams["role"])
+	assert.NotEmpty(t, manageParams["verification_method"])
+
+	var departmentEntry model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "user.department_update").Order("id DESC").First(&departmentEntry).Error)
+	departmentParams := auditParamsOf(t, departmentEntry)
+	assert.Equal(t, float64(target.Id), departmentParams["id"])
+	assert.Equal(t, float64(dept.Id), departmentParams["department_id"])
+}
+
+// 部门改动不要求 step-up proof，与 PUT /api/user/:id/department 同口径。
+func TestUnifiedUpdateDepartmentWithoutProof(t *testing.T) {
+	identity, target, dept := setupUnifiedUpdateTest(t)
+	body := fmt.Sprintf(`{"id":%d,"department_id":%d}`, target.Id, dept.Id)
+
+	_, resp := unifiedUpdateRequest(t, body, "", identity, common.RoleRootUser)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	stored, err := model.GetUserById(target.Id, false)
 	require.NoError(t, err)
-	var params map[string]any
-	require.NoError(t, common.Unmarshal(encoded, &params))
-	assert.Equal(t, []any{"department", "role"}, params["changed_fields"])
-	assert.Equal(t, float64(common.RoleRootUser), params["role"])
-	assert.Equal(t, float64(dept.Id), params["department_id"])
+	require.NotNil(t, stored.DepartmentId)
+	assert.Equal(t, dept.Id, *stored.DepartmentId)
+
+	var entry model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "user.department_update").Order("id DESC").First(&entry).Error)
+	assert.Equal(t, float64(dept.Id), auditParamsOf(t, entry)["department_id"])
+}
+
+// 整对象回写的老客户端会带上未变化的 role/department_id，不得被新 scope 拦下。
+func TestUnifiedUpdateWholeObjectWritebackWithoutProof(t *testing.T) {
+	identity, target, dept := setupUnifiedUpdateTest(t)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).
+		Update("department_id", dept.Id).Error)
+
+	body := fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"managed-user","group":"default","role":%d,"department_id":%d}`,
+		target.Id, common.RoleCommonUser, dept.Id)
+	_, resp := unifiedUpdateRequest(t, body, "", identity, common.RoleRootUser)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	stored, err := model.GetUserById(target.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.RoleCommonUser, stored.Role)
+	require.NotNil(t, stored.DepartmentId)
+	assert.Equal(t, dept.Id, *stored.DepartmentId)
+}
+
+// 合并路径撤销 root 必须与 ManageUser 同口径：user.manage/revoke_root 审计与 admin_demote 吊销原因。
+func TestUnifiedUpdateRevokeRootAuditAndSessionReason(t *testing.T) {
+	identity, target, _ := setupUnifiedUpdateTest(t)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).
+		Update("role", common.RoleRootUser).Error)
+	now := time.Now().Unix()
+	session := model.UserSession{
+		SID: "unified-revoke-root-session", UserID: target.Id, Version: 1,
+		UserAuthVersion: target.AuthVersion, Status: model.UserSessionStatusActive,
+		RefreshHash: strings.Repeat("b", 64), LoginMethod: "password",
+		LastActiveAt: now, ExpiresAt: now + 3600,
+	}
+	require.NoError(t, model.DB.Create(&session).Error)
+	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
+		UserID: target.Id, Changes: []string{"role"}, Role: common.RoleCommonUser,
+	})
+	body := fmt.Sprintf(`{"id":%d,"role":%d}`, target.Id, common.RoleCommonUser)
+
+	_, resp := unifiedUpdateRequest(t, body, proof, identity, common.RoleRootUser)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	var entry model.AuditLog
+	require.NoError(t, model.LOG_DB.Where("action = ?", "user.manage").Order("id DESC").First(&entry).Error)
+	assert.Equal(t, "revoke_root", auditParamsOf(t, entry)["action"])
+
+	var stored model.UserSession
+	require.NoError(t, model.DB.Where("sid = ?", session.SID).First(&stored).Error)
+	assert.Equal(t, model.UserSessionStatusRevoked, stored.Status)
+	assert.Equal(t, "admin_demote", stored.RevokedReason)
 }
 
 // 部分字段请求会跳过 EditWithTx，改角色后仍必须读回新的 auth_version，
@@ -335,7 +416,7 @@ func TestUnifiedUpdatePartialBodyDoesNotWriteProfileColumns(t *testing.T) {
 	}
 }
 
-// R1: 管理范围 proof 只绑定角色/部门。请求体夹带非空密码必须拒绝，
+// 管理范围 proof 只绑定角色/部门。请求体夹带非空密码必须拒绝，
 // 否则一份改部门的 proof 就能顺带重置目标账号密码，且审计看不出来。
 func TestUnifiedUpdateRejectsPasswordWithManagementProof(t *testing.T) {
 	identity, target, dept := setupUnifiedUpdateTest(t)
@@ -357,7 +438,7 @@ func TestUnifiedUpdateRejectsPasswordWithManagementProof(t *testing.T) {
 	assert.Nil(t, stored.DepartmentId, "整次请求应被拒绝，部门也不落库")
 }
 
-// R1: 角色 + 密码的组合同样必须拆分，管理范围 proof 里没有密码槽位。
+// 角色 + 密码的组合同样必须拆分，管理范围 proof 里没有密码槽位。
 func TestUnifiedUpdateRejectsPasswordWithRoleChangeProof(t *testing.T) {
 	identity, target, _ := setupUnifiedUpdateTest(t)
 	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
@@ -373,7 +454,7 @@ func TestUnifiedUpdateRejectsPasswordWithRoleChangeProof(t *testing.T) {
 	assert.Equal(t, common.RoleCommonUser, stored.Role, "整次请求应被拒绝，角色也不落库")
 }
 
-// R1: 权限矩阵虽已绑进 proof，但合并路径仍应拆到 admin.user.update。
+// 权限矩阵虽已绑进 proof，但合并路径仍应拆到 admin.user.update。
 func TestUnifiedUpdateRejectsPermissionMatrixWithManagementProof(t *testing.T) {
 	identity, target, dept := setupUnifiedUpdateTest(t)
 	proof := unifiedUpdateProof(t, identity, service.AdminUserManagementContext{
@@ -395,7 +476,7 @@ func TestUnifiedUpdateRejectsPermissionMatrixWithManagementProof(t *testing.T) {
 	assert.Nil(t, stored.DepartmentId, "整次请求应被拒绝，部门也不落库")
 }
 
-// C1: 只传部分资料键时，缺失列不得用事务外读到的旧快照整份写回。
+// 只传部分资料键时，缺失列不得用事务外读到的旧快照整份写回。
 func TestUnifiedUpdatePartialProfileKeysDoNotRewriteOtherColumns(t *testing.T) {
 	identity, target, dept := setupUnifiedUpdateTest(t)
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", target.Id).Updates(map[string]any{
@@ -433,7 +514,7 @@ func TestUnifiedUpdatePartialProfileKeysDoNotRewriteOtherColumns(t *testing.T) {
 	assert.Equal(t, "concurrent note", stored.Remark)
 }
 
-// C1: password 键存在但值为空时，不得触发资料列整份写回。
+// password 键存在但值为空时，不得触发资料列整份写回。
 func TestUnifiedUpdateEmptyPasswordDoesNotRewriteProfileColumns(t *testing.T) {
 	identity, target, dept := setupUnifiedUpdateTest(t)
 	recorder := &updateSQLRecorder{Interface: logger.Default.LogMode(logger.Silent)}
