@@ -110,8 +110,13 @@ type User struct {
 	// [FORK] 组织归属：部门由 token-master 管理端维护，随用户一起返回。
 	// 指针是必需的，不是风格选择：GORM 对零值会跳过，int 的 0 永远清不掉部门，nil 才表示「未分配」。
 	// 不加 omitempty：nil 要序列化成 null，否则前端分不清「未分配」与「字段没返回」。
-	DepartmentId   *int   `json:"department_id" gorm:"index"`
-	StripeCustomer string `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	DepartmentId *int `json:"department_id" gorm:"index"`
+	// [FORK] 手机号：建号时写入，建号后不可通过任何接口修改（产品决定）。
+	// 接口层允许缺省（自助注册、种子脚本），Web 表单的「必填」只是前端约束。
+	// 指针与 DepartmentId 同一条理由：值类型会被 Updates(struct) 当零值跳过。
+	// 部分唯一索引只约束非 NULL 行；不过滤 deleted_at，与旧 user_profile_phone_key 一致。
+	Phone          *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:phone IS NOT NULL"`
+	StripeCustomer string  `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
 	CreatedAt      int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
 	LastLoginAt    int64  `json:"last_login_at" gorm:"default:0;column:last_login_at"`
 	// [FORK] 上游只有 last_login_at（登录）与 quota_data.created_at（写入时被抹成整点），都不足以回答「最近一次调用」。
