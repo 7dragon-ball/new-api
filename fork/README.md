@@ -1,8 +1,8 @@
 # fork/ — New API 的定制登记册
 
-本仓库是 [New API](https://github.com/QuantumNous/new-api)（AI API 网关）的 fork，在上面做了三组
+本仓库是 [New API](https://github.com/QuantumNous/new-api)（AI API 网关）的 fork，在上面做了四组
 后端定制：支持多个超级管理员（root）、在 `users` 表记录真实的最近调用时刻、把部门归属从业务库
-搬到 `new_api` 库。
+搬到 `new_api` 库、把手机号也搬进 `new_api.users`。
 
 **定制直接写在源码里，以 `// [FORK]` 标记。** 没有补丁目录，也没有 `git am` 重放步骤。
 本文件是唯一的定制登记册：哪几处与上游不同、为什么不同、merge 上游时怎么保住它们。
@@ -101,6 +101,8 @@ model/migrations/postgres/*.sql          # 只有 PG 一份，收录该目录下
 da9b37f5c  feat(fork): 多 root 管理员与 fork 脚手架
 ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 522c044f9  feat(fork): 部门归属搬进 new_api 库
+（第四组「手机号」见下方「四、手机号」小节；它没有单独的补丁提交哈希，
+  与前三组一起随源码发布。）
 ```
 
 基线是上游 `6ef123cd5`。这三个提交是**可直接 merge 的源码改动**，不是补丁。
@@ -171,6 +173,42 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 `new_api` 库这一侧不需要额外步骤：`department` 表与 `users.department_id` 都随新版镜像启动
 自动就位（前者由内嵌 goose 迁移建，后者仍由 AutoMigrate 加列）。
 
+### 四、手机号
+
+**背景**：手机号原本存在业务库 `token_master.user_profile`，与账号分属两个 database，建号因此
+被拆成两段——先建账号、再补写手机号，第二段失败就是「账号已存在但手机号没有」的半成功状态。
+
+**做法**：`users` 加一列 `phone`（`*string`），建号时与账号同一个 GORM 事务写入。
+
+```go
+Phone *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:phone IS NOT NULL"`
+```
+
+- **只有这一个 tag，没有格式 CHECK —— 与 `department_id` / `last_called_at` 一致。** 三者都是
+  「字段 + AutoMigrate」，业务规则留给应用层。格式校验在 fork / BFF / Web 三层做
+  （`^[0-9]{11}$`）。不加 DB 格式约束的理由：`new_api` 的写入方只有本仓库的 Go 代码
+  （BFF 的网关库连接池带 `default_transaction_read_only=on`），没有绕过应用层的写入方；
+  而加 CHECK 要多一个启动时 DDL、SQLite 测不到、CI 没有测试 job 设 `TEST_POSTGRES_DSN`
+  （只有 `quay-publish.yml`），那条验证会永远 SKIP。全仓 `grep 'check:' model/` 零命中。
+- **`uniqueIndex` 是必需的**：应用层预检有并发窗口，唯一约束只能由索引兜住；索引由 AutoMigrate
+  建列时一并建出，零额外代码。
+- **`where:phone IS NOT NULL` 不是「放过多个 NULL」的开关**：PG / SQLite / MySQL 的唯一索引本就把
+  NULL 视为互不相等，去掉 WHERE 也能建出多个无号码用户（`TestMultipleUsersMayHaveNullPhone`
+  两种写法都通过）。保留它只为让索引只覆盖有号码的行、与旧 `user_profile_phone_key` 同口径。
+  另外只有 postgres 与 sqlite dialector 会把这个子句拼进 DDL，mysql dialector 静默丢弃、退化成
+  普通唯一索引——行为等价（NULL 仍互不冲突），但别以为 MySQL 上也建出了部分索引。
+- **不过滤 `deleted_at`**：软删用户仍占着号码，与原 `user_profile_phone_key` 一致。
+- **`UpdateWithTx` 的 `Omit` 列表必须含 `"phone"`**：该路径用 `Updates(struct)` 整行覆盖，
+  GORM 会写入**非 nil** 指针，不排除就会把调用方快照里的旧号码写回。
+- **编辑路径不写 phone**：产品决定建号后手机号不可改，`user_management_fork.go` 的
+  `profileUpdates` 与 `EditWithTx` 的 updates map 都不含它，请求体里带了也忽略。
+- **错误码**：`PHONE_INVALID` / `PHONE_TAKEN`，与 `CreateUser` 其它业务失败（含「部门不存在」）
+  同一口径：HTTP 200 + `success:false`。web 控制台按 `message_key` 翻译（`message` 保持英文），
+  BFF 按 `code` 映射。
+- **持久化从哪里来**：`users.phone` 由 AutoMigrate 建列与索引，**不需要 goose 迁移**。
+  针对 AutoMigrate 所建表的 `ALTER TABLE` 不能放进 goose——goose 在 AutoMigrate 之前跑，
+  空库上表还不存在；给它加 `to_regclass` 守卫又会被 goose 记为已应用、约束永久缺失。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -197,9 +235,9 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 | 文件 | 改动 | 风险 |
 |---|---|---|
-| `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` 与 `DepartmentId` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，三组定制都改它 |
-| `controller/user.go` | `CreateUser` 允许 root 建 root 并接受部门；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
-| `router/api-router.go` | 三处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments` | 中，三组都插在同一文件 |
+| `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，四组定制都改它 |
+| `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
+| `router/api-router.go` | 三处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments` | 中，前三组都插在同一文件 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 4 项 | 低 |
 | `service/security_verification.go` | proof action 白名单加 2 项 | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
@@ -213,6 +251,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | 文件 | 内容 |
 |---|---|
 | `model/department_fork.go` | `Department` 模型、名字归一与校验、`LockDepartmentWithTx` / `EnsureDepartmentExistsWithTx` |
+| `model/user_phone_fork.go` | `IsPhoneDuplicate`：只认 `uk_users_phone` 唯一索引冲突（PG 看约束名、SQLite 看错误文本） |
+| `controller/user_phone_fork.go` | `normalizePhoneFork` 归一与 11 位校验、`ensurePhoneFreeWithTx` 事务内预检、两条 `common.Message` 错误 |
 | `model/goose_fork.go` | 内嵌 PG 迁移的 goose 集成：`Provider.Up()`、非 PG 库直接拒绝 |
 | `model/migrations/postgres/*.sql` | 部门表建表迁移（仅 PG） |
 | `controller/department_fork.go` | 四个 CRUD handler + `PUT /api/user/:id/department` + `isDuplicateKey` |
@@ -358,7 +398,7 @@ docker build -t new-api:$(date +%Y%m%d)-$(git rev-parse --short HEAD) .
 tag 用 `<构建日期>-<HEAD 短号>`，一眼看出镜像来自哪天哪个提交。构建时间包含一次
 `bun install` 加前端构建，不能跳过。
 
-> 源码里三组定制（多 root、最近调用、部门）恒在，tag 不编码定制组，也不跟随上游版本号。
+> 源码里四组定制（多 root、最近调用、部门、手机号）恒在，tag 不编码定制组，也不跟随上游版本号。
 > 工作区有未提交改动时 tag 只反映 HEAD，不反映改动，别用它反推镜像内容。
 
 国内网络通常拉不到 registry 与 Go proxy，用 `--build-arg` 显式传代理，**不要**指望 shell 里的

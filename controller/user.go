@@ -1051,6 +1051,18 @@ func CreateUser(c *gin.Context) {
 		}
 		auditParams["verification_method"] = authorization.Method
 	}
+	// [FORK] 手机号：归一 + 格式校验放在任何写库之前，失败时 users 表不新增行。
+	var phoneRaw string
+	if user.Phone != nil {
+		phoneRaw = *user.Phone
+	}
+	phone, err := normalizePhoneFork(phoneRaw)
+	if err != nil {
+		// [FORK] 与同端点的其它业务失败同一口径：HTTP 200 + success:false，
+		// code 给 BFF 映射，message_key 给 web 控制台翻译。
+		common.ApiErrorStatus(c, http.StatusOK, err, gin.H{"code": "PHONE_INVALID"})
+		return
+	}
 	// Even for admin users, we cannot fully trust them!
 	cleanUser := model.User{
 		Username:    user.Username,
@@ -1059,12 +1071,20 @@ func CreateUser(c *gin.Context) {
 		Role:        user.Role, // 保持管理员设置的角色
 		// [FORK] 部门归属随建号一并写上游，与 users 同一事务
 		DepartmentId: user.DepartmentId,
+		// [FORK] 手机号同一事务写入，建号后不可改
+		Phone: phone,
 	}
 	// [FORK] 部门存在性校验与建号放进同一事务，被拒时 users 表不得新增行。
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
 		if user.DepartmentId != nil {
 			if err := model.EnsureDepartmentExistsWithTx(tx, *user.DepartmentId); err != nil {
+				return err
+			}
+		}
+		// [FORK] 手机号唯一性预检，与建号同一事务
+		if phone != nil {
+			if err := ensurePhoneFreeWithTx(tx, *phone); err != nil {
 				return err
 			}
 		}
@@ -1075,6 +1095,14 @@ func CreateUser(c *gin.Context) {
 		authzTouched = touched
 		return err
 	}); err != nil {
+		// [FORK] 两种来源都要映射成业务错误：
+		//   - ensurePhoneFreeWithTx 的预检命中（ErrPhoneTakenFork，事务内冒出来）
+		//   - 预检窗口内被唯一索引兜住（并发建号抢同一号码）
+		// 漏掉的话客户端收到 500，而不是可以照着改表单的 PHONE_TAKEN 业务失败。
+		if errors.Is(err, ErrPhoneTakenFork) || model.IsPhoneDuplicate(err) {
+			common.ApiErrorStatus(c, http.StatusOK, ErrPhoneTakenFork, gin.H{"code": "PHONE_TAKEN"})
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -1089,8 +1117,9 @@ func CreateUser(c *gin.Context) {
 
 	auditParams["username"] = cleanUser.Username
 	recordManageAuditFor(c, cleanUser.Id, "user.create", auditParams)
-	// [FORK] 返回新用户 id：BFF 建号后要立刻写 token_master.user_profile.phone，
-	// 原来只能靠 /api/user/search 按 username 精确匹配回查，匹配不上就丢档案。
+	// [FORK] 返回新用户 id：BFF 已不需要用它取 id —— 手机号随本次事务写进 users.phone，
+	// 不再有「先建号、再补手机号」的第二段。这个字段现在只作**镜像版本哨兵**：BFF 把
+	// 「缺失」当失败，用来拦下会把 phone 当未知字段静默丢掉的旧镜像。改响应形状时别顺手删它。
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
