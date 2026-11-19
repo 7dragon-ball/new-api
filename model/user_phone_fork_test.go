@@ -68,3 +68,30 @@ func TestDuplicateNonEmptyPhoneIsRejected(t *testing.T) {
 	require.Error(t, err, "相同非空手机号必须被唯一索引拒绝")
 	assert.True(t, IsPhoneDuplicate(err), "应被 IsPhoneDuplicate 识别，实际 %v", err)
 }
+
+// 整行覆盖的写路径（UpdateWithTx）不得改动手机号。
+// 它用 Updates(struct) + Omit 列表；GORM 会跳过 nil 指针但会写入非 nil 指针，
+// 所以调用方拿一个带别的号码的对象回写就会把号改掉。
+func TestUpdateWithTxNeverWritesPhone(t *testing.T) {
+	truncateTables(t)
+	original := "13600136000"
+	user := &User{
+		Username: "phone-update-tx", Password: "password123",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled,
+		Group: "default", AffCode: "phone-update-tx-aff", Phone: &original,
+	}
+	require.NoError(t, DB.Create(user).Error)
+
+	// 模拟调用方手里有一个「号码不同」的快照。
+	snapshot := *user
+	other := "13700137000"
+	snapshot.Phone = &other
+	snapshot.Role = common.RoleAdminUser
+	require.NoError(t, snapshot.UpdateWithTx(DB, false))
+
+	stored, err := GetUserById(user.Id, false)
+	require.NoError(t, err)
+	require.NotNil(t, stored.Phone)
+	assert.Equal(t, original, *stored.Phone, "UpdateWithTx 不得改动手机号")
+	assert.Equal(t, common.RoleAdminUser, stored.Role, "其它列应照常写入，证明整行覆盖路径真的跑了")
+}

@@ -154,3 +154,34 @@ func TestNormalizePhoneFork(t *testing.T) {
 		assert.ErrorIs(t, err, ErrInvalidPhoneFork, "raw=%q 应报格式错误", raw)
 	}
 }
+
+// 编辑路径一律不写 phone：产品决定建号后手机号不可改。
+// 带 department_id 的 PUT /api/user/ 会走 fork 的合并编辑；body 里的 phone 必须被忽略。
+func TestEditingUserNeverChangesPhone(t *testing.T) {
+	_, identity := setupUserSearchControllerTest(t)
+	created := createUserOnce(t, identity, createBody("phone-immutable", "13600136000"))
+	require.True(t, created.Success, "message=%s", created.Message)
+	userId := int(created.Data.Id)
+
+	dept := &model.Department{Name: "手机号不可改"}
+	require.NoError(t, model.DB.Save(dept).Error)
+
+	// 带 department_id 与一个不同的 phone：phone 必须被忽略。
+	body := `{"id":` + strconv.Itoa(userId) + `,"department_id":` +
+		strconv.Itoa(dept.Id) + `,"phone":"13500135000"}`
+	response := adminUserRequest(http.MethodPut, "/api/user/", body, "",
+		identity, common.RoleRootUser, nil, UpdateUser)
+	var result struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.True(t, result.Success, "message=%s", result.Message)
+
+	stored, err := model.GetUserById(userId, false)
+	require.NoError(t, err)
+	require.NotNil(t, stored.Phone)
+	assert.Equal(t, "13600136000", *stored.Phone, "编辑不得改动手机号")
+	require.NotNil(t, stored.DepartmentId, "部门应已生效，证明走的是合并编辑路径")
+	assert.Equal(t, dept.Id, *stored.DepartmentId)
+}

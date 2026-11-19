@@ -946,6 +946,9 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		// 合并路径单列维护，两者都不要求 proof、审计同为 user.department_update。
 		// 整行覆盖会把调用方快照里的旧部门回写，静默回滚并发发生的改归属。
 		"department_id",
+		// [FORK] 手机号建号后不可改（产品决定）。整行覆盖会写回调用方快照里的
+		// 旧值，与 department_id 同一类风险；写库层排除它，不依赖每个调用方自觉。
+		"phone",
 	).Updates(newUser).Error; err != nil {
 		return err
 	}
