@@ -1051,6 +1051,16 @@ func CreateUser(c *gin.Context) {
 		}
 		auditParams["verification_method"] = authorization.Method
 	}
+	// [FORK] 手机号：归一 + 格式校验放在任何写库之前，失败时 users 表不新增行。
+	var phoneRaw string
+	if user.Phone != nil {
+		phoneRaw = *user.Phone
+	}
+	phone, err := normalizePhoneFork(phoneRaw)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, err, gin.H{"code": "PHONE_INVALID"})
+		return
+	}
 	// Even for admin users, we cannot fully trust them!
 	cleanUser := model.User{
 		Username:    user.Username,
@@ -1059,12 +1069,20 @@ func CreateUser(c *gin.Context) {
 		Role:        user.Role, // 保持管理员设置的角色
 		// [FORK] 部门归属随建号一并写上游，与 users 同一事务
 		DepartmentId: user.DepartmentId,
+		// [FORK] 手机号同一事务写入，建号后不可改
+		Phone: phone,
 	}
 	// [FORK] 部门存在性校验与建号放进同一事务，被拒时 users 表不得新增行。
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
 		if user.DepartmentId != nil {
 			if err := model.EnsureDepartmentExistsWithTx(tx, *user.DepartmentId); err != nil {
+				return err
+			}
+		}
+		// [FORK] 手机号唯一性预检，与建号同一事务
+		if phone != nil {
+			if err := ensurePhoneFreeWithTx(tx, *phone); err != nil {
 				return err
 			}
 		}
@@ -1075,6 +1093,14 @@ func CreateUser(c *gin.Context) {
 		authzTouched = touched
 		return err
 	}); err != nil {
+		// [FORK] 两种来源都要映射成业务错误：
+		//   - ensurePhoneFreeWithTx 的预检命中（ErrPhoneTakenFork，事务内冒出来）
+		//   - 预检窗口内被唯一索引兜住（并发建号抢同一号码）
+		// 漏掉的话客户端收到 500，而不是可以照着改表单的 400。
+		if errors.Is(err, ErrPhoneTakenFork) || model.IsPhoneDuplicate(err) {
+			common.ApiErrorStatus(c, http.StatusBadRequest, ErrPhoneTakenFork, gin.H{"code": "PHONE_TAKEN"})
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
