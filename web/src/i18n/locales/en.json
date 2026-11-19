@@ -2001,6 +2001,8 @@
     "Department name must be 1-30 characters (spaces are trimmed)": "Department name must be 1-30 characters (spaces are trimmed)",
     "Department not found": "Department not found",
     "Department still has {{count}} users": "Department still has {{count}} users",
+    "Phone number is already used by another user": "Phone number is already used by another user",
+    "Phone number must be 11 digits": "Phone number must be 11 digits",
     "Deploy your own gateway and start routing requests through your configured upstream services.": "Deploy your own gateway and start routing requests through your configured upstream services.",
     "Deployment created successfully": "Deployment created successfully",
     "Deployment details": "Deployment details",

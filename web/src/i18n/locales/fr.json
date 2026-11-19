@@ -2001,6 +2001,8 @@
     "Department name must be 1-30 characters (spaces are trimmed)": "Le nom du département doit contenir entre 1 et 30 caractères (les espaces autour sont supprimés)",
     "Department not found": "Département introuvable",
     "Department still has {{count}} users": "Le département compte encore {{count}} utilisateurs",
+    "Phone number is already used by another user": "Ce numéro de téléphone est déjà utilisé par un autre utilisateur",
+    "Phone number must be 11 digits": "Le numéro de téléphone doit comporter 11 chiffres",
     "Deploy your own gateway and start routing requests through your configured upstream services.": "Déployez votre propre passerelle et commencez à router les requêtes via vos services en amont configurés.",
     "Deployment created successfully": "Déploiement créé avec succès",
     "Deployment details": "Détails du déploiement",

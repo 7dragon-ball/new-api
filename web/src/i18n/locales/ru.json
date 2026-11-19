@@ -2001,6 +2001,8 @@
     "Department name must be 1-30 characters (spaces are trimmed)": "Название отдела должно содержать от 1 до 30 символов (пробелы по краям удаляются)",
     "Department not found": "Отдел не найден",
     "Department still has {{count}} users": "В отделе всё ещё {{count}} пользователей",
+    "Phone number is already used by another user": "Этот номер телефона уже используется другим пользователем",
+    "Phone number must be 11 digits": "Номер телефона должен содержать 11 цифр",
     "Deploy your own gateway and start routing requests through your configured upstream services.": "Разверните собственный шлюз и начните маршрутизировать запросы через настроенные вышестоящие сервисы.",
     "Deployment created successfully": "Развертывание создано успешно",
     "Deployment details": "Детали развертывания",
