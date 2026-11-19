@@ -190,15 +190,21 @@ Phone *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:
   （BFF 的网关库连接池带 `default_transaction_read_only=on`），没有绕过应用层的写入方；
   而加 CHECK 要多一个启动时 DDL、SQLite 测不到、CI 没有测试 job 设 `TEST_POSTGRES_DSN`
   （只有 `quay-publish.yml`），那条验证会永远 SKIP。全仓 `grep 'check:' model/` 零命中。
-- **部分唯一索引是必需的**：应用层预检有并发窗口，`uniqueIndex` 由 AutoMigrate 建列时一并建出，
-  零额外代码。`where:phone IS NOT NULL` 不能省——否则全表唯一，第二个无手机号用户就建不出来。
+- **`uniqueIndex` 是必需的**：应用层预检有并发窗口，唯一约束只能由索引兜住；索引由 AutoMigrate
+  建列时一并建出，零额外代码。
+- **`where:phone IS NOT NULL` 不是「放过多个 NULL」的开关**：PG / SQLite / MySQL 的唯一索引本就把
+  NULL 视为互不相等，去掉 WHERE 也能建出多个无号码用户（`TestMultipleUsersMayHaveNullPhone`
+  两种写法都通过）。保留它只为让索引只覆盖有号码的行、与旧 `user_profile_phone_key` 同口径。
+  另外只有 postgres 与 sqlite dialector 会把这个子句拼进 DDL，mysql dialector 静默丢弃、退化成
+  普通唯一索引——行为等价（NULL 仍互不冲突），但别以为 MySQL 上也建出了部分索引。
 - **不过滤 `deleted_at`**：软删用户仍占着号码，与原 `user_profile_phone_key` 一致。
 - **`UpdateWithTx` 的 `Omit` 列表必须含 `"phone"`**：该路径用 `Updates(struct)` 整行覆盖，
   GORM 会写入**非 nil** 指针，不排除就会把调用方快照里的旧号码写回。
 - **编辑路径不写 phone**：产品决定建号后手机号不可改，`user_management_fork.go` 的
   `profileUpdates` 与 `EditWithTx` 的 updates map 都不含它，请求体里带了也忽略。
-- **错误码**：`PHONE_INVALID` / `PHONE_TAKEN`，都是 HTTP 400 + `success:false`。
-  `message` 保持英文（同时是上面 locale 文件的 key），中文由 BFF 按 code 映射。
+- **错误码**：`PHONE_INVALID` / `PHONE_TAKEN`，与 `CreateUser` 其它业务失败（含「部门不存在」）
+  同一口径：HTTP 200 + `success:false`。web 控制台按 `message_key` 翻译（`message` 保持英文），
+  BFF 按 `code` 映射。
 - **持久化从哪里来**：`users.phone` 由 AutoMigrate 建列与索引，**不需要 goose 迁移**。
   针对 AutoMigrate 所建表的 `ALTER TABLE` 不能放进 goose——goose 在 AutoMigrate 之前跑，
   空库上表还不存在；给它加 `to_regclass` 守卫又会被 goose 记为已应用、约束永久缺失。

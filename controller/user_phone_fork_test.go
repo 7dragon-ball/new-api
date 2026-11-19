@@ -14,6 +14,7 @@ import (
 )
 
 type createUserResult struct {
+	Status  int    `json:"-"`
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Code    string `json:"code"`
@@ -30,6 +31,7 @@ func createUserOnce(t *testing.T, identity service.AuthIdentity, body string) cr
 		"", identity, common.RoleRootUser, nil, CreateUser)
 	var result createUserResult
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	result.Status = response.Code
 	return result
 }
 
@@ -86,6 +88,7 @@ func TestCreateUserRejectsNonElevenDigitPhoneWithoutInsertingRow(t *testing.T) {
 			before := countUsers(t)
 			result := createUserOnce(t, identity, createBody("phone-bad", phone))
 			assert.False(t, result.Success, "%s 应被拒", phone)
+			assert.Equal(t, http.StatusOK, result.Status, "业务失败沿用 HTTP 200 + success:false")
 			assert.Equal(t, "PHONE_INVALID", result.Code)
 			assert.EqualValues(t, before, countUsers(t), "被拒时 users 表不得新增行")
 		})
@@ -100,6 +103,22 @@ func TestCreateUserRejectsDuplicatePhoneWithoutInsertingRow(t *testing.T) {
 	before := countUsers(t)
 	second := createUserOnce(t, identity, createBody("phone-second", "13800138000"))
 	assert.False(t, second.Success)
+	assert.Equal(t, http.StatusOK, second.Status, "业务失败沿用 HTTP 200 + success:false")
+	assert.Equal(t, "PHONE_TAKEN", second.Code)
+	assert.EqualValues(t, before, countUsers(t), "号码冲突时不得新增行")
+}
+
+// 软删用户仍占着号码：唯一索引不过滤 deleted_at，与旧 user_profile_phone_key 一致。
+// 这条也钉住「不得给索引加 deleted_at 过滤」这个产品口径。
+func TestSoftDeletedUserStillOccupiesPhone(t *testing.T) {
+	_, identity := setupUserSearchControllerTest(t)
+	first := createUserOnce(t, identity, createBody("phone-deleted", "13700137001"))
+	require.True(t, first.Success, "message=%s", first.Message)
+	require.NoError(t, model.DB.Delete(&model.User{}, int(first.Data.Id)).Error)
+
+	before := countUsers(t)
+	second := createUserOnce(t, identity, createBody("phone-reuse", "13700137001"))
+	assert.False(t, second.Success, "软删用户的号码不得被重新占用")
 	assert.Equal(t, "PHONE_TAKEN", second.Code)
 	assert.EqualValues(t, before, countUsers(t), "号码冲突时不得新增行")
 }
@@ -115,7 +134,7 @@ func TestCreateUserWithoutPhoneSucceeds(t *testing.T) {
 	assert.Nil(t, stored.Phone)
 }
 
-// 空串与纯空白等价于「没有手机号」，不能落成 ''（会占掉唯一索引）。
+// 空串与纯空白等价于「没有手机号」，不能落成 ”（会占掉唯一索引）。
 func TestCreateUserTreatsBlankPhoneAsNull(t *testing.T) {
 	_, identity := setupUserSearchControllerTest(t)
 	for i, phone := range []string{"", "   ", "\t\n"} {

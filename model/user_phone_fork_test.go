@@ -39,7 +39,8 @@ func TestUserPhoneRoundTrips(t *testing.T) {
 	assert.Equal(t, phone, *got.Phone)
 }
 
-// 部分唯一索引：只约束非 NULL。多个无号码用户必须能共存。
+// 多个无号码用户必须能共存。唯一索引本就把 NULL 视为互不相等，所以这条与
+// `where:phone IS NOT NULL` 子句无关：去掉子句这条 test 也通过。
 func TestMultipleUsersMayHaveNullPhone(t *testing.T) {
 	truncateTables(t)
 	for _, name := range []string{"no-phone-a", "no-phone-b", "no-phone-c"} {
