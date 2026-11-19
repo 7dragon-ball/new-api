@@ -171,6 +171,18 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 `new_api` 库这一侧不需要额外步骤：`department` 表与 `users.department_id` 都随新版镜像启动
 自动就位（前者由内嵌 goose 迁移建，后者仍由 AutoMigrate 加列）。
 
+### 四、日志记录上游密钥指纹
+
+**上游行为**：日志只把 `other.admin_info.multi_key_index`（密钥在渠道里的位置）记为「这次用了哪把钥匙」。位置不稳定：渠道增删或重排密钥后，同一序号指向另一把，历史日志的掩码、`/reveal` 明文与「按密钥明文反查」的结果全部漂移。
+
+**做法**：写日志时把该次调用所用密钥做 sha256、取前 16 位，写入 `other.admin_info.channel_key_fp`。取的是**日志写入时刻的 `ContextKeyChannelKey`**，不是 `GetNextEnabledKey()` 的返回值——插件类渠道会在选定后把该键改写成刷新后的凭据行，且该行会回写 `channels.key`，所以上下文值才是管理员能从库里读到的那份明文。该键在 `middleware/distributor.go` 里无条件设置（不在 `IsMultiKey` 分支内），因此单密钥渠道与错误日志同样带得上指纹。
+
+**哈希输入不做任何规范化**，连 trim 都不做。两侧输入本来就同源（都是 `channels.key` 里那一行的字节），而 Go 的 `strings.TrimSpace` 与 JS 的 `trim()` 覆盖的字符集不同——U+FEFF 对 JS 是空白、对 Go 不是，U+0085 反过来。加 strip 只会制造两侧永远对不上的指纹，表现是「按密钥搜不到」。
+
+**已知缺口**：升级前的日志没有该字段；JSON 数组形式的渠道密钥（Vertex 等服务账号）不参与反查；任务退款/差额结算日志（`RecordTaskBillingLog`）只有 `context.Context`，不带指纹。详见 `fork/design-channel-key-fingerprint.md`。
+
+**发布顺序**：先发含此改动的新 API 镜像，再发按指纹搜索的 BFF。反过来的表现是「按密钥搜永远空页」，不报错。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -191,7 +203,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 29 个文件（12 个上游文件被改、17 个新增），+2431/−62（不含 `fork/` 目录本身）。
+共 33 个文件（14 个上游文件被改、19 个新增），+2431/−62（不含 `fork/` 目录本身）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
@@ -207,6 +219,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_pagination_test.go` | `SearchUsers` 签名变化，补两个参数 | 低 |
 | `controller/security_enrollment_test.go` | 绑定清单加用例 | 低 |
 | `model/user_authentication_test.go` | 补 `deleteUserAuthenticationData` 的用例（只清目标用户、软删行、失败传播） | 低 |
+| `service/log_info_generate.go` | `AppendRelayLogAdminInfo` 加一行调用写指纹 | 低，块内独立 |
+| `service/violation_fee.go` | 构建违规费日志处加一行调用写指纹 | 低 |
 
 **本 fork 新增（文件名带 `_fork` 后缀，上游不可能改，merge 时不会冲突）**
 
@@ -219,6 +233,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/department_usage_fork.go` | 部门用量聚合 handler |
 | `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go` | controller 包测试 |
 | `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go` | model 包测试 |
+| `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
+| `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
 
 （另有 3 个上游测试文件被改签名或补迁移。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
