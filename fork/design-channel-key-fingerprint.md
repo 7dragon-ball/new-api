@@ -196,6 +196,10 @@ if fp := ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.ContextK
 日志（`GenerateTextOtherInfo`）、错误日志（`service/relay_error.go:97`）、Midjourney 提交与
 轮询（`relay/mjproxy_handler.go:286`、`:665`）。
 
+**不走这个函数的两处写日志点要单独补**：违规费（下节）与任务提交消费日志
+（`service/task_billing.go` 的 `LogTaskConsumption`，同为 `gin.Context`，同补一行）。后者
+一度被漏掉：它自己 `NewLogOther()`，导致同一请求的错误日志有指纹、消费日志没有。
+
 ### 3. 违规费日志
 
 `service/violation_fee.go:137-150` 手工构建 `LogOther` 后直接 `RecordConsumeLog`，不走

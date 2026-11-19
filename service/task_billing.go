@@ -82,6 +82,10 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		other.SetAdmin("request_plugins", info.RequestPluginSteps)
 	}
 	appendRequestPluginRecord(info, other)
+	// [FORK] 任务型渠道的提交日志同样要记指纹：本函数自己 NewLogOther，
+	// 不经过 AppendRelayLogAdminInfo。缺了它，任务渠道的消费日志按密钥搜不到，
+	// 而同一请求的错误日志（走 relay_error → AppendRelayLogAdminInfo）却搜得到。
+	AppendChannelKeyFingerprint(c, other)
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
 		ChannelId: info.ChannelId,
 		ModelName: info.OriginModelName,

@@ -36,9 +36,12 @@ func ChannelKeyFingerprint(key string) string {
 // AppendChannelKeyFingerprint 把日志写入时刻实际使用的密钥指纹记进 admin_info。
 //
 // 取 ContextKeyChannelKey 而不是 GetNextEnabledKey 的返回值：插件类渠道会在选定后
-// 把该键改写成刷新后的凭据行，且刷新结果会回写 channels.key
-// （service/provider_plugin.go 的 UpdateChannelLocked 分支）。所以上下文里的值才是
-// 上游真正发出去、也是管理员能从库里读到的那一份明文；取选择时的旧值会永久搜不到。
+// 把该键改写成刷新后的凭据行（relay/channel/providerplugin/adaptor.go、
+// relay/channel/task/jsplugin/credential.go），而刷新结果会经
+// model.UpdateChannelLocked 的 updates["key"] 回写 channels.key
+// （service/provider_plugin.go 改 channel.Key，model/channel_plugin_credential.go:71 落库）。
+// 所以上下文里的值才是上游真正发出去、也是管理员能从库里读到的那一份明文；
+// 取选择时的旧值会永久搜不到。
 //
 // 该键在 middleware/distributor.go 里无条件设置（不在 IsMultiKey 分支内），因此单密钥
 // 渠道与错误日志同样带得上指纹。

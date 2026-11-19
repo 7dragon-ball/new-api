@@ -74,3 +74,32 @@ func TestAppendRelayLogAdminInfoFingerprintOnSingleKeyChannel(t *testing.T) {
 	_, hasIndex := adminInfo["multi_key_index"]
 	assert.False(t, hasIndex, "单密钥渠道上游不写 multi_key_index")
 }
+
+// WebSocket 重连时 lockedContext 会逐键还原上下文（relay/responses_websocket.go 的
+// restoreConnectionContext 末尾 `for key, value := range s.lockedContext { c.Set(...) }`），
+// 其中包含 ContextKeyChannelKey。这里钉住「还原后指纹照样算得出来」这个契约：
+// 若有人把 ChannelKey 从那个白名单里删掉，重连后的日志会静默丢指纹。
+func TestAppendChannelKeyFingerprintAfterWebSocketContextRestore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// 模拟已建立连接时锁存下来的上下文
+	locked := map[string]any{
+		string(constant.ContextKeyChannelId):            7,
+		string(constant.ContextKeyChannelIsMultiKey):    true,
+		string(constant.ContextKeyChannelMultiKeyIndex): 1,
+		string(constant.ContextKeyChannelKey):           "efg-secret-value-123456",
+	}
+
+	// 模拟重连：新 ctx 上逐键还原
+	ctx, _ := gin.CreateTestContext(nil)
+	for k, v := range locked {
+		ctx.Set(k, v)
+	}
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "296de5b0c20acf93", adminInfo["channel_key_fp"])
+}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -1809,4 +1810,43 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 			assert.Equal(t, testCase.wantQuota, task.Quota)
 		})
 	}
+}
+
+// 任务型渠道的提交日志是 LogTaskConsumption 自己 NewLogOther 写的，
+// 不经过 AppendRelayLogAdminInfo。缺了这一步，同一请求的错误日志
+// （走 relay_error → AppendRelayLogAdminInfo）按密钥搜得到、消费日志却搜不到。
+func TestLogTaskConsumptionCarriesChannelKeyFingerprint(t *testing.T) {
+	truncate(t)
+	const userID, channelID = 42, 42
+	seedUser(t, userID, 10_000)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, 100, 0, BillingSourceWallet, 0)
+	info := &relaycommon.RelayInfo{
+		UserId:          userID,
+		OriginModelName: "test-model",
+		UsingGroup:      "default",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{Action: "GENERATE"},
+		PriceData: types.PriceData{
+			ModelPrice:     0.02,
+			Quota:          100,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	ctx.Set("token_name", "test_token")
+	ctx.Set(string(constant.ContextKeyChannelKey), "sk-abc123")
+	LogTaskConsumption(ctx, info, task)
+
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	adminInfo, ok := other["admin_info"].(map[string]any)
+	require.True(t, ok, "admin_info 应被创建")
+	assert.Equal(t, "0a2f6ba7b3d49736", adminInfo["channel_key_fp"])
 }
