@@ -79,6 +79,9 @@ var auditContentTemplates = map[string]string{
 	"subscription.plan_reset":       "Reset active subscriptions for plan ${plan_id}",
 	"subscription.user_plan_reset":  "Reset active plan ${plan_id} subscriptions for user ${target_user_id}",
 	"subscription.user_quota_reset": "Administrator reset the quota of subscription plan ${plan_title} (ID: ${plan_id})",
+
+	// [FORK] 批量重置密码：params 只有 count / user_ids / verification_method，绝不含密码。
+	"user.batch_password_reset": "Batch reset passwords for ${count} users (IDs: ${user_ids})",
 }
 
 func recordPasskeyDomainAudit(c *gin.Context, change *model.PasskeyDomainChange, confirmed bool, err error) {

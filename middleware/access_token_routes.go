@@ -122,6 +122,8 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"DELETE /api/user/:id/reset_passkey":               accessTokenScopeRule("user:write"),
 	"GET /api/user/2fa/stats":                          accessTokenScopeRule("user:read"),
 	"DELETE /api/user/:id/2fa":                         accessTokenScopeRule("user:write"),
+	// [FORK] 批量重置密码（仅后端）
+	"POST /api/user/batch/reset_password": accessTokenScopeRule("user:write"),
 
 	// router/api-router.go: /api/subscription
 	"GET /api/subscription/plans":                                    accessTokenScopeRule("wallet:read"),
