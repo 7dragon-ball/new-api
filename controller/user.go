@@ -1117,9 +1117,7 @@ func CreateUser(c *gin.Context) {
 
 	auditParams["username"] = cleanUser.Username
 	recordManageAuditFor(c, cleanUser.Id, "user.create", auditParams)
-	// [FORK] 返回新用户 id：BFF 已不需要用它取 id —— 手机号随本次事务写进 users.phone，
-	// 不再有「先建号、再补手机号」的第二段。这个字段现在只作**镜像版本哨兵**：BFF 把
-	// 「缺失」当失败，用来拦下会把 phone 当未知字段静默丢掉的旧镜像。改响应形状时别顺手删它。
+	// [FORK] 返回新用户 id 手机号随本次事务写进 users.phone，
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
