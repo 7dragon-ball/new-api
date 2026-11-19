@@ -203,7 +203,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 34 个文件（15 个上游文件被改、19 个新增），+2431/−62（不含 `fork/` 目录本身）。
+共 37 个文件（18 个上游文件被改、19 个新增），+2734/−62（不含 `fork/` 目录本身）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
@@ -222,6 +222,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `service/log_info_generate.go` | `AppendRelayLogAdminInfo` 加一行调用写指纹 | 低，块内独立 |
 | `service/violation_fee.go` | 构建违规费日志处加一行调用写指纹 | 低 |
 | `service/task_billing.go` | `LogTaskConsumption` 加一行调用写指纹（任务型渠道的提交日志） | 低 |
+| `relay/responses_websocket.go` | lockedContext 白名单提成包级变量 `lockedContextKeys`（行为不变，为让白名单可被测试断言） | 低 |
 
 **本 fork 新增（文件名带 `_fork` 后缀，上游不可能改，merge 时不会冲突）**
 
@@ -251,7 +252,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 64 处、20 个文件：
+当前共 65 处、21 个文件：
 
 | 文件 | 处数 |
 |---|---|
@@ -263,7 +264,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `router/api-router.go` | 3 |
 | `service/security_verification.go` | 3 |
 | `service/security_verification_fork.go` | 2 |
-| `model/main.go`、`model/goose_fork.go`、`controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`model/user_department_fork_test.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`service/log_info_generate.go`、`service/violation_fee.go`、`service/task_billing.go`、`service/channel_key_fingerprint_fork.go` | 各 1 |
+| `model/main.go`、`model/goose_fork.go`、`controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`model/user_department_fork_test.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`service/log_info_generate.go`、`service/violation_fee.go`、`service/task_billing.go`、`service/channel_key_fingerprint_fork.go`、`relay/responses_websocket.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .

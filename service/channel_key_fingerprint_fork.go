@@ -40,8 +40,12 @@ func ChannelKeyFingerprint(key string) string {
 // relay/channel/task/jsplugin/credential.go），而刷新结果会经
 // model.UpdateChannelLocked 的 updates["key"] 回写 channels.key
 // （service/provider_plugin.go 改 channel.Key，model/channel_plugin_credential.go:71 落库）。
-// 所以上下文里的值才是上游真正发出去、也是管理员能从库里读到的那一份明文；
+// 所以上下文里的值才是上游真正发出去、**正常情况下**也等于库里那一行的明文；
 // 取选择时的旧值会永久搜不到。
+//
+// 存在一个窄竞态：刷新返回到写日志之间，另一节点可能再次刷新并落库，此时上下文
+// 指纹对应的行已不在库里，BFF 从库里拆候选就算不出来，表现为偶发「按密钥搜不到」。
+// 这是本方案的固有残余（替代方案是写日志时读库取值，更慢也更差），不额外处理。
 //
 // 该键在 middleware/distributor.go 里无条件设置（不在 IsMultiKey 分支内），因此单密钥
 // 渠道与错误日志同样带得上指纹。

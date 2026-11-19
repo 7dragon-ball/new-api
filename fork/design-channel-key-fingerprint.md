@@ -11,7 +11,7 @@
 怎么变都不影响。
 
 **为什么不是给密钥建 id**：`channels.key` 是一列文本，多把密钥只是同一条字符串里的不同片段，
-没有主键；`GetKeys()` 有 17 处调用，`MultiKeyStatusList` 等状态 map 全以序号为键。引入独立
+没有主键；`GetKeys()` 有 16 处调用（不计定义与测试），`MultiKeyStatusList` 等状态 map 全以序号为键。引入独立
 id 要动存储模型与上游前端，每次 merge 都要付冲突成本。哈希是纯增量：多写一个字段，两处读它，
 零 schema 变更。
 
@@ -38,7 +38,7 @@ id 要动存储模型与上游前端，每次 merge 都要付冲突成本。哈�
 | 取哪个 key | **`ContextKeyChannelKey`**（日志写入时刻的值） | 见下节。 |
 | 存储位置 | `other.admin_info.channel_key_fp` | `admin_info` 由 `formatLogOtherJSON` 对普通用户整体剥离（`model/log_other.go:246-258`），天然只对管理员可见，与 `multi_key_index` 同作用域。 |
 | JSON 数组 key | 不纳入 | BFF 侧要逐字节对齐数组元素的原始文本，得新写一个原文扫描器；这类渠道的 key 是凭证 JSON，不是运维会拿来搜的形态。 |
-| 任务结算/退款日志 | 接受漏 | 这些路径只有 `context.Context`，没有 `gin.Context`；要覆盖就得把指纹持久化进 `Task.PrivateData`，成本与收益不成比例。 |
+| 任务结算/退款日志 | 接受漏 | 这些路径只有 `context.Context`，没有 `gin.Context`。`Task.PrivateData` 里已为插件任务存了原始密钥（`model/task.go` 的 `Key` 字段），理论上可在提交时算出指纹一并持久化、结算时再写出；但退款与差额结算不是「这次调用用了哪把钥匙」的记录，且要改动 Task 模型的写入路径，成本与收益不成比例，故不做。 |
 
 ## 关键事实（已核对代码）
 
@@ -149,7 +149,7 @@ JSON 数组渠道第 2、3 步都不命中，落回第 4 步。
 | 升级前的日志 | 按密钥明文搜不到 | 没有指纹字段，且不回填。展示侧也不回填，但仍走原有回落逻辑，显示不受影响 |
 | 升级前写入的多密钥渠道缺序号日志 | 掩码与 reveal 给出拼接串 | 没有指纹可回填；升级后新写入的日志已靠指纹修正 |
 | JSON 数组形式的渠道密钥（Vertex 等多密钥） | 该渠道日志按密钥搜不到 | 上游存的是 `json.RawMessage` 原文，BFF 现有 `splitChannelKeys` 会 `JSON.stringify` 重排；逐字节对齐需要新写原文扫描器 |
-| 任务型渠道的退款/差额结算日志（`model.RecordTaskBillingLog`） | 搜不到 | `RefundTaskQuota` / `RecalculateTaskQuota` 只有 `context.Context`（`service/task_billing.go:267`、`:314`），拿不到 gin 上下文 |
+| 任务型渠道的退款/差额结算日志（`model.RecordTaskBillingLog`） | 搜不到 | `RefundTaskQuota` / `RecalculateTaskQuota` 只有 `context.Context`（`service/task_billing.go:271`、`:318`），拿不到 gin 上下文 |
 | Midjourney 退款日志（`service/midjourney.go:122`） | 搜不到 | 同上，无上下文 |
 
 ## 上游改动（new-api）
@@ -222,13 +222,17 @@ if fp := service.ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.
 
 | 文件 | 改动 | 类型 |
 |---|---|---|
-| `service/channel_key_fingerprint_fork.go` | 规范化 + 哈希 + 写 admin_info | 新增 |
-| `service/channel_key_fingerprint_fork_test.go` | 向量与路径测试 | 新增 |
-| `service/log_info_generate.go` | +1 处调用 | 改上游 |
+| `service/channel_key_fingerprint_fork.go` | 哈希 + 写 admin_info（**不做任何规范化**） | 新增 |
+| `service/channel_key_fingerprint_fork_test.go` | 向量、写入路径与 WS 白名单测试 | 新增 |
+| `service/log_info_generate.go` | `AppendRelayLogAdminInfo` +1 处调用 | 改上游 |
 | `service/violation_fee.go` | +1 处调用 | 改上游 |
-| `fork/README.md` | 定制登记册加一节 | 改 |
+| `service/task_billing.go` | `LogTaskConsumption` +1 处调用 | 改上游 |
+| `relay/responses_websocket.go` | 把 lockedContext 白名单提成包级变量 `lockedContextKeys` | 改上游 |
+| `fork/README.md`、本文档 | 登记与设计说明 | 改 |
 
-上游其余文件零改动：无 `constant/`、无 `middleware/`、无 `relay/`、无 schema 迁移。
+上游其余文件零改动：无 `constant/`、无 `middleware/`、无 schema 迁移。注意
+`relay/responses_websocket.go` 是**本次唯一的 relay 侧改动**，且只是把内联切片提成
+包级变量（行为不变），目的是让「白名单必须含 `ContextKeyChannelKey`」这件事可被测试断言。
 
 ## BFF 改动（token-master）
 
