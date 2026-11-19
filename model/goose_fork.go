@@ -2,17 +2,17 @@ package model
 
 import (
 	"context"
-	"embed"
 	"fmt"
-	"io/fs"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/migrations"
 	"github.com/pressly/goose/v3"
 )
 
 // [FORK] PostgreSQL 上需要 AutoMigrate 之外的 schema 变更，统一走这里的内嵌 goose
-// 迁移。第一份迁移是部门表；后续任何需要改约束、回填数据的表也往同一目录加文件。
+// 迁移。第一份迁移是部门表；后续任何需要改约束、回填数据的表也往
+// migrations/postgres/ 加文件，本文件只负责执行。
 //
 // 为什么要有这一层：AutoMigrate 只会「加」，不会改约束、不会回填数据，也读不出
 // 历史意图。部门表下一步要加约束与数据回填，AutoMigrate 帮不上忙，所以一次性把
@@ -25,9 +25,6 @@ import (
 // 只写 PostgreSQL 一份 SQL。本 fork 实际只跑 PG（见 fork/README.md「数据库」），
 // 所以不写 SQLite / MySQL 分支，department 也从 AutoMigrate 列表里移除了。
 // 测试库例外：测试自己 AutoMigrate 建表，不走这里。
-
-//go:embed migrations/postgres/*.sql
-var forkMigrations embed.FS
 
 // runForkMigrations 执行内嵌的全部 fork 迁移，按文件名版本号升序。调用方只在主库为
 // PostgreSQL 时调用；这里再挡一次，避免将来有人挪动调用点后在一次 SQLite 启动里
@@ -45,12 +42,7 @@ func runForkMigrations() error {
 		return fmt.Errorf("goose: get sql.DB: %w", err)
 	}
 
-	migrations, err := fs.Sub(forkMigrations, "migrations/postgres")
-	if err != nil {
-		return fmt.Errorf("goose: select migrations: %w", err)
-	}
-
-	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations)
+	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, migrations.Postgres)
 	if err != nil {
 		return fmt.Errorf("goose: new provider: %w", err)
 	}

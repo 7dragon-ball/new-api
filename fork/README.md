@@ -59,12 +59,13 @@ model/goose_fork.go
 `migrateDB()` 先跑 goose，再跑 AutoMigrate。
 
 ```
-model/goose_fork.go                      # //go:embed + goose.NewProvider + Up()
-model/migrations/postgres/*.sql          # 只有 PG 一份，收录该目录下全部迁移
+migrations/embed.go                      # //go:embed + 暴露 migrations.Postgres
+migrations/postgres/*.sql                # 只有 PG 一份，收录该目录下全部迁移
+model/goose_fork.go                      # goose.NewProvider + Up()，消费上面的 FS
 ```
 
 `runForkMigrations()` 按方言目录整体执行，不认识具体表名：以后新增一张表只要往
-`model/migrations/postgres/` 加一份 SQL，Go 代码一行都不用改。
+`migrations/postgres/` 加一份 SQL，Go 代码一行都不用改。
 
 - **goose 是 Go 库，不是独立容器。** 用 `github.com/pressly/goose/v3` 的 Provider API，
   直接复用 `DB.DB()` 那条连接池。本 fork 单镜像部署，外部迁移容器会让「表是否存在」
@@ -80,7 +81,7 @@ model/migrations/postgres/*.sql          # 只有 PG 一份，收录该目录下
   迁移必须在那类库上变成空操作，否则升级即失败。也正因如此，首次切换到 goose 不需要
   baseline 步骤：goose 只是把版本号写进 `goose_db_version`，表本身没变。
 - **版本表名是 goose 默认的 `goose_db_version`**，与上游的 GORM 表都不撞名。
-- 新增 PG 迁移：往 `model/migrations/postgres/` 加文件 → 用 `TEST_POSTGRES_DSN` 跑
+- 新增 PG 迁移：往 `migrations/postgres/` 加文件 → 用 `TEST_POSTGRES_DSN` 跑
   `TestForkMigrationsOnPostgres`。没有 PG 实例时这条用例会 SKIP，**不算验证过**。
 
 `fork/README.md` 之外**没有**额外的迁移文档；`token-master2-dept/` 的 goose 迁移与本仓库无关，
@@ -254,7 +255,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_phone_fork.go` | `IsPhoneDuplicate`：只认 `uk_users_phone` 唯一索引冲突（PG 看约束名、SQLite 看错误文本） |
 | `controller/user_phone_fork.go` | `normalizePhoneFork` 归一与 11 位校验、`ensurePhoneFreeWithTx` 事务内预检、两条 `common.Message` 错误 |
 | `model/goose_fork.go` | 内嵌 PG 迁移的 goose 集成：`Provider.Up()`、非 PG 库直接拒绝 |
-| `model/migrations/postgres/*.sql` | 部门表建表迁移（仅 PG） |
+| `migrations/embed.go` | 内嵌 `migrations/postgres/*.sql`，导出 `migrations.Postgres` |
+| `migrations/postgres/*.sql` | 部门表建表迁移（仅 PG） |
 | `controller/department_fork.go` | 四个 CRUD handler + `PUT /api/user/:id/department` + `isDuplicateKey` |
 | `controller/department_usage_fork.go` | 部门用量聚合 handler |
 | `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go` | controller 包测试 |
@@ -335,7 +337,7 @@ merge 无冲突时直接进验证。有冲突时按下面的原则处理。
   跟着上游的新签名走，把 `departmentID`/`username`/`displayName` 作为新字段塞进去，不要保留旧签名。
 - `model/user.go` 里 `User` 结构体的对齐格式差异：只保留字段新增，不要为消掉格式 diff 去重排上游字段。
 - **上游若开始用 goose 或其它迁移工具**：不要直接采纳。本 fork 的 goose 接线
-  （`model/goose_fork.go` 与 `model/migrations/`）与 `goose_db_version` 表必须与上游方案共存或合并，
+  （`model/goose_fork.go` 与 `migrations/`）与 `goose_db_version` 表必须与上游方案共存或合并，
   否则同一次启动会建两套版本表。先确认上游的版本表名与方言，再决定是并进去还是改本 fork 的路径。
 - **`model/main.go` 的 AutoMigrate 列表**：上游新增模型时正常取并集，但**不要**把
   `&Department{}` 加回去——部门表归 goose 管，两套机制同时管一张表会导致每次重启都尝试改列。
