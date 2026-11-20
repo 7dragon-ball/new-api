@@ -168,6 +168,8 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.PUT("/:id/department", controller.UpdateUserDepartment)
 				adminRoute.DELETE("/:id", controller.DeleteUser)
 				adminRoute.DELETE("/:id/reset_passkey", controller.AdminResetPasskey)
+				// [FORK] 批量重置用户密码：一次 step-up、全或无；仅后端，web/ 未接入。
+				adminRoute.POST("/batch/reset_password", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.BatchResetUserPasswords)
 
 				// Admin 2FA routes
 				adminRoute.GET("/2fa/stats", controller.Admin2FAStats)

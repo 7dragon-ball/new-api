@@ -53,6 +53,10 @@ const (
 // 字段和目标值，不能用只绑 user_id 的 admin.user.update 代替。
 const VerificationScopeAdminUserManagement = "admin.user.management"
 
+// [FORK] 批量重置密码：一份 proof 覆盖升序去重的完整账号集合，不能拆成逐个
+// admin.user.update——那会把「改资料/改权限矩阵」与「批量改密码」混进同一 scope。
+const VerificationScopeAdminUserPasswordBatchReset = "admin.user.password.batch_reset"
+
 // adminUserManageActions are the ManageUser actions that change a user's
 // status or role. Quota adjustments are not gated and deletion has its own scope.
 // [FORK] grant_root / revoke_root 是多 root 方案新增的 action，必须在此登记，
@@ -224,6 +228,18 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 			return VerificationBinding{}, err
 		}
 		normalized = bound
+	case VerificationScopeAdminUserPasswordBatchReset:
+		// [FORK] id 集合的校验规则在 security_verification_batch_password_fork.go。
+		var context AdminUserPasswordBatchResetContext
+		if len(fields) != 1 || common.Unmarshal(operation.Context, &context) != nil {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		userIDs, ok := NormalizeBatchPasswordResetUserIDs(context.UserIDs)
+		if !ok {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		context.UserIDs = userIDs
+		normalized = context
 	case VerificationScopeAdminUserBindingClear:
 		var context AdminUserBindingContext
 		if len(fields) != 2 || common.Unmarshal(operation.Context, &context) != nil || context.UserID <= 0 || context.ProviderID < 0 {
@@ -344,7 +360,8 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 		VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 		VerificationScopeAdminUserManage, VerificationScopeAdminUserManagement, VerificationScopeAdminUserPasskeyReset,
-		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
+		// [FORK] 末位追加 VerificationScopeAdminUserPasswordBatchReset（批量重置密码）。
+		VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear, VerificationScopeAdminUserPasswordBatchReset:
 		if scope == VerificationScopeAccountDelete && state.Role == common.RoleRootUser {
 			return nil, ErrVerificationForbidden
 		}
@@ -409,7 +426,8 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 			case VerificationScopeAccountBind, VerificationScopeAccountUnbind, VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
 				VerificationScopeAdminUserCreate, VerificationScopeAdminUserUpdate, VerificationScopeAdminUserDelete,
 				VerificationScopeAdminUserManage, VerificationScopeAdminUserManagement, VerificationScopeAdminUserPasskeyReset,
-				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear:
+				// [FORK] 末位追加 VerificationScopeAdminUserPasswordBatchReset（批量重置密码）。
+				VerificationScopeAdminUserTwoFADisable, VerificationScopeAdminUserBindingClear, VerificationScopeAdminUserPasswordBatchReset:
 				methods[i].Available, methods[i].Reason = false, "Password authentication is disabled."
 			}
 		}

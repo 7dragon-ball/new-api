@@ -102,11 +102,13 @@ model/goose_fork.go                      # goose.NewProvider + Up()，消费上�
 da9b37f5c  feat(fork): 多 root 管理员与 fork 脚手架
 ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 522c044f9  feat(fork): 部门归属搬进 new_api 库
-（第四组「手机号」见下方「四、手机号」小节；它没有单独的补丁提交哈希，
-  与前三组一起随源码发布。）
+（第四组「手机号」见下方「四、手机号」小节，第五组「上游密钥指纹」见「五、日志记录上游密钥指纹」；
+  两者都没有单独的补丁提交哈希，与前三组一起随源码发布。）
+（最新）    feat(user): 新增批量重置用户密码接口（仅后端）
 ```
 
-基线是上游 `6ef123cd5`。这三个提交是**可直接 merge 的源码改动**，不是补丁。
+基线是上游 `6ef123cd5`。这些都是**可直接 merge 的源码改动**，不是补丁。最后一条不记短 hash——
+它会跟着 `git commit --amend` 变，按提交标题 grep 即可。
 
 ## 定制清单
 
@@ -222,6 +224,31 @@ Phone *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:
 
 **发布顺序**：先发含此改动的新 API 镜像，再发按指纹搜索的 BFF。反过来的表现是「按密钥搜永远空页」，不报错。
 
+### 六、批量重置用户密码
+
+**需求**：一次 step-up 授权覆盖一批账号（现场交付默认密码、集中回收账号），任一目标不可重置则
+整批回滚、零写入、不返回任何密码。
+
+**做法**：`POST /api/user/batch/reset_password`，body 是 `ids` 数组（≤100），响应逐条返回新密码。
+新增 scope `admin.user.password.batch_reset`，context 是「升序去重后的完整 id 集合」，所以一份
+proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canManageTargetRole`；进事务后按 id 升序
+加锁（固定顺序防死锁），锁内重读 `role`/`status`/`deleted_at` 再授权一次——事务外那次预检只用于
+尽早拒绝，不构成授权保证。密码 8 位、必含大写/小写/数字、`crypto/rand` 生成、
+`HashAccountPassword` 散列；散列在事务外算完，事务里只写 `auth_version`（先）与 `password`（后）。
+
+**已知代价**（有意接受，不修）：
+
+| 现象 | 说明 |
+|---|---|
+| 8 位密码熵约 47 bit | 明确的产品要求。后端生成、不进日志、重置后吊销浏览器会话，降低撞库价值。 |
+| 重置密码踢不掉现有 PAT | `user_access_tokens` 没有 auth version 列，PAT 鉴权不与版本号比较。要连带撤销只能物理删令牌。与上游三条改密路径一致。 |
+| 回滚不是完全无痕 | `IncrementUserAuthVersionWithTx` 在写库前就发了 Redis pending fence，事务回滚后 fence 只能等 TTL 过期（见「测试覆盖不到」第 6 条）。 |
+| 请求不幂等 | 响应丢了，密码就只剩已改掉的散列；proof 单次使用，重放会被拒。调用方不得盲目重试。 |
+
+**本仓库前端未接入**：接口只对 BFF / 脚本开放（与 `last_called_at`、部门接口相同）。审计 action
+`user.batch_password_reset` 也没登记进 `web/src/features/usage-logs/lib/format.ts` 的
+`AUDIT_TEMPLATES`，控制台审计列表显示原始英文（与 `department.*` 一致）。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -250,9 +277,11 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 |---|---|---|
 | `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，四组定制都改它 |
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
-| `router/api-router.go` | 三处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments` | 中，前三组都插在同一文件 |
-| `controller/audit.go` | 审计 action 英文模板 map 加 4 项 | 低 |
-| `service/security_verification.go` | proof action 白名单加 2 项 | 低 |
+| `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
+| `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
+| `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
+| `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
+| `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
 | `model/task_cas_test.go` | 测试的 `AutoMigrate` 同样加 `&Department{}` | 低 |
 | `model/user_pagination_test.go` | `SearchUsers` 签名变化，补两个参数 | 低 |
@@ -279,6 +308,11 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go` | model 包测试 |
 | `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
 | `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
+| `common/random_password_fork.go` | 8 位随机账号密码：三类字符必现、Fisher–Yates 打散位置、`crypto/rand` 无偏 |
+| `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
+| `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |
+| `service/security_verification_batch_password_fork.go` | proof context 定义、id 集合校验（≤100、升序、不许重复） |
+| `controller/user_batch_password_reset_fork_test.go` | controller 包测试（含锁内二次授权与整批回滚） |
 
 （另有 3 个上游测试文件被改签名或补迁移。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
@@ -294,19 +328,20 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 65 处、21 个文件：
+当前共 84 处、29 个文件：
 
 | 文件 | 处数 |
 |---|---|
-| `model/user.go` | 15 |
-| `controller/user.go` | 11 |
+| `model/user.go` | 17 |
+| `controller/user.go` | 16 |
 | `model/user_last_called_fork_test.go` | 6 |
-| `controller/department_fork.go` | 6 |
 | `model/department_fork.go` | 6 |
-| `router/api-router.go` | 3 |
-| `service/security_verification.go` | 3 |
+| `controller/department_fork.go` | 6 |
+| `service/security_verification.go` | 5 |
+| `router/api-router.go` | 4 |
 | `service/security_verification_fork.go` | 2 |
-| `model/main.go`、`model/goose_fork.go`、`controller/department_usage_fork.go`、`controller/audit.go`、`controller/security_enrollment_test.go`、`model/user_department_fork_test.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`service/log_info_generate.go`、`service/violation_fee.go`、`service/task_billing.go`、`service/channel_key_fingerprint_fork.go`、`relay/responses_websocket.go` | 各 1 |
+| `controller/audit.go` | 2 |
+| `common/random_password_fork.go`、`controller/department_usage_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/user_batch_password_fork.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
@@ -387,7 +422,7 @@ gofmt -l controller model service middleware     # CI 不查格式，本地补�
   `golang:1.26.10-alpine` 容器里跑上面这几条——注意 Docker 内存低于 4G 时 `go build ./...`
   容易被 OOM kill，`signal: killed` 就是这个原因，不是编译错误。
 
-仅编译通过不算升级成功——下面「测试覆盖不到」那五项仍需人工验证。
+仅编译通过不算升级成功——下面「测试覆盖不到」那六项仍需人工验证。
 
 ### 并发用例（可选，需要 Postgres）
 
@@ -456,14 +491,19 @@ docker build \
   传 `null` 表示清空；**不带该字段返回 `Invalid parameters`**，不会被当成清空。
 - `GET /api/data/departments?start_timestamp=&end_timestamp=`：部门用量聚合，
   返回 `members`/`keys`/`calls`/`tokens`/`quota`。
+- `POST /api/user/batch/reset_password`：批量重置密码，body 是 `ids` 数组（≤100、不许重复），
+  需带 `X-Security-Proof`（scope `admin.user.password.batch_reset`，context 的 `user_ids`
+  必须是升序去重后的完整 id 列表）。全或无：任一目标不可重置则整批回滚、不返回任何密码；
+  成功时逐条返回 `id`/`username`/`display_name`/`email`/`password`，顺序与请求一致。
+  **明文密码只在这一响应里出现一次**，请求不幂等，响应丢了只能重新签 proof 重来。
 
 调用约定：`grant_root` 只有 root 能调，`revoke_root` 受「至少留一个启用 root」约束；两者都要求
 目标用户存在且状态合法。部门的写操作与改归属都受 `canManageTargetRole` 约束（同级或更高角色的
 账号不可操作）。
 
-## 测试覆盖不到的五点
+## 测试覆盖不到的六点
 
-自动化测试覆盖了不变量、写路径与接口行为，但以下五项只能人工验证：
+自动化测试覆盖了不变量、写路径与接口行为，但以下六项只能人工验证：
 
 1. **`revoke_root` 的 Casbin override 清理**：现有测试无法区分「走了 `demote` 分支」与「走了
    `else` 分支」，两条都会把 role 写成 1。唯一手段是在 Postgres 上直接查 `casbin_rule`
@@ -479,6 +519,11 @@ docker build \
    **SKIP 不等于通过**。上线前必须对真实 PG 跑一次，覆盖「空库启动」与「已有 department 表
    （旧版 AutoMigrate 建的）启动」两种形态，并确认 `goose_db_version` 里记下了版本、
    `\d department` 与旧表结构一致。
+6. **批量重置回滚后的 Redis fence 残留。** `IncrementUserAuthVersionWithTx` 在写库之前就发布了
+   pending fence，事务回滚后它只能等 TTL（`userAuthFenceTTLSeconds`，约 120 秒）过期；这期间
+   已处理过的用户读写路径返回 `ErrUserAuthCachePending`，登录与刷新暂时失败。测试库不启 Redis，
+   该窗口没有自动化覆盖。要验证得在真实 Redis 上让一次批量重置中途失败，观察 fence TTL 与
+   恢复时间。
 
 ## 已知限制（有意不修）
 

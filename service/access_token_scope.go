@@ -240,6 +240,10 @@ var accessTokenVerificationScopes = map[string]string{
 	VerificationScopeAccessTokenUpdate:     "",
 	VerificationScopeAccessTokenRevoke:     "",
 	VerificationScopeLogin:                 "",
+
+	// [FORK] 批量重置密码的 proof 也允许 user:write 的 PAT 获取。
+	// 单独成组（前置空行），避免 gofmt 因本行键名更长而重排上游 23 行对齐。
+	VerificationScopeAdminUserPasswordBatchReset: "user:write",
 }
 
 // AccessTokenVerificationScope returns the token scope a PAT needs for a
