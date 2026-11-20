@@ -20,9 +20,10 @@ import (
 // POST /api/user/reset）一致，代价见 fork/README.md「批量重置用户密码」。
 
 // 事务内二次授权失败用哨兵错误回传，事务外再映射成对调用方稳定可见的消息 key。
+// 账号是否启用不在此列：批量重置面向「集中回收/发放账号」，禁用账号也允许被重置，
+// 见 fork/README.md「批量重置用户密码」。
 var (
 	errBatchPasswordTargetMissing   = errors.New("batch password reset: target user no longer exists")
-	errBatchPasswordTargetDisabled  = errors.New("batch password reset: target user is disabled")
 	errBatchPasswordTargetForbidden = errors.New("batch password reset: target user is not manageable")
 )
 
@@ -75,10 +76,6 @@ func BatchResetUserPasswords(c *gin.Context) {
 			common.ApiError(c, err)
 			return
 		}
-		if user.Status != common.UserStatusEnabled {
-			common.ApiErrorT(c, "This user account is disabled.")
-			return
-		}
 		if !canManageTargetRole(myRole, user.Role) {
 			common.ApiErrorT(c, "No permission to update users of same or higher permission level")
 			return
@@ -119,8 +116,6 @@ func BatchResetUserPasswords(c *gin.Context) {
 		switch {
 		case errors.Is(err, errBatchPasswordTargetMissing):
 			common.ApiErrorT(c, "User does not exist")
-		case errors.Is(err, errBatchPasswordTargetDisabled):
-			common.ApiErrorT(c, "This user account is disabled.")
 		case errors.Is(err, errBatchPasswordTargetForbidden):
 			common.ApiErrorT(c, "No permission to update users of same or higher permission level")
 		default:
@@ -177,8 +172,9 @@ func BatchResetUserPasswords(c *gin.Context) {
 // （锁内校验不通过）在发出任何 fence 之前就返回。
 //
 // 按 ids 升序加锁：固定加锁顺序，避免两个并发批量请求因顺序不同死锁。
-// 锁内重读 role / status / deleted_at 并再次授权：事务外那次预检只用于尽早拒绝，
-// 到此刻之间目标可能已被提权、被禁用或被删除，所以它不构成授权保证。
+// 锁内重读 role / deleted_at 并再次授权：事务外那次预检只用于尽早拒绝，
+// 到此刻之间目标可能已被提权或被删除，所以它不构成授权保证。status 有意不重读——
+// 禁用账号也允许被重置，否则「先禁用、再统一改密回收」这条现场流程就得逐个启用再禁用。
 //
 // 返回锁内读到的行，供调用方用最新资料渲染响应（事务外的快照可能已过期）。
 func resetBatchPasswordsInTx(tx *gorm.DB, myRole int, ids []int, passwordHashes map[int]string) (map[int]*model.User, error) {
@@ -193,9 +189,6 @@ func resetBatchPasswordsInTx(tx *gorm.DB, myRole int, ids []int, passwordHashes 
 		}
 		if locked.DeletedAt.Valid {
 			return nil, errBatchPasswordTargetMissing
-		}
-		if locked.Status != common.UserStatusEnabled {
-			return nil, errBatchPasswordTargetDisabled
 		}
 		if !canManageTargetRole(myRole, locked.Role) {
 			return nil, errBatchPasswordTargetForbidden
