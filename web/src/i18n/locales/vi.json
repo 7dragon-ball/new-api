@@ -2001,6 +2001,8 @@
     "Department name must be 1-30 characters (spaces are trimmed)": "Tên phòng ban phải có từ 1 đến 30 ký tự (khoảng trắng hai đầu sẽ bị cắt)",
     "Department not found": "Không tìm thấy phòng ban",
     "Department still has {{count}} users": "Phòng ban vẫn còn {{count}} người dùng",
+    "Phone number is already used by another user": "Số điện thoại này đã được người dùng khác sử dụng",
+    "Phone number must be 11 digits": "Số điện thoại phải có 11 chữ số",
     "Deploy your own gateway and start routing requests through your configured upstream services.": "Triển khai cổng riêng của bạn và bắt đầu định tuyến yêu cầu qua các dịch vụ thượng nguồn đã cấu hình.",
     "Deployment created successfully": "Tạo triển khai thành công",
     "Deployment details": "Chi tiết triển khai",

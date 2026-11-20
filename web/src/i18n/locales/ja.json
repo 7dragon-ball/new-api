@@ -2001,6 +2001,8 @@
     "Department name must be 1-30 characters (spaces are trimmed)": "部門名は 1〜30 文字で入力してください（前後の空白は除去されます）",
     "Department not found": "部門が見つかりません",
     "Department still has {{count}} users": "この部門にはまだ {{count}} 人のユーザーがいます",
+    "Phone number is already used by another user": "この電話番号は既に他のユーザーが使用しています",
+    "Phone number must be 11 digits": "電話番号は11桁の数字である必要があります",
     "Deploy your own gateway and start routing requests through your configured upstream services.": "独自のゲートウェイをデプロイし、設定済みのアップストリームサービスへリクエストをルーティングできます。",
     "Deployment created successfully": "デプロイを作成しました",
     "Deployment details": "デプロイメントの詳細",
