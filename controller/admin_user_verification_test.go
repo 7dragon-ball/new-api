@@ -152,6 +152,16 @@ func TestAdminUserRiskOperationsRequireProofBeforeMutation(t *testing.T) {
 			},
 		},
 		{
+			name: "batch password reset", method: http.MethodPost, path: "/api/user/batch/reset_password", handler: BatchResetUserPasswords,
+			body: func(target *model.User) string { return fmt.Sprintf(`{"ids":[%d]}`, target.Id) },
+			unchanged: func(t *testing.T, target *model.User) {
+				stored, err := model.GetUserById(target.Id, true)
+				require.NoError(t, err)
+				assert.True(t, common.ValidatePasswordAndHash("managed-password", stored.Password))
+				assert.Equal(t, int64(1), stored.AuthVersion, "被拒时不得推进 auth_version")
+			},
+		},
+		{
 			name: "custom oauth unbind", method: http.MethodDelete, path: "/api/user/:id/oauth/bindings/:provider_id", handler: UnbindCustomOAuthByAdmin,
 			params: func(target *model.User) gin.Params {
 				return gin.Params{{Key: "id", Value: fmt.Sprint(target.Id)}, {Key: "provider_id", Value: "7"}}

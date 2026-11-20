@@ -2,7 +2,6 @@ package common
 
 import (
 	"crypto/rand"
-	"fmt"
 	"math/big"
 )
 
@@ -51,10 +50,8 @@ func GenerateRandomAccountPassword() (string, error) {
 }
 
 // randomPasswordIndex returns a value in [0, n) without modulo bias.
+// Callers only pass character-set lengths, so n is always positive.
 func randomPasswordIndex(n int) (int, error) {
-	if n <= 0 {
-		return 0, fmt.Errorf("invalid password character set size %d", n)
-	}
 	value, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
 	if err != nil {
 		return 0, err

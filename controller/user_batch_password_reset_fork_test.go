@@ -11,6 +11,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -271,7 +273,8 @@ func TestBatchPasswordResetInTxRechecksTargetAfterPreflight(t *testing.T) {
 				passwordHashes[id] = hash
 			}
 			err := model.DB.Transaction(func(tx *gorm.DB) error {
-				return resetBatchPasswordsInTx(tx, common.RoleAdminUser, ids, passwordHashes)
+				_, err := resetBatchPasswordsInTx(tx, common.RoleAdminUser, ids, passwordHashes)
+				return err
 			})
 			require.ErrorIs(t, err, scenario.wantErr)
 
@@ -282,6 +285,74 @@ func TestBatchPasswordResetInTxRechecksTargetAfterPreflight(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBatchPasswordResetRejectsOperatorInBatch 覆盖「不能重置自己」：root 的
+// canManageTargetRole 恒真，没有这一道就会把自己也算进去，结果是本次请求推进自己的
+// auth version、吊销自己的会话，而新密码只在导出的文件里。前端已剔除自己，
+// 这里守住脚本与 BFF 直连的口径。
+func TestBatchPasswordResetRejectsOperatorInBatch(t *testing.T) {
+	operator, identity, targets := setupBatchPasswordResetTest(t, 1)
+	target := targets[0]
+	beforeHash, beforeVersion := storedPasswordHash(t, target.Id)
+
+	ids := []int{operator.Id, target.Id}
+	slices.Sort(ids)
+	body := fmt.Sprintf(`{"ids":[%d,%d]}`, ids[0], ids[1])
+	result := runBatchPasswordReset(t, identity, common.RoleRootUser, body,
+		issueBatchPasswordResetProof(t, identity, ids))
+	assert.False(t, result.Success)
+	assert.Equal(t, "You cannot reset your own password in a batch operation", result.Message)
+
+	// 整批拒绝：同批的普通目标也不得改动。
+	hash, version := storedPasswordHash(t, target.Id)
+	assert.Equal(t, beforeHash, hash)
+	assert.Equal(t, version, beforeVersion)
+}
+
+// TestBatchPasswordResetInTxRejectsBeforeAnyAuthVersionBump 证明「两阶段」的实际收益：
+// 锁内校验失败时，一个 auth version 都没被推进，因此也没有任何 Redis fence 被留下。
+//
+// 单段循环里前面的目标会先推进 auth version，而 IncrementUserAuthVersionWithTx 在写库前
+// 就发布 fail-closed fence；事务回滚只还原数据库，fence 留在 Redis 里要等 TTL（约 120s）
+// 过期，期间那些用户的登录与刷新全部失败。所以这条断言必须看 Redis，不能只看 DB ——
+// 事务回滚本来就会把 DB 里的 auth_version 还原，只看 DB 永远看不出差别。
+func TestBatchPasswordResetInTxRejectsBeforeAnyAuthVersionBump(t *testing.T) {
+	_, _, targets := setupBatchPasswordResetTest(t, 2)
+	ids := []int{targets[0].Id, targets[1].Id}
+	slices.Sort(ids)
+
+	server := miniredis.RunT(t)
+	oldRDB, oldEnabled := common.RDB, common.RedisEnabled
+	common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		_ = common.RDB.Close()
+		common.RDB, common.RedisEnabled = oldRDB, oldEnabled
+	})
+
+	// 升序第二个目标在事务开始前被禁用：分段实现在校验阶段就会失败。
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", ids[1]).Update("status", common.UserStatusDisabled).Error)
+
+	passwordHashes := make(map[int]string, len(ids))
+	for _, id := range ids {
+		hash, err := common.HashAccountPassword(fmt.Sprintf("generated-%d-password", id))
+		require.NoError(t, err)
+		passwordHashes[id] = hash
+	}
+
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		_, err := resetBatchPasswordsInTx(tx, common.RoleRootUser, ids, passwordHashes)
+		return err
+	})
+	require.ErrorIs(t, err, errBatchPasswordTargetDisabled)
+
+	for _, id := range ids {
+		assert.NotContains(t, server.Keys(), fmt.Sprintf("auth:user:version:{%d}", id),
+			"目标 id=%d 不得留下已提交的 auth version 记录", id)
+	}
+	assert.Empty(t, server.Keys(),
+		"校验失败必须在推进任何 auth version 之前返回；有 key 说明已处理目标留下了 fail-closed fence")
 }
 
 // TestBatchPasswordResetRollsBackOnWriteFailure 在第二个目标的密码 UPDATE 上注入

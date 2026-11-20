@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -51,6 +52,15 @@ func BatchResetUserPasswords(c *gin.Context) {
 		return
 	}
 	myRole := c.GetInt("role")
+	// 自己不在批量范围内：root 的 canManageTargetRole 恒真，不挡就会把自己也算进去，
+	// 结果是本次请求推进自己的 auth version、吊销自己的会话，而新密码只有导出的文件里有。
+	// 前端已剔除自己，这里再挡一道，脚本与 BFF 直连时口径才一致。
+	if operatorID := c.GetInt("id"); operatorID > 0 {
+		if slices.Contains(sortedIDs, operatorID) {
+			common.ApiErrorT(c, "You cannot reset your own password in a batch operation")
+			return
+		}
+	}
 
 	// 先把所有可拒绝条件在事务外查完：这一步只用于尽早拒绝，不构成授权保证
 	//（真正的授权在事务内加锁后重做一次）。
@@ -100,8 +110,11 @@ func BatchResetUserPasswords(c *gin.Context) {
 		passwordHashes[id] = hash
 	}
 
+	var lockedUsers map[int]*model.User
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
-		return resetBatchPasswordsInTx(tx, myRole, sortedIDs, passwordHashes)
+		var err error
+		lockedUsers, err = resetBatchPasswordsInTx(tx, myRole, sortedIDs, passwordHashes)
+		return err
 	}); err != nil {
 		switch {
 		case errors.Is(err, errBatchPasswordTargetMissing):
@@ -129,9 +142,10 @@ func BatchResetUserPasswords(c *gin.Context) {
 	}
 
 	// 响应按请求的原始顺序重排；DB 操作与审计用升序集合。
+	// 资料列取锁内读到的那份：事务外的预检快照到提交之间可能已被改名或改邮箱。
 	users := make([]batchPasswordResetUser, 0, len(request.Ids))
 	for _, id := range request.Ids {
-		target := targets[id]
+		target := lockedUsers[id]
 		users = append(users, batchPasswordResetUser{
 			Id:          target.Id,
 			Username:    target.Username,
@@ -151,41 +165,57 @@ func BatchResetUserPasswords(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"users": users})
 }
 
-// resetBatchPasswordsInTx 在调用方的事务里逐个加锁并重置密码。
+// resetBatchPasswordsInTx 在调用方的事务里重置整批密码，分两段：
+//
+//  1. 全部目标先加锁并校验，一个都不写；
+//  2. 校验全部通过后，才推进 auth version 并写散列。
+//
+// 分两段是为了把「中途被拒」的副作用降到零：IncrementUserAuthVersionWithTx 在
+// 写库前就会向 Redis 发布 fail-closed fence，回滚后 fence 只能等 TTL（约 120s）
+// 过期，期间那些用户的登录与刷新全部失败。单段循环里第 51 个目标被并发禁用，
+// 前 50 个已经发出的 fence 就白锁了 2 分钟。两段之后，这类最常见的失败
+// （锁内校验不通过）在发出任何 fence 之前就返回。
 //
 // 按 ids 升序加锁：固定加锁顺序，避免两个并发批量请求因顺序不同死锁。
 // 锁内重读 role / status / deleted_at 并再次授权：事务外那次预检只用于尽早拒绝，
 // 到此刻之间目标可能已被提权、被禁用或被删除，所以它不构成授权保证。
-func resetBatchPasswordsInTx(tx *gorm.DB, myRole int, ids []int, passwordHashes map[int]string) error {
+//
+// 返回锁内读到的行，供调用方用最新资料渲染响应（事务外的快照可能已过期）。
+func resetBatchPasswordsInTx(tx *gorm.DB, myRole int, ids []int, passwordHashes map[int]string) (map[int]*model.User, error) {
+	lockedUsers := make(map[int]*model.User, len(ids))
 	for _, id := range ids {
 		locked, err := model.LockUserForBatchPasswordResetWithTx(tx, id)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return errBatchPasswordTargetMissing
+				return nil, errBatchPasswordTargetMissing
 			}
-			return err
+			return nil, err
 		}
 		if locked.DeletedAt.Valid {
-			return errBatchPasswordTargetMissing
+			return nil, errBatchPasswordTargetMissing
 		}
 		if locked.Status != common.UserStatusEnabled {
-			return errBatchPasswordTargetDisabled
+			return nil, errBatchPasswordTargetDisabled
 		}
 		if !canManageTargetRole(myRole, locked.Role) {
-			return errBatchPasswordTargetForbidden
+			return nil, errBatchPasswordTargetForbidden
 		}
+		lockedUsers[id] = locked
+	}
+	// 到这里所有目标都已通过校验，后面任何一步失败都只剩 DB 错误（罕见）。
+	for _, id := range ids {
 		// 顺序与 model.ResetUserPasswordByEmail 一致：先推进 auth version
 		//（自带行锁 + Redis fail-closed fence），再写新散列。
 		if _, err := model.IncrementUserAuthVersionWithTx(tx, id); err != nil {
-			return err
+			return nil, err
 		}
 		result := tx.Model(&model.User{}).Where("id = ?", id).Update("password", passwordHashes[id])
 		if result.Error != nil {
-			return result.Error
+			return nil, result.Error
 		}
 		if result.RowsAffected != 1 {
-			return errBatchPasswordTargetMissing
+			return nil, errBatchPasswordTargetMissing
 		}
 	}
-	return nil
+	return lockedUsers, nil
 }
