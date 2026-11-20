@@ -773,3 +773,52 @@ func TestResponsesWSErrorAttribution(t *testing.T) {
 		})
 	}
 }
+
+// RestoreConnectionContext 用 lockedContext 逐键还原上下文，其中必须包含
+// ContextKeyChannelKey——否则重连后的日志算不出密钥指纹（service.AppendChannelKeyFingerprint
+// 读的就是这个键），而消费日志会静默丢掉按密钥反查的能力。
+//
+// 这里必须走真实的 restoreConnectionContext，不能用 ctx.Set 手工模拟：
+// 手工模拟的用例在「白名单里删掉 ChannelKey」时仍然绿，等于没有守卫。
+func TestRestoreConnectionContextPreservesChannelKeyForFingerprint(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	baseURL := "http://upstream.example"
+	channel := &model.Channel{Name: "ws-key", Key: "sk-original-key-value", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeOpenAI, BaseURL: &baseURL}
+	channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
+	require.NoError(t, database.Create(channel).Error)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	service.GetChannelConstraints(c).AddPin(appdto.ChannelPin{ChannelId: channel.Id, Source: appdto.PinSourceToken, Rank: appdto.PinRankToken, RetryMode: appdto.PinRetrySingleAttempt})
+
+	session := &responsesWSSession{
+		lockedChannelID: channel.Id,
+		lockedModel:     "ws-model",
+		lockedKey:       channel.Key,
+		lockedContext: map[constant.ContextKey]any{
+			constant.ContextKeyChannelId:      channel.Id,
+			constant.ContextKeyChannelKey:     channel.Key,
+			constant.ContextKeyChannelBaseUrl: channel.GetBaseURL(),
+			// restoreConnectionContext 会比对 BaseURL 与 HeaderOverride 判断连接能否复用
+			constant.ContextKeyChannelHeaderOverride: channel.GetHeaderOverride(),
+		},
+	}
+	require.Nil(t, session.restoreConnectionContext(c, "ws-model"))
+
+	assert.Equal(t, channel.Key, common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+		"重连后 ChannelKey 必须还原，否则日志丢指纹")
+	assert.Equal(t, service.ChannelKeyFingerprint(channel.Key), service.ChannelKeyFingerprint(common.GetContextKeyString(c, constant.ContextKeyChannelKey)))
+}
+
+// 上面那条用例直接构造 lockedContext，测不到「建立连接时把哪些键收进 lockedContext」。
+// 白名单漏掉 ChannelKey 时它依然绿。这条直接断言白名单本身。
+func TestLockedContextKeysIncludesChannelKey(t *testing.T) {
+	var found bool
+	for _, key := range lockedContextKeys {
+		if key == constant.ContextKeyChannelKey {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "lockedContextKeys 必须含 ContextKeyChannelKey，否则重连后的日志算不出指纹")
+}

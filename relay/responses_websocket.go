@@ -93,6 +93,22 @@ type responsesWSCallState struct {
 	closeReason string
 }
 
+// [FORK] 从内联切片提成包级变量，行为不变；见 fork/design-channel-key-fingerprint.md。
+//
+// lockedContextKeys 是 WebSocket 连接建立时锁存、重连时逐键还原的上下文键。
+//
+// ContextKeyChannelKey 必须在其中：重连后写日志要靠它算密钥指纹
+// （service.AppendChannelKeyFingerprint），漏掉会让重连后的日志静默丢掉指纹。
+// 提成包级变量是为了让测试能直接断言这一点——嵌在建立连接的流程里测不到。
+var lockedContextKeys = []appconstant.ContextKey{
+	appconstant.ContextKeyChannelId, appconstant.ContextKeyChannelName, appconstant.ContextKeyChannelType,
+	appconstant.ContextKeyChannelCreateTime, appconstant.ContextKeyChannelSetting, appconstant.ContextKeyChannelOtherSetting,
+	appconstant.ContextKeyChannelParamOverride, appconstant.ContextKeyChannelHeaderOverride, appconstant.ContextKeyChannelOrganization,
+	appconstant.ContextKeyChannelAutoBan, appconstant.ContextKeyChannelModelMapping, appconstant.ContextKeyChannelStatusCodeMapping,
+	appconstant.ContextKeyChannelIsMultiKey, appconstant.ContextKeyChannelMultiKeyIndex, appconstant.ContextKeyChannelKey, appconstant.ContextKeyChannelBaseUrl,
+	appconstant.ContextKeyUpstreamRequestOrigin, appconstant.ContextKeyProviderPlugin,
+}
+
 type responsesWSSession struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -379,14 +395,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			s.lockedKey, s.lockedKeyIndex = info.ApiKey, info.ChannelMultiKeyIndex
 			s.lockedRoute, _ = connectionOtherSettings(c, channel).AdvancedCustom.MatchPathForModel(c.Request.URL.Path, modelName)
 			s.lockedContext = make(map[appconstant.ContextKey]any)
-			for _, key := range []appconstant.ContextKey{
-				appconstant.ContextKeyChannelId, appconstant.ContextKeyChannelName, appconstant.ContextKeyChannelType,
-				appconstant.ContextKeyChannelCreateTime, appconstant.ContextKeyChannelSetting, appconstant.ContextKeyChannelOtherSetting,
-				appconstant.ContextKeyChannelParamOverride, appconstant.ContextKeyChannelHeaderOverride, appconstant.ContextKeyChannelOrganization,
-				appconstant.ContextKeyChannelAutoBan, appconstant.ContextKeyChannelModelMapping, appconstant.ContextKeyChannelStatusCodeMapping,
-				appconstant.ContextKeyChannelIsMultiKey, appconstant.ContextKeyChannelMultiKeyIndex, appconstant.ContextKeyChannelKey, appconstant.ContextKeyChannelBaseUrl,
-				appconstant.ContextKeyUpstreamRequestOrigin, appconstant.ContextKeyProviderPlugin,
-			} {
+			for _, key := range lockedContextKeys {
 				if value, ok := c.Get(string(key)); ok {
 					s.lockedContext[key] = value
 				}
