@@ -227,13 +227,14 @@ Phone *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:
 ### 六、批量重置用户密码
 
 **需求**：一次 step-up 授权覆盖一批账号（现场交付默认密码、集中回收账号），任一目标不可重置则
-整批回滚、零写入、不返回任何密码。
+整批回滚、零写入、不返回任何密码。**禁用状态的账号也属于可重置目标**：现场流程是先禁用该回收的
+账号、再统一改密，若把 `status` 当拒绝条件，管理员就得先启用一遍再禁用回去。
 
 **做法**：`POST /api/user/batch/reset_password`，body 是 `ids` 数组（≤100），响应逐条返回新密码。
 新增 scope `admin.user.password.batch_reset`，context 是「升序去重后的完整 id 集合」，所以一份
 proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canManageTargetRole`；进事务后按 id 升序
-加锁（固定顺序防死锁），锁内重读 `role`/`status`/`deleted_at` 再授权一次——事务外那次预检只用于
-尽早拒绝，不构成授权保证。密码 8 位、必含大写/小写/数字、`crypto/rand` 生成、
+加锁（固定顺序防死锁），锁内重读 `role`/`deleted_at` 再授权一次（`status` 有意不重读，禁用账号
+允许被重置，且重置不会改动 `status`）——事务外那次预检只用于尽早拒绝，不构成授权保证。密码 8 位、必含大写/小写/数字、`crypto/rand` 生成、
 `HashAccountPassword` 散列；散列在事务外算完，事务里只写 `auth_version`（先）与 `password`（后）。
 
 **已知代价**（有意接受，不修）：
@@ -241,6 +242,7 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 | 现象 | 说明 |
 |---|---|
 | 8 位密码熵约 47 bit | 明确的产品要求。后端生成、不进日志、重置后吊销浏览器会话，降低撞库价值。 |
+| 禁用账号也能被重置 | 有意为之（见「需求」）。重置只换凭据、不碰 `status`，所以不会顺手把账号启用回来。 |
 | 重置密码踢不掉现有 PAT | `user_access_tokens` 没有 auth version 列，PAT 鉴权不与版本号比较。要连带撤销只能物理删令牌。与上游三条改密路径一致。 |
 | 回滚不是完全无痕 | `IncrementUserAuthVersionWithTx` 在写库前就发了 Redis pending fence，事务回滚后 fence 只能等 TTL 过期（见「测试覆盖不到」第 6 条）。 |
 | 请求不幂等 | 响应丢了，密码就只剩已改掉的散列；proof 单次使用，重放会被拒。调用方不得盲目重试。 |

@@ -224,8 +224,9 @@ func TestBatchPasswordResetRejectsUnauthorizedTargetWithoutWriting(t *testing.T)
 }
 
 // TestBatchPasswordResetInTxRechecksTargetAfterPreflight 覆盖锁内二次授权：事务外
-// 预检已经放行，目标在事务开始前被提权 / 禁用 / 软删，只有锁住后重读 role、status、
-// deleted_at 的那三行能拦住。删掉其中任意一行，本用例都会变红。
+// 预检已经放行，目标在事务开始前被提权 / 软删，只有锁住后重读 role、deleted_at
+// 的那两行能拦住。删掉其中任意一行，本用例都会变红。禁用不是拒绝条件（见
+// TestBatchPasswordResetAcceptsDisabledTargets），所以这里不再把 status 当场景。
 func TestBatchPasswordResetInTxRechecksTargetAfterPreflight(t *testing.T) {
 	for _, scenario := range []struct {
 		name    string
@@ -238,13 +239,6 @@ func TestBatchPasswordResetInTxRechecksTargetAfterPreflight(t *testing.T) {
 				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", id).Update("role", common.RoleRootUser).Error)
 			},
 			wantErr: errBatchPasswordTargetForbidden,
-		},
-		{
-			name: "disabled after preflight",
-			mutate: func(t *testing.T, id int) {
-				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", id).Update("status", common.UserStatusDisabled).Error)
-			},
-			wantErr: errBatchPasswordTargetDisabled,
 		},
 		{
 			name: "soft deleted after preflight",
@@ -285,6 +279,32 @@ func TestBatchPasswordResetInTxRechecksTargetAfterPreflight(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBatchPasswordResetAcceptsDisabledTargets 覆盖「禁用账号也要能被重置」：
+// 现场流程是「先禁用该回收的账号、再统一改密码」，若把 status 当拒绝条件，
+// 管理员就得先启用一遍再禁用回去。重置不得顺手改动 status。
+func TestBatchPasswordResetAcceptsDisabledTargets(t *testing.T) {
+	_, identity, targets := setupBatchPasswordResetTest(t, 2)
+	ids := []int{targets[0].Id, targets[1].Id}
+	slices.Sort(ids)
+
+	beforeHash, beforeVersion := storedPasswordHash(t, ids[1])
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", ids[1]).Update("status", common.UserStatusDisabled).Error)
+
+	body := fmt.Sprintf(`{"ids":[%d,%d]}`, ids[0], ids[1])
+	result := runBatchPasswordReset(t, identity, common.RoleRootUser, body,
+		issueBatchPasswordResetProof(t, identity, ids))
+	require.True(t, result.Success, result.Message)
+	require.Len(t, result.Data.Users, 2)
+
+	hash, version := storedPasswordHash(t, ids[1])
+	assert.NotEqual(t, beforeHash, hash, "禁用目标也应当拿到新密码散列")
+	assert.Equal(t, beforeVersion+1, version, "禁用目标也应当推进 auth version 以踢掉旧会话")
+
+	var stored model.User
+	require.NoError(t, model.DB.Select("status").Where("id = ?", ids[1]).First(&stored).Error)
+	assert.Equal(t, common.UserStatusDisabled, stored.Status, "重置密码不得顺手启用账号")
 }
 
 // TestBatchPasswordResetRejectsOperatorInBatch 覆盖「不能重置自己」：root 的
@@ -331,8 +351,8 @@ func TestBatchPasswordResetInTxRejectsBeforeAnyAuthVersionBump(t *testing.T) {
 		common.RDB, common.RedisEnabled = oldRDB, oldEnabled
 	})
 
-	// 升序第二个目标在事务开始前被禁用：分段实现在校验阶段就会失败。
-	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", ids[1]).Update("status", common.UserStatusDisabled).Error)
+	// 升序第二个目标在事务开始前被提权：分段实现在校验阶段就会失败。
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", ids[1]).Update("role", common.RoleRootUser).Error)
 
 	passwordHashes := make(map[int]string, len(ids))
 	for _, id := range ids {
@@ -342,10 +362,10 @@ func TestBatchPasswordResetInTxRejectsBeforeAnyAuthVersionBump(t *testing.T) {
 	}
 
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
-		_, err := resetBatchPasswordsInTx(tx, common.RoleRootUser, ids, passwordHashes)
+		_, err := resetBatchPasswordsInTx(tx, common.RoleAdminUser, ids, passwordHashes)
 		return err
 	})
-	require.ErrorIs(t, err, errBatchPasswordTargetDisabled)
+	require.ErrorIs(t, err, errBatchPasswordTargetForbidden)
 
 	for _, id := range ids {
 		assert.NotContains(t, server.Keys(), fmt.Sprintf("auth:user:version:{%d}", id),
