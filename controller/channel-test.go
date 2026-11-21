@@ -496,6 +496,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
+			// [FORK] 预览态的 key 来自请求体（任意管理员可提交），上游错误体可能回显它；
+			// 落 syslog 前按同一口径脱敏，否则容器日志里会出现明文密钥。
+			var logErr error = err
+			if channel.Id == 0 {
+				logErr = redactKeyInError(logErr, channel.Key)
+			}
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
 				channel.Id,
@@ -504,7 +510,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				testModel,
 				endpointType,
 				httpResp.StatusCode,
-				err,
+				logErr,
 			))
 			return testResult{
 				context:     c,

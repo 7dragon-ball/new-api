@@ -264,7 +264,9 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   跳过定价校验（网关 `model_ratio` 与平台成本表是两套数据，不跳过会让未配价模型全部测试失败）
   与结算/消费日志（否则记到 channel 0）。
 - 错误 message 过 `sanitizeFetchModelsError`：上游错误体可能回显它收到的 Authorization。
-- `router/channel-router.go` 注册 `POST /test`，权限沿用 `authz.ChannelOperate`。
+- `router/channel-router.go` 注册 `POST /test`，权限用 `authz.ChannelSensitiveWrite`（与 `POST /fetch_models` 一致）：
+  两者都是「带鉴权头打管理员临时输入的 base_url 并回显上游错误」，对只有 `ChannelOperate` 的管理员
+  等于一个有回显的内网探测能力。
 
 `testChannel()` 签名未变，既有两个调用点（`TestChannel` 与 `testChannelForHealthCheck`）零改动。
 
@@ -299,6 +301,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
+| `router/channel-router.go` | 权限路由表插入 `POST /test`（1 处 `[FORK]`，用 `ChannelSensitiveWrite`） | 低，单行 |
 | `router/channel_router_test.go` | 同上路由的权限断言 | 低 |
 | `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志（2 处 `[FORK]`） | 中，逐模型测试热路径 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |

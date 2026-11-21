@@ -65,8 +65,11 @@ var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/ops", permission: authz.ChannelRead, handler: controller.GetChannelOps},
 	{method: http.MethodGet, path: "/:id", permission: authz.ChannelRead, handler: controller.GetChannel},
 	{method: http.MethodGet, path: "/test", permission: authz.ChannelOperate, handler: controller.TestAllChannels},
-	// [FORK] 按凭据测试：新建渠道尚无 id 时用请求体里的 type/base_url/key 测连通性
-	{method: http.MethodPost, path: "/test", permission: authz.ChannelOperate, handler: controller.TestChannelByCredentials},
+	// [FORK] 按凭据测试：新建渠道尚无 id 时用请求体里的 type/base_url/key 测连通性。
+	// 权限与 POST /fetch_models 对齐（ChannelSensitiveWrite）：两者都是「带鉴权头去打管理员
+	// 临时输入的 base_url 并把上游错误回显出来」，对只有 ChannelOperate 的管理员等于一个
+	// 有回显的内网主机/端口探测器。
+	{method: http.MethodPost, path: "/test", permission: authz.ChannelSensitiveWrite, handler: controller.TestChannelByCredentials},
 	{method: http.MethodGet, path: "/test/:id", permission: authz.ChannelOperate, handler: controller.TestChannel},
 	{method: http.MethodGet, path: "/update_balance", permission: authz.ChannelOperate, handler: controller.UpdateAllChannelsBalance},
 	{method: http.MethodGet, path: "/update_balance/:id", permission: authz.ChannelOperate, handler: controller.UpdateChannelBalance},

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -234,4 +235,49 @@ func TestTestChannelByCredentialsUpstreamFailureIsNotHTTPError(t *testing.T) {
 			assert.NotContains(t, recorder.Body.String(), "sk-secret-value", "响应里不得回显密钥")
 		})
 	}
+}
+
+// 前导空行很常见（textarea 里粘贴）。fetch_models 是先整体 trim 再切第一把，
+// 新接口必须同口径，否则 "\nsk-real" 会被切成空串，静默以空 key 打上游。
+func TestTestChannelByCredentialsTrimsBeforeSplittingKey(t *testing.T) {
+	previewTestEnv(t)
+	var seenAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	body := `{"type":1,"base_url":"` + upstream.URL + `","key":"\nsk-real-key\nsk-second","model":"m"}`
+	recorder, parsed := callTestByCredentials(t, body)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, true, parsed["success"], "%v", parsed["message"])
+	assert.Equal(t, "Bearer sk-real-key", seenAuth, "前导空行不应把 key 切成空串")
+}
+
+// Codex 的凭据是多行 JSON，切开就废了。fetch_models 对 Codex 有显式例外。
+func TestTestChannelByCredentialsKeepsCodexMultilineKey(t *testing.T) {
+	key := "{\"access_token\":\"tok\",\n\"account_id\":\"acct\"}"
+	got := credentialKeyFor(constant.ChannelTypeCodex, key)
+	assert.Equal(t, key, got, "Codex 的 key 必须原样保留")
+
+	got = credentialKeyFor(constant.ChannelTypeOpenAI, "sk-a\nsk-b")
+	assert.Equal(t, "sk-a", got, "其它类型只取第一把")
+}
+
+// 上游 401 的错误体可能回显 key。响应侧已脱敏，但 testChannel 的那条 SysError
+// 会把 err 原文打进容器日志 —— 预览态的 key 来自请求体，必须同样脱敏。
+func TestRedactKeyInErrorHidesKeyEverywhere(t *testing.T) {
+	err := redactKeyInError(
+		errors.New(`bad response status code 401, message: invalid api key: sk-secret-value, body: {"error":{"message":"invalid api key: sk-secret-value"}}`),
+		"sk-secret-value",
+	)
+	require.NotNil(t, err)
+	assert.NotContains(t, err.Error(), "sk-secret-value")
+	assert.Contains(t, err.Error(), "[REDACTED]")
+
+	// 空 key 时原样返回，不能把 nil 变成 panic
+	assert.Nil(t, redactKeyInError(nil, "k"))
 }

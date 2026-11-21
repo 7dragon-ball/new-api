@@ -30,10 +30,11 @@ func TestChannelByCredentials(c *gin.Context) {
 		return
 	}
 
-	// 多行秘钥只取第一把，与 POST /api/channel/fetch_models 同口径。
+	// 多行秘钥只取第一把，与 POST /api/channel/fetch_models 同口径：
+	// 先整体 trim 再切（前导空行很常见），Codex 的凭据本身是多行 JSON 要原样保留。
 	// key 允许为空：「自建算力」走内网网关，上游不校验秘钥（保存路径也不检查，
 	// 见 validateChannel 的 isAdd=false 分支）。
-	key := strings.TrimSpace(strings.Split(req.Key, "\n")[0])
+	key := credentialKeyFor(req.Type, req.Key)
 	modelName := strings.TrimSpace(req.Model)
 	if req.Type <= 0 || modelName == "" {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("type and model are required"))
@@ -93,4 +94,21 @@ func TestChannelByCredentials(c *gin.Context) {
 	}
 	// 预览态没有渠道可归属，不更新 response_time（TestChannel 在这里有 go channel.UpdateResponseTime）。
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "time": consumedTime})
+}
+
+// credentialKeyFor 从用户提交的秘钥串里取出这次要用的一把，
+// 口径与 POST /api/channel/fetch_models（controller/channel.go:1717-1720）一致：
+// 先整体 trim，Codex 保留完整多行 JSON，其余类型取第一行。
+func credentialKeyFor(channelType int, raw string) string {
+	key := strings.TrimSpace(raw)
+	if channelType != constant.ChannelTypeCodex {
+		key = strings.Split(key, "\n")[0]
+	}
+	return key
+}
+
+// redactKeyInError 把错误文本里的明文密钥替换掉，用于写日志。
+// 上游 401 的响应体会被 RelayErrorHandler 原样拼进 err，而预览态的 key 来自请求体。
+func redactKeyInError(err error, key string) error {
+	return sanitizeFetchModelsError(err, key)
 }
