@@ -251,6 +251,23 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 `user.batch_password_reset` 也没登记进 `web/src/features/usage-logs/lib/format.ts` 的
 `AUDIT_TEMPLATES`，控制台审计列表显示原始英文（与 `department.*` 一致）。
 
+### 七、新建渠道按凭据测试连通性
+
+上游只有 `GET /api/channel/test/:id`，必须先落库拿到 id 才能测。管理端「新建渠道」弹窗在保存前
+就要逐模型测连通性，于是加一个 `POST /api/channel/test`：
+
+- `controller/channel_test_fork.go` —— 用请求体里的 `type/base_url/key/model` 内存构造
+  `model.Channel`（`Id = 0`），复用现有 `testChannel()`。与 `POST /api/channel/fetch_models`
+  同一套「不落库预览」思路。多行秘钥只取第一把（与 `fetch_models` 同口径）；key 允许为空，
+  因为「自建算力」渠道走内网网关、上游不校验秘钥。
+- `controller/channel-test.go` 两处 `// [FORK]` —— `testChannel()` 按 `channel.Id == 0` 识别预览态，
+  跳过定价校验（网关 `model_ratio` 与平台成本表是两套数据，不跳过会让未配价模型全部测试失败）
+  与结算/消费日志（否则记到 channel 0）。
+- 错误 message 过 `sanitizeFetchModelsError`：上游错误体可能回显它收到的 Authorization。
+- `router/channel-router.go` 注册 `POST /test`，权限沿用 `authz.ChannelOperate`。
+
+`testChannel()` 签名未变，既有两个调用点（`TestChannel` 与 `testChannelForHealthCheck`）零改动。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -282,6 +299,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
+| `router/channel_router_test.go` | 同上路由的权限断言 | 低 |
+| `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志（2 处 `[FORK]`） | 中，逐模型测试热路径 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
 | `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
@@ -314,6 +333,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
 | `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |
 | `service/security_verification_batch_password_fork.go` | proof context 定义、id 集合校验（≤100、升序、不许重复） |
+| `controller/channel_test_fork.go` | `POST /api/channel/test` handler：按凭据构造临时渠道、复用 `testChannel()`、错误脱敏 |
+| `controller/channel_test_fork_test.go` | 预览态跳过定价/日志、入参 400、空秘钥放行、上游失败不回 HTTP 错、密钥不回显 |
 | `controller/user_batch_password_reset_fork_test.go` | controller 包测试（含锁内二次授权与整批回滚） |
 
 （另有 3 个上游测试文件被改签名或补迁移。）上游若在这些路径放了同名文件，
