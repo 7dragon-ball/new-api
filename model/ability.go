@@ -285,8 +285,26 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 		}()
 	}
 
+	// [FORK] 保留已有的单条优先级：DELETE 之前先按 (group, model) 记下当前值，
+	// 重建时还原。否则管理员在模型上架页调好的优先级会被「改渠道名/权重/模型列表」
+	// 这类日常运维动作清回 channel.Priority。nil 原样传回（GORM 对 default:0 的
+	// nil 指针落 0，与选路「nil 视作 0」一致）。
+	var existingAbilities []Ability
+	err := tx.Select(commonGroupCol+", model, priority").
+		Where("channel_id = ?", channel.Id).Find(&existingAbilities).Error
+	if err != nil {
+		if isNewTx {
+			tx.Rollback()
+		}
+		return err
+	}
+	keptPriorities := make(map[string]*int64, len(existingAbilities))
+	for _, existing := range existingAbilities {
+		keptPriorities[existing.Group+"|"+existing.Model] = existing.Priority
+	}
+
 	// First delete all abilities of this channel
-	err := tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
+	err = tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
 	if err != nil {
 		if isNewTx {
 			tx.Rollback()
@@ -306,12 +324,17 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 				continue
 			}
 			abilitySet[key] = struct{}{}
+			// [FORK] 该 (group, model) 已有 abilities 行时沿用它的优先级（含 nil）。
+			priority := channel.Priority
+			if kept, ok := keptPriorities[key]; ok {
+				priority = kept
+			}
 			ability := Ability{
 				Group:     group,
 				Model:     model,
 				ChannelId: channel.Id,
 				Enabled:   channel.Status == common.ChannelStatusEnabled,
-				Priority:  channel.Priority,
+				Priority:  priority,
 				Weight:    uint(channel.GetWeight()),
 				Tag:       channel.Tag,
 			}

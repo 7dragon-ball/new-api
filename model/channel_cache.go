@@ -1,9 +1,11 @@
 package model
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -84,8 +86,12 @@ func InitChannelCache() {
 		}
 	}
 
+	// [FORK] 锁外构建优先级查询表：构建要遍历全部 abilities 行，放进锁内会阻塞所有选路请求
+	newPriorityLookup := buildPriorityLookup(abilities)
+
 	channelSyncLock.Lock()
 	group2model2channels = newGroup2model2channels
+	priorityLookupCache = newPriorityLookup // [FORK] 与候选列表来自同一次 DB 读取，必须同时发布
 	//channelsIDM = newChannelId2channel
 	for i, channel := range newChannelId2channel {
 		if channel.ChannelInfo.IsMultiKey {
@@ -135,12 +141,14 @@ func GetRandomSatisfiedChannel(
 	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
+	eligibleModel := model // [FORK] 候选来自哪个 model key，优先级查表必须用同一个名字
 	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
 		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
+		eligibleModel = normalizedModel // [FORK] abilities.model 存的是归一化后的名字
 	}
 
 	if len(channels) == 0 {
@@ -154,31 +162,32 @@ func GetRandomSatisfiedChannel(
 		return nil, fmt.Errorf("database consistency error: channel #%d does not exist, please contact the administrator", channels[0])
 	}
 
-	uniquePriorities := make(map[int]bool)
+	// [FORK] 优先级改读 abilities.priority，使按供应关系设优先级在缓存路径生效
+	uniquePriorities := make(map[int64]bool)
 	for _, channelId := range channels {
-		if channel, ok := channelsIDM[channelId]; ok {
-			uniquePriorities[int(channel.GetPriority())] = true
+		if _, ok := channelsIDM[channelId]; ok {
+			uniquePriorities[effectivePriority(group, eligibleModel, channelId)] = true
 		} else {
 			return nil, fmt.Errorf("database consistency error: channel #%d does not exist, please contact the administrator", channelId)
 		}
 	}
-	var sortedUniquePriorities []int
+	sortedUniquePriorities := make([]int64, 0, len(uniquePriorities))
 	for priority := range uniquePriorities {
 		sortedUniquePriorities = append(sortedUniquePriorities, priority)
 	}
-	sort.Sort(sort.Reverse(sort.IntSlice(sortedUniquePriorities)))
+	slices.SortFunc(sortedUniquePriorities, func(a, b int64) int { return cmp.Compare(b, a) })
 
 	if retry >= len(uniquePriorities) {
 		retry = len(uniquePriorities) - 1
 	}
-	targetPriority := int64(sortedUniquePriorities[retry])
+	targetPriority := sortedUniquePriorities[retry]
 
 	// get the priority for the given retry number
 	var sumWeight = 0
 	var targetChannels []*Channel
 	for _, channelId := range channels {
 		if channel, ok := channelsIDM[channelId]; ok {
-			if channel.GetPriority() == targetPriority {
+			if effectivePriority(group, eligibleModel, channelId) == targetPriority {
 				sumWeight += channel.GetWeight()
 				targetChannels = append(targetChannels, channel)
 			}
