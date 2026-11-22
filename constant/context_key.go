@@ -61,6 +61,9 @@ const (
 	ContextKeyUserGroup   ContextKey = "user_group"
 	ContextKeyUsingGroup  ContextKey = "group"
 	ContextKeyUserName    ContextKey = "username"
+	// [FORK] 写日志/用量时直接读这两个键做身份快照，不回查 users 或 department 表。
+	ContextKeyUserDisplayName    ContextKey = "user_display_name"
+	ContextKeyUserDepartmentName ContextKey = "user_department_name"
 
 	ContextKeyLocalCountTokens ContextKey = "local_count_tokens"
 

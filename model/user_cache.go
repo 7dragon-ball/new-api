@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const userCacheSchemaVersion = 2
+const userCacheSchemaVersion = 3
 
 type UserBase struct {
 	Id             int    `json:"id"`
@@ -26,6 +26,13 @@ type UserBase struct {
 	CacheSchema    int    `json:"-"`
 	CacheExpiresAt int64  `json:"-"`
 	CacheMAC       string `json:"-"`
+	// [FORK] 身份快照随鉴权缓存一起下发：日志/用量写入是每次调用都走的
+	// 热路径，绝不能在写日志时再查一次库。
+	// 只放**名字**，不放 DepartmentId：`PublishUserAuthCache` 用 `*a == *b` 比较两次
+	// 独立 DB 读取的结果，指针字段会让「值相同」被判成不等，函数跑满重试后误报
+	// 「元数据仍在变」。而这里确实只需要名字——写日志不需要 id。
+	DisplayName    string `json:"display_name"`
+	DepartmentName string `json:"department_name"`
 }
 
 func (user UserBase) cacheMAC() (string, error) {
@@ -44,6 +51,8 @@ func (user *UserBase) WriteContext(c *gin.Context) {
 	common.SetContextKey(c, constant.ContextKeyUserStatus, user.Status)
 	common.SetContextKey(c, constant.ContextKeyUserEmail, user.Email)
 	common.SetContextKey(c, constant.ContextKeyUserName, user.Username)
+	common.SetContextKey(c, constant.ContextKeyUserDisplayName, user.DisplayName)
+	common.SetContextKey(c, constant.ContextKeyUserDepartmentName, user.DepartmentName)
 	common.SetContextKey(c, constant.ContextKeyUserSetting, user.GetSetting())
 }
 
@@ -79,21 +88,47 @@ func invalidateUserCache(userId int) error {
 	return common.RedisDelKey(getUserCacheKey(userId))
 }
 
+// baseUserWithDepartment 构造带部门名的 UserBase。
+//
+// 部门名只能按 `user.DepartmentId` 查字典表得到（`User` 里只有 id），而缓存的所有
+// 写入与返回值都必须带上它——日志/用量的身份快照直接取这个字段。曾经只有
+// populateUserCache 补名字，另外两条路径（updateUserCache 写、GetUserCache 冷启动
+// 返回）绕过它，结果改一次资料或冷启动一次就把部门名冲成空串。
+//
+// 只在写缓存/缓存 miss 时调用，不在请求热路径上，这一次查询可接受。
+// 部门已被删时查不到，留空——日志侧退化为无部门，与「当时没有部门」同义。
+func baseUserWithDepartment(user User) *UserBase {
+	base := user.ToBaseUser()
+	if user.DepartmentId == nil {
+		return base
+	}
+	var name string
+	if err := DB.Model(&Department{}).Where("id = ?", *user.DepartmentId).
+		Select("name").Scan(&name).Error; err == nil {
+		base.DepartmentName = name
+	}
+	return base
+}
+
 func populateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return writeUserCache(user.ToBaseUser(), true)
+	return writeUserCache(baseUserWithDepartment(user), true)
 }
 
 // updateUserCache refreshes non-quota user cache fields.
 // Quota is maintained by atomic quota delta paths and must not be overwritten
 // by stale user snapshots from profile/settings updates.
+//
+// 必须走 baseUserWithDepartment：直接写 ToBaseUser() 会把部门名冲成空串，
+// 而这条路径覆盖改密码/改角色/改部门/2FA/passkey 等十几处，等于「用户改过一次
+// 资料，之后一个缓存周期内写入的日志都没有部门」。
 func updateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return writeUserCache(user.ToBaseUser(), false)
+	return writeUserCache(baseUserWithDepartment(user), false)
 }
 
 // GetUserCache gets complete user cache from hash
@@ -123,7 +158,10 @@ func GetUserCache(userId int) (*UserBase, error) {
 			common.SysLog(common.LogText("failed to synchronously populate user cache: %s", err.Error()))
 		}
 	}
-	return user.ToBaseUser(), nil
+	// 返回带部门名的 base：populateUserCache 写进 Redis 的是它，直接返回
+	// user.ToBaseUser() 会让「缓存冷启动后的第一条请求」拿到空部门，每个
+	// 缓存周期（默认 60s）都漏一条没有部门的日志。
+	return baseUserWithDepartment(*user), nil
 }
 
 func cacheGetUserBase(userId int) (*UserBase, error) {

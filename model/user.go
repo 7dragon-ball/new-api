@@ -134,6 +134,10 @@ func (user *User) ToBaseUser() *UserBase {
 		Status:      user.Status,
 		Role:        user.Role,
 		Username:    user.Username,
+		DisplayName: user.DisplayName,
+		// 部门名不在这里取：User 只有 id，名字由 populateUserCache 回查字典表补上。
+		// 这里刻意不复制 DepartmentId：UserBase 用结构体相等做缓存一致性判断，
+		// 指针字段会让两次独立读取永远判不等（见 UserBase 字段注释）。
 		Setting:     user.Setting,
 		Email:       user.Email,
 		AuthVersion: user.AuthVersion,
