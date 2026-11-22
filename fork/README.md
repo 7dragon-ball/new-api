@@ -1,8 +1,9 @@
 # fork/ — New API 的定制登记册
 
-本仓库是 [New API](https://github.com/QuantumNous/new-api)（AI API 网关）的 fork，在上面做了四组
+本仓库是 [New API](https://github.com/QuantumNous/new-api)（AI API 网关）的 fork，在上面做了多组
 后端定制：支持多个超级管理员（root）、在 `users` 表记录真实的最近调用时刻、把部门归属从业务库
-搬到 `new_api` 库、把手机号也搬进 `new_api.users`。
+搬到 `new_api` 库、把手机号也搬进 `new_api.users`、日志记录上游密钥指纹、批量重置用户密码、
+按供应关系设优先级。各组细节见下方「定制清单」。
 
 **定制直接写在源码里，以 `// [FORK]` 标记。** 没有补丁目录，也没有 `git am` 重放步骤。
 本文件是唯一的定制登记册：哪几处与上游不同、为什么不同、merge 上游时怎么保住它们。
@@ -102,13 +103,13 @@ model/goose_fork.go                      # goose.NewProvider + Up()，消费上�
 da9b37f5c  feat(fork): 多 root 管理员与 fork 脚手架
 ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 522c044f9  feat(fork): 部门归属搬进 new_api 库
-（第四组「手机号」见下方「四、手机号」小节，第五组「上游密钥指纹」见「五、日志记录上游密钥指纹」；
-  两者都没有单独的补丁提交哈希，与前三组一起随源码发布。）
-（最新）    feat(user): 新增批量重置用户密码接口（仅后端）
+（第四组「手机号」见下方「四、手机号」小节，第五组「上游密钥指纹」见「五、日志记录上游密钥指纹」，
+  第六组「批量重置密码」、第七组「供应关系优先级」见对应小节；它们都没有单独的补丁提交哈希，
+  与前三组一起随源码发布。）
 ```
 
-基线是上游 `6ef123cd5`。这些都是**可直接 merge 的源码改动**，不是补丁。最后一条不记短 hash——
-它会跟着 `git commit --amend` 变，按提交标题 grep 即可。
+基线是上游 `6ef123cd5`。这些都是**可直接 merge 的源码改动**，不是补丁。后四组不记短 hash——
+提交会跟着 `git commit --amend` / rebase 变，按提交标题 grep 即可。
 
 ## 定制清单
 
@@ -144,7 +145,9 @@ ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 任务退款结算。只有第一类算调用。判定方式是看 `request_count`：一次调用必然伴随一次请求数累加，
 退款是相反的减法，充值不动请求数。
 
-> **本仓库前端未改动。** `web/` 与上游一致，自带控制台不显示这一列。该字段供自行开发的管理端读取。
+> **自带控制台不显示这一列。** 本 fork 对 `web/` 的改动只有 i18n 语言包、`static-keys.ts` 的白名单
+> 与 `secure-verification/types.ts` 的 scope 联合类型（见「改了哪些文件」），没有任何页面组件接线，
+> 所以 `last_called_at` 仍只供自行开发的管理端读取。
 
 ### 三、部门归属（`522c044f9`）
 
@@ -251,6 +254,53 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 `user.batch_password_reset` 也没登记进 `web/src/features/usage-logs/lib/format.ts` 的
 `AUDIT_TEMPLATES`，控制台审计列表显示原始英文（与 `department.*` 一致）。
 
+### 七、供应关系优先级（`abilities.priority` 参与选路）
+
+**背景**：上游缓存选路只读 `channels.priority`；`abilities.priority` 虽然存在且 `GetChannel`
+（缓存关闭时的 DB 路径）会读它，但开着内存缓存时它**不参与任何选路**。而 `abilities` 的主键是
+`(group, model, channel_id)`，正好就是「一条供应关系」——同渠道可以给不同模型设不同优先级。
+
+**做法**：让缓存选路改读 `abilities.priority`，缺行时逐渠道回退 `channels.priority`。
+
+- **候选集合不动。** `group2model2channels` 仍由 `channels` 派生，`abilities` 只提供「这条供应关系
+  的优先级」。不从 `abilities` 重新派生候选，是为了不引入孤儿行与停用渠道残留。
+- **新增查询表** `priorityLookup`（`model/channel_priority_cache_fork.go`）：`(group, model, channel_id)
+  → priority`。`InitChannelCache` 在**锁外**构建（构建要遍历全部 abilities 行，放锁内会阻塞所有选路），
+  与候选列表在同一次锁内发布，二者来自同一次 DB 读取。
+- **nil 语义**：行存在即采用其值，`NULL` 视作 `0`（对齐 `GetChannel`）；行不存在才回退
+  `channels.priority`。所以「删掉某渠道的 abilities 行」不会把它排除出选路，只是把优先级降回渠道级。
+- **写接口** `PUT /api/channel/ability/priority`（body `{model, channel_id, priority, group?}`）：
+  只改一条 `(group, model, channel)` 的 abilities 行，不写 `channels` 行。`priority` 限 1–999；
+  `group` 缺省为 `default`；目标行不存在返回 404。写后立即 `InitChannelCache()`，不等 3 秒 sync。
+- **与 `ReorderChannelPriority` 的区别**：`POST /api/channel/priority/reorder` 是渠道级**全量重排**——
+  改 `channels.priority`，并把该渠道**所有** abilities 行一起改成新值，用于调整渠道之间的整体顺序；
+  `PUT /api/channel/ability/priority` 是**单条**设置，只动一个模型 × 一个渠道。想只调某个模型的优先级
+  就只能用后者，用重排会把同渠道其它模型一起改掉。两者语义不同，都保留。
+- **`UpdateAbilities` 已改为保留 priority**（`model/ability.go`，6 个调用点）。它原本先 `DELETE` 该渠道
+  全部 abilities 行再按 `channel.Priority` 重建，意味着管理员设好的单条优先级会被「改渠道名 / 权重 /
+  模型列表 / 批量打标签 / 上游模型同步」任一动作清零。现在 `DELETE` 前按 `(group, model)` 记下现有
+  priority，重建时还原；`enabled` / `weight` / `tag` 仍按当前渠道状态重建——它们本来就该跟着渠道走。
+  模型列表里删掉的模型不会残留在 `kept` 里，重建后该行消失，维持原语义。
+
+**增删单条供应关系**（`POST|DELETE /api/channel/ability`，`model/channel_ability_fork.go` 与
+`controller/channel_ability_fork.go`）：
+
+- **`channels.models` 是权威，`abilities` 是重建产物。** 直接插一行 abilities 会在两处失效：
+  缓存选路的候选列表由 `channels` 派生（不读 abilities），请求根本看不到这一行；任何一次
+  `UpdateAbilities` 又会先删光该渠道的 abilities 行再按 `channels.models` 重建，这一行随即消失。
+  所以两个接口都以渠道的 `models` 列为写入点：新增时把模型名写进去（给了 `upstream_model`
+  就同时写 `model_mapping`），删除时摘掉模型名并清掉对应映射，然后调用 `UpdateAbilities` 重建。
+- **行锁**：读写 `models` 列是读改写，两个并发新增不加锁会丢一条。两条路径都先
+  `lockForUpdate` 锁住渠道行，并在锁内完成去重、写列与重建。
+- **group 用渠道原始 token**：`UpdateAbilities` 按 `channels.group` 的原始 token 写 group 列
+  （不 trim），所以校验与回写都用原始 token，否则刚重建出来的行查不到。
+- **重复新增返回 400**（`The supply relation already exists`），不静默成功；删除不存在的行返回 404。
+- **已知边界**：`channels.models` 是渠道级而不是 group 级的列，多 group 渠道删一条会连带移除
+  其它 group 下的同名行——与「在渠道接入改模型清单」的行为一致。
+
+**已知边界**：BFF 的写接口固定落 `default` 组；查询表本身不做 group 过滤，但部署里若存在多 group
+渠道，单条优先级目前只对 `default` 组生效。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -271,17 +321,27 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 37 个文件（18 个上游文件被改、19 个新增），+2734/−62（不含 `fork/` 目录本身）。
+共 75 个文件（39 个上游文件被改、36 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +6320/−84，`web/` 部分 +114/−0（都是 i18n 与类型联合）。
+
+> 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
+> 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
+> 那不是定制，不计入上面的文件数。39 个被改文件里有 9 个是 `web/`（见下表末三行）、4 个不是功能
+> 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
 | 文件 | 改动 | 风险 |
 |---|---|---|
-| `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，四组定制都改它 |
+| `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，前四组定制都改它 |
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
+| `model/channel_cache.go` | 新增 `priorityLookupCache` 的构建与发布、`GetRandomSatisfiedChannel` 的优先级改读 `abilities.priority`（5 处 `[FORK]`） | **高**，逐请求热路径 |
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
+| `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 `(group, model) → priority`，重建时还原（2 处 `[FORK]`） | 中，6 个调用点的高频路径 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
+| `router/channel-router.go` | 权限路由表插入 `PUT /ability/priority`（1 处 `[FORK]`） | 低，单行 |
+| `router/channel_router_test.go` | 同上路由的权限断言 | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
 | `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
@@ -293,8 +353,12 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `service/violation_fee.go` | 构建违规费日志处加一行调用写指纹 | 低 |
 | `service/task_billing.go` | `LogTaskConsumption` 加一行调用写指纹（任务型渠道的提交日志） | 低 |
 | `relay/responses_websocket.go` | lockedContext 白名单提成包级变量 `lockedContextKeys`（行为不变，为让白名单可被测试断言） | 低 |
+| `controller/token.go`、`model/token.go` | 令牌「使用方」`owner`：请求字段（指针区分未传）、128 字节校验、写库 | 低 |
+| `controller/token_test.go`、`controller/admin_user_verification_test.go`、`relay/responses_websocket_test.go`、`service/task_billing_test.go` | 对应测试：owner 用例、批量重置的 proof 前置断言、白名单断言、指纹断言 | 低 |
+| `web/src/i18n/locales/{en,zh,zh-TW,ja,ru,vi,fr}.json`、`web/src/i18n/static-keys.ts` | 新增错误文案的翻译键（部门、手机号、批量重置、单条优先级、令牌使用方等），`static-keys.ts` 同步白名单 | 低 |
+| `web/src/features/auth/secure-verification/types.ts` | `SecurityProofScope` / `VerificationOperation` 联合类型加 `admin.user.management` 及 context | 低 |
 
-**本 fork 新增（文件名带 `_fork` 后缀，上游不可能改，merge 时不会冲突）**
+**本仓库新增（文件名带 `_fork` 后缀，上游不可能改，merge 时不会冲突）**
 
 | 文件 | 内容 |
 |---|---|
@@ -303,20 +367,31 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/user_phone_fork.go` | `normalizePhoneFork` 归一与 11 位校验、`ensurePhoneFreeWithTx` 事务内预检、两条 `common.Message` 错误 |
 | `model/goose_fork.go` | 内嵌 PG 迁移的 goose 集成：`Provider.Up()`、非 PG 库直接拒绝 |
 | `migrations/embed.go` | 内嵌 `migrations/postgres/*.sql`，导出 `migrations.Postgres` |
-| `migrations/postgres/*.sql` | 部门表建表迁移（仅 PG） |
+| `migrations/postgres/20261117160000_create_department.sql` | 部门表建表迁移（仅 PG） |
 | `controller/department_fork.go` | 四个 CRUD handler + `PUT /api/user/:id/department` + `isDuplicateKey` |
 | `controller/department_usage_fork.go` | 部门用量聚合 handler |
-| `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go` | controller 包测试 |
-| `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go` | model 包测试 |
+| `controller/user_management_fork.go` | 编辑用户三项合一（角色 / 部门 / 手机号）的 profile 更新逻辑 |
+| `controller/department_fork_test.go`、`controller/department_usage_fork_test.go`、`controller/user_department_fork_test.go`、`controller/user_multi_root_fork_test.go`、`controller/user_search_department_fork_test.go`、`controller/user_phone_fork_test.go`、`controller/user_unified_update_fork_test.go` | controller 包测试 |
+| `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go`、`model/user_phone_fork_test.go` | model 包测试 |
 | `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
 | `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
+| `service/security_verification_fork.go` | `admin.user.manage` 的 proof 校验规则 |
 | `common/random_password_fork.go` | 8 位随机账号密码：三类字符必现、Fisher–Yates 打散位置、`crypto/rand` 无偏 |
 | `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
 | `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |
 | `service/security_verification_batch_password_fork.go` | proof context 定义、id 集合校验（≤100、升序、不许重复） |
+| `model/channel_priority_cache_fork.go` | 优先级查询表 `priorityLookup`、`buildPriorityLookup`、`priorityOf`、`effectivePriority` |
+| `model/channel_priority_fork.go` | 单条优先级写接口：1–999 校验、两条 `common.Message` 错误、`UpdateAbilityPriority` |
+| `controller/channel_priority_fork.go` | `PUT /api/channel/ability/priority` handler，写后 `InitChannelCache()` |
+| `model/channel_ability_fork.go` | 增删单条供应关系：以 `channels.models` 为权威写列、同步 `model_mapping`、重建 abilities |
+| `controller/channel_ability_fork.go` | `POST` / `DELETE /api/channel/ability` handler，写后 `InitChannelCache()` |
+| `model/channel_ability_fork_test.go`、`controller/channel_ability_fork_test.go` | 增删关系、映射同步、重复 400、写后可选路 |
 | `controller/user_batch_password_reset_fork_test.go` | controller 包测试（含锁内二次授权与整批回滚） |
+| `model/channel_priority_cache_fork_test.go` | 选路基线、查询表、逐渠道回退、缓存开关一致性、`UpdateAbilities` 保留优先级 |
+| `model/channel_priority_fork_test.go` | `UpdateAbilityPriority` 只改目标行、范围校验、缓存版本推进 |
+| `controller/channel_priority_fork_test.go` | 端点用例（含缺省 group、错误码、写后立即生效） |
 
-（另有 3 个上游测试文件被改签名或补迁移。）上游若在这些路径放了同名文件，
+（另有 12 个上游文件被改签名、补迁移或补测试，已并入上表。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 
 `model/user.go` 里有一段 `User` 结构体的整段对齐格式化 diff（加字段导致列宽变化），属噪声，
@@ -330,20 +405,27 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 84 处、29 个文件：
+当前共 114 处、38 个文件：
 
 | 文件 | 处数 |
 |---|---|
 | `model/user.go` | 17 |
 | `controller/user.go` | 16 |
+| `model/channel_priority_cache_fork_test.go` | 7 |
+| `service/security_verification.go` | 7 |
 | `model/user_last_called_fork_test.go` | 6 |
 | `model/department_fork.go` | 6 |
 | `controller/department_fork.go` | 6 |
-| `service/security_verification.go` | 5 |
+| `model/channel_cache.go` | 5 |
+| `model/channel_priority_cache_fork.go` | 5 |
 | `router/api-router.go` | 4 |
-| `service/security_verification_fork.go` | 2 |
+| `model/channel_priority_fork.go` | 3 |
+| `model/ability.go` | 2 |
+| `controller/channel_priority_fork.go` | 2 |
+| `controller/channel_priority_fork_test.go` | 2 |
 | `controller/audit.go` | 2 |
-| `common/random_password_fork.go`、`controller/department_usage_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/user_batch_password_fork.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `service/security_verification_fork.go` | 2 |
+| `common/random_password_fork.go`、`controller/department_usage_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`model/channel_priority_fork_test.go`、`model/goose_fork.go`、`model/main.go`、`model/user_batch_password_fork.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`router/channel-router.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
@@ -401,7 +483,8 @@ merge 无冲突时直接进验证。有冲突时按下面的原则处理。
 
 ### 验证
 
-用仓库自带的入口，与 CI（`.github/workflows/ci.yml`）同一套命令：
+用仓库自带的入口（`.github/workflows/ci.yml` 已在 fork 中删除，只保留 `quay-publish.yml`，
+所以 CI 不再跑测试，下面的命令靠本地 / 人工执行）：
 
 ```bash
 mkdir -p web/dist && touch web/dist/index.html   # 根包 //go:embed web/dist，见下
@@ -457,7 +540,8 @@ docker build -t new-api:$(date +%Y%m%d)-$(git rev-parse --short HEAD) .
 tag 用 `<构建日期>-<HEAD 短号>`，一眼看出镜像来自哪天哪个提交。构建时间包含一次
 `bun install` 加前端构建，不能跳过。
 
-> 源码里四组定制（多 root、最近调用、部门、手机号）恒在，tag 不编码定制组，也不跟随上游版本号。
+> 源码里七组定制（多 root、最近调用、部门、手机号、上游密钥指纹、批量重置密码、供应关系优先级）
+> 恒在，tag 不编码定制组，也不跟随上游版本号。
 > 工作区有未提交改动时 tag 只反映 HEAD，不反映改动，别用它反推镜像内容。
 
 国内网络通常拉不到 registry 与 Go proxy，用 `--build-arg` 显式传代理，**不要**指望 shell 里的
@@ -498,6 +582,22 @@ docker build \
   必须是升序去重后的完整 id 列表）。全或无：任一目标不可重置则整批回滚、不返回任何密码；
   成功时逐条返回 `id`/`username`/`display_name`/`email`/`password`，顺序与请求一致。
   **明文密码只在这一响应里出现一次**，请求不幂等，响应丢了只能重新签 proof 重来。
+- `PUT /api/channel/ability/priority`：按供应关系设优先级。body
+  `{"model": "...", "channel_id": <id>, "priority": 1..999, "group": "default"}`，`group` 可缺省。
+  只改 `(group, model, channel_id)` 这一条 abilities 行，不写 `channels`；返回
+  `{"model", "channel_id", "priority"}`。权限 `ChannelWrite`。`priority` 越界 → 400
+  （`Priority must be between 1 and 999`），目标行不存在 → 404（`The supply relation does not exist`）。
+  写后立即刷新路由缓存，不需等 3 秒 sync。
+- `POST /api/channel/priority/reorder` 仍按渠道级全量重排（`channels.priority` + 该渠道全部 abilities
+  行），与上面这条的语义区别见「定制清单 · 七、供应关系优先级」。
+- `POST /api/channel/ability`：新增一条供应关系。body
+  `{"model": "...", "channel_id": <id>, "group"?: "default", "upstream_model"?: "...", "priority"?: 1..999}`。
+  `upstream_model` 与 `model` 不同时写成 `channels.model_mapping`，`priority` 缺省为 1。
+  已存在同一 `(group, model, channel_id)` → 400（`The supply relation already exists`）；
+  渠道不存在 → 404；`(group, model, channel)` 重建后仍无行 → 404。
+- `DELETE /api/channel/ability`：删除一条供应关系。body `{"model": "...", "channel_id": <id>, "group"?: ...}`。
+  从 `channels.models` 摘掉模型名、清掉对应映射并重建 abilities；行不存在 → 404。
+  两者权限均为 `ChannelWrite`，写后立即刷新路由缓存。
 
 调用约定：`grant_root` 只有 root 能调，`revoke_root` 受「至少留一个启用 root」约束；两者都要求
 目标用户存在且状态合法。部门的写操作与改归属都受 `canManageTargetRole` 约束（同级或更高角色的
@@ -515,7 +615,8 @@ docker build \
 3. **部门用量聚合的数字正确性**：测试用的是造出来的 `quota_data`/`tokens` 行，能验证 CTE 结构与
    零成员部门不丢失，但真实库里「一个用户多把秘钥」「跨部门迁移后历史流水仍记在旧账上」等
    形态要拿生产数据抽样核对。特别地，`keys` 只统计成员**当前**拥有的有效秘钥数。
-4. **前端渲染**：本仓库前端未改动，若在自己前端展示这些字段/接口，属另一侧的验证。
+4. **前端渲染**：本 fork 对 `web/` 只改了 i18n 语言包、`static-keys.ts` 白名单与 scope 联合类型，
+   没有页面组件接线。若在自己前端展示这些字段/接口，属另一侧的验证。
 5. **goose 迁移只有 PG 一份，且需要真实 PG 才能验证。** `TestForkMigrationsOnPostgres`
    验证建表、唯一索引、重复执行幂等，但它要求 `TEST_POSTGRES_DSN`，没配时 SKIP——
    **SKIP 不等于通过**。上线前必须对真实 PG 跑一次，覆盖「空库启动」与「已有 department 表
@@ -536,7 +637,7 @@ docker build \
 | 渠道测试固定取「第一个 root」当测试用户 | 多 root 下取到哪个不确定，行为可接受。 |
 | 渠道通知默认发给所有未显式配置的 root | 多 root 后收件人变多，行为可接受。 |
 | `CountEnabledRootUsers` 生产代码里没有调用点 | 守卫走的是加锁路径。该函数留给排查与测试用。 |
-| 新建用户的默认侧边栏配置不含 admin 区，事后 `grant_root` 不重算 | 只影响上游自带控制台，本仓库未改前端。 |
+| 新建用户的默认侧边栏配置不含 admin 区，事后 `grant_root` 不重算 | 只影响上游自带控制台；本 fork 的 `web/` 改动只有 i18n 与类型，没动侧边栏逻辑。 |
 | 极端情况下仍可能被人工操作清空 root（手工 SQL、迁移脚本） | 事故兜底：把可信账号 `UPDATE users SET role=100, status=1`，或删除 setups 记录后重启走初始化。**仅事故时人工执行，不可当控制手段。** |
 
 ## 许可证与合规
