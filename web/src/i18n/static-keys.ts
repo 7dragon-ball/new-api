@@ -917,4 +917,7 @@ export const STATIC_I18N_KEYS = [
   'Channel priorities changed. Refresh and try again.',
   'Invalid channel priority move',
   'Channel priority is outside the sortable range',
+  // Supply relation priority API errors.
+  'Priority must be between 1 and 999',
+  'The supply relation does not exist',
 ] as const

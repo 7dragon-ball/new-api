@@ -57,6 +57,11 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/priority/order", permission: authz.ChannelRead, handler: controller.GetChannelPriorityOrder},
 	{method: http.MethodPost, path: "/priority/reorder", permission: authz.ChannelWrite, handler: controller.ReorderChannelPriority},
+	// [FORK] 按供应关系设优先级：只改一条 (model × channel) 的 abilities.priority
+	{method: http.MethodPut, path: "/ability/priority", permission: authz.ChannelWrite, handler: controller.UpdateAbilityPriority},
+	// [FORK] 模型上架页增删供应关系：同时改 channels.models 与重建 abilities
+	{method: http.MethodPost, path: "/ability", permission: authz.ChannelWrite, handler: controller.AddChannelAbility},
+	{method: http.MethodDelete, path: "/ability", permission: authz.ChannelWrite, handler: controller.DeleteChannelAbility},
 	{method: http.MethodGet, path: "/", permission: authz.ChannelRead, handler: controller.GetAllChannels},
 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
 	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
