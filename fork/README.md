@@ -83,6 +83,11 @@ model/goose_fork.go                      # goose.NewProvider + Up()，消费上�
 - **版本表名是 goose 默认的 `goose_db_version`**，与上游的 GORM 表都不撞名。
 - 新增 PG 迁移：往 `migrations/postgres/` 加文件 → 用 `TEST_POSTGRES_DSN` 跑
   `TestForkMigrationsOnPostgres`。没有 PG 实例时这条用例会 SKIP，**不算验证过**。
+- **AutoMigrate 管着的表不写迁移。** `logs`、`quota_data`、`redemptions` 都在 `migrateDB()` 的
+  AutoMigrate 列表里（独立日志库还有 `migrateLOGDB()` 再补一次），加列本来就在建表/启动时完成；
+  再写一份 goose SQL 就是同一列定义两处维护，改 tag 忘了改 SQL 只换来一次多余 `ALTER` 或迁移失败，
+  而独立日志库那份 SQL 压根不会被执行（goose 只跑主库）。所以身份快照这几列**只有 GORM tag**，
+  升级路径由 `TestForkMigrationsOnPostgres` 的「旧形状表 + AutoMigrate」用例验证。
 
 `fork/README.md` 之外**没有**额外的迁移文档；`token-master2-dept/` 的 goose 迁移与本仓库无关，
 那是业务库 `token_master` 的。
@@ -251,7 +256,53 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 `user.batch_password_reset` 也没登记进 `web/src/features/usage-logs/lib/format.ts` 的
 `AUDIT_TEMPLATES`，控制台审计列表显示原始英文（与 `department.*` 一致）。
 
-### 七、新建渠道按凭据测试连通性
+### 七、身份快照（`feat/identity-snapshot` 的四个提交）
+
+**需求**：用户、部门、渠道都是**硬删除**（或改名）。删掉之后，历史日志/用量/兑换记录再没有任何地方
+能回答「当时是谁、哪个部门、哪个渠道」。所以要在产生数据的那一刻把名字抄一份存进去。
+
+**做法**：写入时抄名字，查询直接显示，不回查当前状态。
+
+- **热路径零查库**：鉴权中间件把 `display_name` / `department_name` 从用户缓存写进 gin 上下文
+  （`UserBase.WriteContext` → `constant.ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName`）；
+  分发中间件写渠道名。写日志/用量时只读上下文，一次额外查询都不发。
+- **缓存必须带名字**：`UserBase` 新增 `DisplayName` / `DepartmentName` 两个**值**字段，
+  `userCacheSchemaVersion` 升到 3，`user_auth_cache.go` 的内联 Lua 把两列连同 MAC/版本号整份写入。
+  部门名只能按 `user.DepartmentId` 查字典表，所以「写缓存」与「冷启动返回」共用
+  `baseUserWithDepartment`——三条旁路（populate / update / 冷启动）任何一条漏了，都会把部门名冲成空串。
+  部门 **id 不进** `UserBase`：`PublishUserAuthCache` 用 `*a == *b` 判断元数据是否还在变，
+  指针字段会让它永远判成在变，重试三次后报错。
+- **没有请求上下文的路径**（任务计费、充值回调、系统日志）按 `userId` 从用户缓存取
+  （`identitySnapshotForUser`），不额外查库。
+- **放哪里**：`logs.display_name` / `logs.department` / `logs.channel_name`（同机制还有
+  `logs.channel_tag` / `logs.token_owner`，取 `channels.tag` 与 `tokens.owner`），
+  `quota_data.display_name` / `quota_data.department`，
+  `redemptions.used_username` / `redemptions.used_display_name`。全列 TEXT：源列宽度不统一
+  （`users.display_name` 的 20 字上限只在请求校验层，OAuth 注册绕过它；`channels.name` 根本没限），
+  快照列收窄会让超长名字的 INSERT 失败，而 `createLog` 只记 error → 静默丢日志。
+- **身份进聚合键**：`quota_data` 的聚合键加了 `display_name`/`department`，所以改名前后是两行，
+  历史不会被改后的名字覆盖。键的唯一定义是 `model/usedata.go` 的 `quotaDataKeyParts()`：
+  内存分桶键与两条 upsert 判据（`Find` 的 Where、`UPDATE` 的 Where）都由它生成，不再手抄三份。
+- **不回填存量**：老日志/老用量/老兑换记录的身份列留空（NULL/空串），语义是「当时没记」。
+  `quota_data` 的存量行在这两列上是 NULL、新行是空串，所以 upsert 判据对这两列用
+  `COALESCE(col, '') = ?` 比较（`applyQuotaDataKey`）——直接 `= ''` 匹配不到 NULL，部署后
+  首次保存就会给同一聚合键再插一行。NULL 本身不改写，仍是「当时没记」。
+- **跨仓库契约（BFF 侧）**：上述列在本分支上线后才存在，且不保证有值；读之前先判空。
+  `quota_data` 的存量行仍可能是 NULL，拼接/展示时按「未知」处理。老日志按旧列名（`users`
+  反查）展示的旧逻辑不改也不补——两套数据共存时，新行显示快照，老行显示当前值/空。
+
+**已知缺口**：
+
+- 只对新建行生效，存量不回填、不做修复脚本（与渠道秘钥指纹同一形态）。
+- **部门改名不会立刻刷新成员缓存**：`UpdateDepartment` 只改 `department` 表，`user:<id>` 里的
+  `DepartmentName` 要等缓存过期（`SYNC_FREQUENCY`，默认 60s）才重建，所以这段时间内新产生的
+  日志/用量仍写旧名，`quota_data` 会把旧名/新名拆成两行。当前业务不会改名，接口虽仍在
+  `PUT /api/department/` 上可达，但没有调用方，故未加「按部门批量刷成员缓存」。若以后要启用
+  改名，在改名成功后按 `department_id` 取成员 id 逐个 `PublishUserAuthCache`——不要用
+  `invalidateUserCache`：那会连缓存里的 `Quota` 一起丢掉，而批量更新模式下数据库余额还没跟上
+  缓存，重建时会读出偏高的余额。
+
+### 八、新建渠道按凭据测试连通性
 
 上游只有 `GET /api/channel/test/:id`，必须先落库拿到 id 才能测。管理端「新建渠道」弹窗在保存前
 就要逐模型测连通性，于是加一个 `POST /api/channel/test`：
@@ -311,9 +362,23 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 因此若要把本 fork 部署到 MySQL，这几处必须先补 MySQL 分支并做三库实测。仅在当前 PG 部署下
 运行不受影响。
 
+### 独立日志库（ClickHouse）不在本部署范围内
+
+本 fork 只把日志表放在主库（`LOG_SQL_DSN` 不设置，`InitLogDB` 直接 `LOG_DB = DB`）。上游支持的
+「独立日志库」——包括 ClickHouse（`LOG_SQL_DSN=clickhouse://…`）——本部署不使用，也没有实测：
+
+- 身份快照新增的列（`display_name` / `department` / `channel_name` / `channel_tag` / `token_owner`）
+  已同步进 `model/main.go` 的 ClickHouse 建表语句（`clickHouseLogCreateTableSQL`），保证代码自洽；
+- 但**老 ClickHouse 日志库升级不补列**：`CREATE TABLE IF NOT EXISTS` 在已存在的表上是空操作，
+  且本 fork 未实现 `ALTER TABLE logs ADD COLUMN`。若将来真的要启用 ClickHouse，必须先补这一步，
+  否则老库升级后每条日志写入都会以 `NO_SUCH_COLUMN_IN_TABLE` 失败。
+- 不启用 ClickHouse 时，日志表随主库走 PG，由 `migrateDB()` 的 `AutoMigrate`（含 `&Log{}`）
+  在建表/启动时建列、补列，不受上述限制影响。
+
 ## 改了哪些文件
 
-共 37 个文件（18 个上游文件被改、19 个新增），+2734/−62（不含 `fork/` 目录本身）。
+共 52 个文件（32 个上游文件被改、20 个新增），+3587/−137（不含 `fork/` 目录本身；
+含 `feat/identity-snapshot` 的 4 个提交与随后的修正）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
@@ -338,6 +403,15 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_authentication_test.go` | 补 `deleteUserAuthenticationData` 的用例（只清目标用户、软删行、失败传播） | 低 |
 | `service/log_info_generate.go` | `AppendRelayLogAdminInfo` 加一行调用写指纹 | 低，块内独立 |
 | `service/violation_fee.go` | 构建违规费日志处加一行调用写指纹 | 低 |
+| `model/user.go` | `UserBase` 加 `DisplayName` / `DepartmentName` 两个值字段（快照来源） | 低 |
+| `model/log.go` | `Log` 加快照列；写入路径按上下文/用户缓存填快照；列表与导出反查不到渠道时保留行内快照 | 中，写入路径多，漏一处就少一列 |
+| `model/usedata.go` | `QuotaData` 加 `display_name` / `department` 并入聚合键；`quotaDataKeyParts()` 成为 10 列键的唯一定义 | 中，聚合键写错只错数据、不报错 |
+| `model/user_cache.go` | `baseUserWithDepartment` 成为「用户 → 带部门名的 `UserBase`」的唯一实现，三个缓存路径共用 | 中 |
+| `model/user_auth_cache.go` | 内联 Lua 多写两列（ARGV 下标必须与 `UserBase` 字段顺序对齐）；`userCacheSchemaVersion` 升 3 | **最高**，漏写一列就永远读回空串 |
+| `model/redemption.go` | 兑换时抄一份兑换人用户名/显示名 | 低 |
+| `constant/context_key.go` | 新增 `ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName` | 低 |
+| `middleware/auth.go` | 鉴权通过后把身份写进上下文 | 低 |
+| `middleware/distributor.go` | 分发后把渠道名/供应商写进上下文 | 低 |
 | `service/task_billing.go` | `LogTaskConsumption` 加一行调用写指纹（任务型渠道的提交日志） | 低 |
 | `relay/responses_websocket.go` | lockedContext 白名单提成包级变量 `lockedContextKeys`（行为不变，为让白名单可被测试断言） | 低 |
 
@@ -357,6 +431,9 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go` | model 包测试 |
 | `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
 | `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
+| `model/log_identity_snapshot_fork_test.go` | 身份快照的写入/读取侧回归（上下文、后台路径、删除后列表） |
+| `model/user_cache_fork_test.go` | 缓存往返、`updateUserCache`、冷启动返回值、Redis 关闭时不查部门 |
+| `model/usedata_fork_test.go` | `quota_data` 按身份快照分桶、同键累加的回归 |
 | `common/random_password_fork.go` | 8 位随机账号密码：三类字符必现、Fisher–Yates 打散位置、`crypto/rand` 无偏 |
 | `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
 | `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |
@@ -379,20 +456,24 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 84 处、29 个文件：
+当前共 104 处、37 个文件：
 
 | 文件 | 处数 |
 |---|---|
 | `model/user.go` | 17 |
 | `controller/user.go` | 16 |
+| `service/security_verification.go` | 7 |
 | `model/user_last_called_fork_test.go` | 6 |
 | `model/department_fork.go` | 6 |
 | `controller/department_fork.go` | 6 |
-| `service/security_verification.go` | 5 |
+| `model/usedata.go` | 5 |
 | `router/api-router.go` | 4 |
+| `model/log.go` | 4 |
+| `constant/context_key.go` | 3 |
 | `service/security_verification_fork.go` | 2 |
+| `model/user_auth_cache.go` | 2 |
 | `controller/audit.go` | 2 |
-| `common/random_password_fork.go`、`controller/department_usage_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/user_batch_password_fork.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `common/random_password_fork.go`、`controller/department_usage_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/access_token_routes.go`、`middleware/auth.go`、`middleware/distributor.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
@@ -547,6 +628,9 @@ docker build \
   必须是升序去重后的完整 id 列表）。全或无：任一目标不可重置则整批回滚、不返回任何密码；
   成功时逐条返回 `id`/`username`/`display_name`/`email`/`password`，顺序与请求一致。
   **明文密码只在这一响应里出现一次**，请求不幂等，响应丢了只能重新签 proof 重来。
+- 日志行（`GET /api/log/`、`/api/log/export`）多了快照字段 `display_name`、`department`、
+  `channel_name`、`channel_tag`、`token_owner`。**筛选参数没变**：`LogFilter` 没有按显示名/渠道名
+  筛选的能力，这些列只用于展示。
 
 调用约定：`grant_root` 只有 root 能调，`revoke_root` 受「至少留一个启用 root」约束；两者都要求
 目标用户存在且状态合法。部门的写操作与改归属都受 `canManageTargetRole` 约束（同级或更高角色的
@@ -584,6 +668,9 @@ docker build \
 | `grant_root` 会吊销目标会话 | role 变更走 `UpdateWithTx` 的 `authChanged` 分支，递增 auth version → `Update` 调 `RevokeAllUserSessions`。上游 `promote` 走同一路径，所以升权也会踢下线；目标用户需要重新登录。降权同理，且即时生效（鉴权读实时角色）。 |
 | 渠道测试固定取「第一个 root」当测试用户 | 多 root 下取到哪个不确定，行为可接受。 |
 | 渠道通知默认发给所有未显式配置的 root | 多 root 后收件人变多，行为可接受。 |
+| 关闭 Redis 的部署写不出部门快照 | 部门名只能从鉴权缓存带下来；`RedisEnabled=false` 时 `GetUserCache` 直接返回 `ToBaseUser()`（否则每个请求都要多查一次字典表），因此 `logs.department` / `quota_data.department` 恒为空。显示名不受影响。生产多节点部署必须开 Redis。 |
+| 已存在的 ClickHouse 日志库升级后缺快照列 | 见「数据库」→「独立日志库（ClickHouse）不在本部署范围内」：建表语句已补列保证代码自洽，但不做老库自动补列。 |
+| 部门用量聚合仍按当前归属算 | `GET /api/data/departments` 用 `users.department_id` 实时聚合（且 `deleted_at IS NULL`），用户转部门后历史用量跟着走，删掉的用户不计入。`quota_data.department` 快照已写入但尚未被该接口使用。 |
 | `CountEnabledRootUsers` 生产代码里没有调用点 | 守卫走的是加锁路径。该函数留给排查与测试用。 |
 | 新建用户的默认侧边栏配置不含 admin 区，事后 `grant_root` 不重算 | 只影响上游自带控制台，本仓库未改前端。 |
 | 极端情况下仍可能被人工操作清空 root（手工 SQL、迁移脚本） | 事故兜底：把可信账号 `UPDATE users SET role=100, status=1`，或删除 setups 记录后重启走初始化。**仅事故时人工执行，不可当控制手段。** |

@@ -125,12 +125,39 @@ func TestForkMigrationsOnPostgres(t *testing.T) {
 	DB = db
 	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
 
+	// [FORK] 快照列不写 goose 迁移，靠 AutoMigrate（`logs`/`quota_data`/`redemptions` 都在
+	// migrateDB() 的列表里）。这里先手建「旧版建出来的表」（只有 id 列），再跑一次
+	// AutoMigrate，断言存量库真能补上列——这才是升级路径，与空库启动无关。
+	for _, table := range []string{"logs", "quota_data", "redemptions"} {
+		require.NoError(t, db.Exec("CREATE TABLE IF NOT EXISTS "+table+" (id bigint NOT NULL)").Error)
+	}
+	require.False(t, db.Migrator().HasColumn(&Log{}, "display_name"))
+	require.NoError(t, db.AutoMigrate(&Log{}, &QuotaData{}, &Redemption{}))
+
 	require.NoError(t, runForkMigrations())
 	require.True(t, db.Migrator().HasTable(&Department{}))
 	require.True(t, db.Migrator().HasIndex(&Department{}, "uk_department_name"))
 
+	// [FORK] 快照列必须建出来，且类型要装得下比源列上限更长的历史值：
+	// VARCHAR 定宽会让超长名字的 INSERT 以 22001 失败，而写日志只记一行错误。
+	longText := strings.Repeat("名", 300)
+	for _, column := range []string{"display_name", "department", "channel_name", "channel_tag", "token_owner"} {
+		assert.True(t, db.Migrator().HasColumn(&Log{}, column), "logs.%s", column)
+	}
+	for _, column := range []string{"display_name", "department"} {
+		assert.True(t, db.Migrator().HasColumn(&QuotaData{}, column), "quota_data.%s", column)
+	}
+	for _, column := range []string{"used_username", "used_display_name"} {
+		assert.True(t, db.Migrator().HasColumn(&Redemption{}, column), "redemptions.%s", column)
+	}
+	require.NoError(t, db.Exec("INSERT INTO logs (id, display_name) VALUES (1, ?)", longText).Error)
+	var stored string
+	require.NoError(t, db.Raw("SELECT display_name FROM logs WHERE id = 1").Scan(&stored).Error)
+	assert.Equal(t, longText, stored, "快照列不得比源列先截断")
+
 	// 幂等：多节点启动会各跑一次，第二次不能报错也不能重建表。
 	require.NoError(t, runForkMigrations())
+	require.NoError(t, db.AutoMigrate(&Log{}, &QuotaData{}, &Redemption{}))
 
 	dept := &Department{Name: "技术部"}
 	require.NoError(t, db.Create(dept).Error)
