@@ -166,7 +166,11 @@ func redactResponseBody(body io.ReadCloser, secrets []string) io.ReadCloser {
 }
 
 // redactCredentialText 替换文本里的凭据：原文、URL 编码形式（上游回显查询串时是编码
-// 后的），与响应 message 那条路径同一口径。
+// 后的）。它是 fork 侧唯一的文本级脱敏规则，渠道测试（redactCredentialError /
+// redactResponseBody）都走它。
+//
+// 上游自己的 sanitizeFetchModelsError（fetch_models / 渠道余额）有一份等价实现，按 fork
+// 约定不碰：两处都改了语义时记得同步，否则两条回显路径的脱敏强度会歧开。
 func redactCredentialText(text string, secrets []string) string {
 	for _, secret := range secrets {
 		secret = strings.TrimSpace(secret)
@@ -180,8 +184,9 @@ func redactCredentialText(text string, secrets []string) string {
 	return text
 }
 
-// redactCredentialError 脱敏错误文本；没有替换到任何东西时原样返回，保留
-// *common.Message 的 message_key（前端靠它选语言包），真替换过才丢类型。
+// redactCredentialError 与上游 sanitizeFetchModelsError 的文本规则等价（都盖原文与 URL
+// 编码形式），差别是它在没有替换到任何东西时原样返回 err，保留 *common.Message 的
+// message_key（前端靠它选语言包）；真替换过才包 errors.New，接受丢类型。
 func redactCredentialError(err error, secrets []string) error {
 	if err == nil {
 		return nil

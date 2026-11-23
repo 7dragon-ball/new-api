@@ -262,10 +262,22 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   key 允许为空，因为「自建算力」渠道走内网网关、上游不校验秘钥。`endpoint_type` / `stream` 与
   `GET /test/:id` 同口径透传（新建弹窗要测非 chat 端点或流式）；未知的 `endpoint_type` 落回
   `testChannel()` 默认分支（chat 端点 + OpenAI 格式），与老接口行为一致。
-- `controller/channel-test.go` 四处 `// [FORK]` —— `testChannel()` 开头算一次 `preview := channel.Id == 0`，
+- `controller/channel-test.go` 五处 `// [FORK]` —— `testChannel()` 开头算一次 `preview := channel.Id == 0`，
   据此跳过定价校验（网关 `model_ratio` 与平台成本表是两套数据，不跳过会让未配价模型全部测试失败）、
-  结算/消费日志（否则记到 channel 0），并在落 syslog 前把上游错误体里的明文 key 脱敏。
-- 错误 message 过 `sanitizeFetchModelsError`：上游错误体可能回显它收到的 Authorization。
+  结算/消费日志（否则记到 channel 0），并在调 `RelayErrorHandler` 前把上游响应体里的明文凭据
+  （含 Codex 的 OAuth token）替换成 `[REDACTED]`；`TestChannel` 的两个错误分支再对回给前端的
+  message 做一次同样的脱敏——这个接口只需要 `ChannelOperate`，上游回显 Key 等于绕开
+  `ChannelSensitiveWrite` 读到密钥。
+- 错误 message 过 `redactCredentialError`，脱敏集合由 `credentialSecrets()` 给出（秘钥本身 +
+  Codex 的 `access_token`/`id_token`/`refresh_token`），多 Key 渠道取上下文里本次实际下发的那把。
+  文本规则在 `redactCredentialText()` 里（原文 + QueryEscape + PathEscape 三种形式），
+  `redactCredentialError()` 只多一层「没替换到东西时原样返回原 error」——渠道测试要保留
+  `*common.Message` 的 `message_key`（前端靠它翻译），上游的 `sanitizeFetchModelsError()`
+  （`fetch_models` / 渠道余额）没这个需要，所以还是 `errors.New` 重包。
+
+  **上游那份 `sanitizeFetchModelsError()` 保持原样，fork 不改它**（它所在的
+  `controller/channel_upstream_update.go` 是上游高频改动的文件，为了一个无行为变化的
+  重构去碰它不值得）。代价是同一套替换规则存在两份等价实现：动了其中一份的语义要同步另一份。
 - `router/channel-router.go` 注册 `POST /test`，权限用 `authz.ChannelSensitiveWrite`（与 `POST /fetch_models` 一致）：
   两者都是「带鉴权头打管理员临时输入的 base_url 并回显上游错误」，对只有 `ChannelOperate` 的管理员
   等于一个有回显的内网探测能力。
@@ -314,7 +326,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
 | `router/channel-router.go` | 权限路由表插入 `POST /test`（1 处 `[FORK]`，用 `ChannelSensitiveWrite`） | 低，单行 |
 | `router/channel_router_test.go` | 同上路由的权限断言 | 低 |
-| `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志、错误日志脱敏（4 处 `[FORK]`） | 中，逐模型测试热路径 |
+| `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志、错误日志脱敏，`TestChannel` 回前端前脱敏（5 处 `[FORK]`） | 中，逐模型测试热路径 |
 | `controller/channel.go` | `FetchModels` 的取 key 逻辑改为调 `credentialKeyFor`（1 处 `[FORK]`） | 低，单行 |
 | `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态用例（跳过定价/消费日志、日志脱敏） | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
