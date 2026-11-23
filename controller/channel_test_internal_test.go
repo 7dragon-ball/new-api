@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -657,4 +658,46 @@ func TestSavedChannelStillChecksPrice(t *testing.T) {
 
 	require.NotNil(t, result.localErr, "已保存渠道未定价时必须失败")
 	assert.Zero(t, hits, "定价校验在发请求之前，上游不应被调用")
+}
+
+// GET /api/channel/test/:id 只要有 ChannelOperate 权限就能调，而 TestChannel 把
+// localErr / newAPIError 的文本原样回给前端。上游 200 但响应体回显 Key 时，等于绕开
+// 查看渠道密钥所需的 ChannelSensitiveWrite，所以旧接口也得在返回前脱敏。
+func TestTestChannelRedactsSavedChannelKey(t *testing.T) {
+	previewTestEnv(t)
+	pricedModel(t, "echo-model")
+	const savedKey = "sk-saved-secret"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid api key: ` + savedKey + `"}}`))
+	}))
+	defer upstream.Close()
+
+	base := upstream.URL
+	ch := &model.Channel{
+		Name:    "saved-echo",
+		Type:    constant.ChannelTypeOpenAI,
+		Key:     savedKey,
+		BaseURL: &base,
+		Models:  "echo-model",
+		Group:   "default",
+		Status:  common.ChannelStatusEnabled,
+	}
+	require.NoError(t, model.DB.Create(ch).Error)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel/test/"+strconv.Itoa(ch.Id), nil)
+	ctx.Set("id", 7)
+	ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(ch.Id)}}
+	TestChannel(ctx)
+
+	var parsed map[string]any
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &parsed))
+	message, _ := parsed["message"].(string)
+	assert.Equal(t, false, parsed["success"])
+	require.NotEmpty(t, message, "上游 200 带 error 体时必须回失败")
+	assert.Contains(t, message, "[REDACTED]")
+	assert.NotContains(t, message, savedKey, "只有 ChannelOperate 权限的管理员不该拿到明文 Key")
 }

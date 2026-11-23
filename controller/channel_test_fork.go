@@ -142,6 +142,18 @@ func credentialSecrets(channelType int, key string) []string {
 	return append(secrets, oauthKey.AccessToken, oauthKey.IDToken, oauthKey.RefreshToken)
 }
 
+// selectedCredentialSecrets 用本次实际下发的 Key 组装脱敏集合。testChannel 会把选中的
+// 那一把写进 result.context（SetupContextForSelectedChannel），取不到时退回 channel.Key。
+func selectedCredentialSecrets(result testResult, channel *model.Channel) []string {
+	key := channel.Key
+	if result.context != nil {
+		if selected := common.GetContextKeyString(result.context, constant.ContextKeyChannelKey); selected != "" {
+			key = selected
+		}
+	}
+	return credentialSecrets(channel.Type, key)
+}
+
 // redactResponseBody 把上游响应体里的凭据替换掉再回填。
 //
 // RelayErrorHandler 在「body 是 JSON 但取不到 error message」时会直接把原始 body 写进

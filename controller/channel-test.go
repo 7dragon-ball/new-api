@@ -938,10 +938,15 @@ func TestChannel(c *gin.Context) {
 		requestCtx = c.Request.Context()
 	}
 	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	// [FORK] 这个接口只需要 ChannelOperate 权限，而 testChannel 会把上游回显的凭据带进
+	// localErr / newAPIError（例如 200 响应体里就是「invalid api key: sk-xxx」），回
+	// 给前端等于绕开查看渠道密钥所需 ChannelSensitiveWrite。脱敏集合用本次实际下发的
+	// 那把 Key，多 Key 渠道同一条口径。
+	secrets := selectedCredentialSecrets(result, channel)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
-			"message": result.localErr.Error(),
+			"message": redactCredentialError(result.localErr, secrets).Error(),
 			"time":    0.0,
 		}
 		if result.newAPIError != nil {
@@ -957,7 +962,7 @@ func TestChannel(c *gin.Context) {
 	if result.newAPIError != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success":    false,
-			"message":    result.newAPIError.Error(),
+			"message":    redactCredentialError(result.newAPIError, secrets).Error(),
 			"time":       consumedTime,
 			"error_code": result.newAPIError.GetErrorCode(),
 		})
