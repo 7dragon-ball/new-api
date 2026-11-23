@@ -152,6 +152,85 @@ func TestDeleteAbilityRejectsMissingRelation(t *testing.T) {
 	assert.ErrorIs(t, DeleteAbility("m", 999999, "default"), ErrAbilityChannelNotFound)
 }
 
+// [FORK] 回归：abilities 行缺失（重建的中间态）时，DELETE 仍以 channels.models 为权威
+// 移除关系。否则前端拿到 404，而渠道实际还在被选路。
+func TestDeleteAbilityRemovesModelWhenAbilityRowMissing(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	previousMemoryCache := common.MemoryCacheEnabled
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	common.MemoryCacheEnabled = true
+
+	channel := &Channel{Name: "ability-del-orphan", Key: "k", Models: "keep-me,drop-me", Group: "default", Status: common.ChannelStatusEnabled}
+	require.NoError(t, DB.Create(channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	InitChannelCache()
+
+	// 模拟 UpdateAbilities / FixAbility 的中间态：abilities 行已删，channels.models 未改。
+	require.NoError(t, DB.Where("channel_id = ? AND model = ?", channel.Id, "drop-me").Delete(&Ability{}).Error)
+
+	require.NoError(t, DeleteAbility("drop-me", channel.Id, "default"))
+
+	stored, err := GetChannelById(channel.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"keep-me"}, stored.GetModels())
+
+	InitChannelCache()
+	picked, err := GetRandomSatisfiedChannel("default", "drop-me", 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, picked, "the removed relation must no longer be routable")
+}
+
+// [FORK] 回归：abilities 里有一条孤儿行、但 channels.models 没有该模型时，新增不能被
+// 「已有关系」挡住（存在性以 channels.models 为准）。
+func TestAddAbilityIgnoresOrphanAbilityRow(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	channel := &Channel{Name: "ability-add-orphan", Key: "k", Models: "other-model", Group: "default", Status: common.ChannelStatusEnabled}
+	require.NoError(t, DB.Create(channel).Error)
+	orphanPriority := int64(5)
+	require.NoError(t, DB.Create(&Ability{Group: "default", Model: "ghost-model", ChannelId: channel.Id, Enabled: true, Priority: &orphanPriority}).Error)
+
+	require.NoError(t, AddAbility("ghost-model", channel.Id, "default", "", 2))
+
+	stored, err := GetChannelById(channel.Id, false)
+	require.NoError(t, err)
+	assert.Contains(t, stored.GetModels(), "ghost-model")
+	var row Ability
+	require.NoError(t, DB.Where(commonGroupCol+" = ? AND model = ? AND channel_id = ?", "default", "ghost-model", channel.Id).First(&row).Error)
+	require.NotNil(t, row.Priority)
+	assert.Equal(t, int64(2), *row.Priority)
+}
+
+// [FORK] 回归：channels.group 带空白 token（"default, vip"）时，三个写接口都按渠道
+// 原始 token 定位同一条关系，且 model 首尾空白被归一化。
+func TestAbilityWritesResolvePaddedGroupToken(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	channel := &Channel{Name: "ability-multi-group", Key: "k", Group: "default, vip", Status: common.ChannelStatusEnabled}
+	require.NoError(t, DB.Create(channel).Error)
+
+	require.NoError(t, AddAbility(" vip-model ", channel.Id, "vip", "", 2))
+	// abilities 行的 group 是 channels.group 的原始 token，不是 trim 过的 "vip"。
+	var added Ability
+	require.NoError(t, DB.Where(commonGroupCol+" = ? AND model = ? AND channel_id = ?", " vip", "vip-model", channel.Id).First(&added).Error)
+
+	require.NoError(t, UpdateAbilityPriority("vip-model", channel.Id, "vip", 6))
+	var updated Ability
+	require.NoError(t, DB.Where(commonGroupCol+" = ? AND model = ? AND channel_id = ?", " vip", "vip-model", channel.Id).First(&updated).Error)
+	require.NotNil(t, updated.Priority)
+	assert.Equal(t, int64(6), *updated.Priority)
+
+	// models 是渠道级列，两个 group 都拿到了这一行（既定边界）。
+	var count int64
+	require.NoError(t, DB.Model(&Ability{}).Where("model = ? AND channel_id = ?", "vip-model", channel.Id).Count(&count).Error)
+	assert.Equal(t, int64(2), count)
+
+	require.NoError(t, DeleteAbility("vip-model", channel.Id, "vip"))
+	stored, err := GetChannelById(channel.Id, false)
+	require.NoError(t, err)
+	assert.NotContains(t, stored.GetModels(), "vip-model")
+	require.NoError(t, DB.Model(&Ability{}).Where("model = ? AND channel_id = ?", "vip-model", channel.Id).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
 // [FORK] 写后选路立即看到新供应关系（缓存路径的候选来自 channels.models）。
 func TestAddAbilityIsRoutableAfterCacheRefresh(t *testing.T) {
 	useScheduledChannelDatabase(t)

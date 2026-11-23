@@ -374,6 +374,11 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   权重 / 模型列表 / 批量打标签 / 上游模型同步」任一动作清零。现在 `DELETE` 前按 `(group, model)`
   记下现有 priority，重建时还原；`enabled` / `weight` / `tag` 仍按当前渠道状态重建——它们本来就该
   跟着渠道走。模型列表里删掉的模型不会残留在 `kept` 里，重建后该行消失，维持原语义。
+- **重建与单条优先级写入互斥**。`UpdateAbilities` 是「读旧 priority → 删 → 插」的读改写，
+  `UpdateAbilityPriority` 是单条 `UPDATE`：不加锁时重建会用读到的旧值覆盖并发的写入（接口返回 200、
+  优先级静默丢失），或在行被删掉的那一瞬间让写入影响 0 行、误报 404。现在两条路径都在事务里先
+  `SELECT ... FOR UPDATE` 渠道行，锁序与 `AddAbility` / `DeleteAbility` 统一为「channel 行 → abilities 行」。
+  SQLite 不支持该语法（`lockForUpdate` 跳过），靠它的单写者模型兜底。
 - **已知取舍（既定边界，不是待修 bug）：保留是无条件的，所以「改渠道级 priority」不生效。**
   上述还原不看 priority 值，只要该 `(group, model)` 行存在就沿用它的旧值。于是只有一种情况下选路
   看不到渠道优先级的改动：**渠道建好之后**再改 `channels.priority`。触发它的入口是
@@ -413,7 +418,12 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 - **行锁**：读写 `models` 列是读改写，两个并发新增不加锁会丢一条。两条路径都先
   `lockForUpdate` 锁住渠道行，并在锁内完成去重、写列与重建。
 - **group 用渠道原始 token**：`UpdateAbilities` 按 `channels.group` 的原始 token 写 group 列
-  （不 trim），所以校验与回写都用原始 token，否则刚重建出来的行查不到。
+  （不 trim），所以校验与回写都用原始 token，否则刚重建出来的行查不到。`PUT
+  /api/channel/ability/priority` 的 group/model 也走同一个 `resolveAbilityRelation`，三个
+  写接口对同一个逻辑关系用同一套口径。
+- **关系是否存在只看 `channels.models`**：`abilities` 行可能正处在「已删、`models` 未改」的
+  重建中间态。新增按 `models` 判重（孤儿 abilities 行不挡 400），删除也按 `models` 判存在
+  （行缺失时仍摘掉模型并重建），所以 DELETE 不会对一条仍在选路的关系回 404。
 - **重复新增返回 400**（`The supply relation already exists`），不静默成功；删除不存在的行返回 404。
 - **已知边界：单条增删只对单 group 渠道语义正确，多 group 渠道会连带影响其它 group。**
   `channels.models` 是渠道级而不是 group 级的列，`abilities` 又按它重建，所以两处都不是 group 级：

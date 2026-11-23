@@ -38,7 +38,9 @@ func UpdateAbilityPriority(c *gin.Context) {
 		switch {
 		case errors.Is(err, model.ErrAbilityPriorityRange):
 			common.ApiErrorStatus(c, http.StatusBadRequest, err)
-		case errors.Is(err, model.ErrAbilityPriorityNotFound):
+		case errors.Is(err, model.ErrAbilityPriorityNotFound),
+			errors.Is(err, model.ErrAbilityChannelNotFound),
+			errors.Is(err, model.ErrAbilityGroupNotFound):
 			common.ApiErrorStatus(c, http.StatusNotFound, err)
 		default:
 			common.ApiError(c, err)

@@ -26,22 +26,41 @@ func UpdateAbilityPriority(modelName string, channelId int, group string, priori
 	if group == "" {
 		group = "default"
 	}
-	query := func() *gorm.DB {
-		return DB.Model(&Ability{}).Where(commonGroupCol+" = ? AND model = ? AND channel_id = ?", group, modelName, channelId)
-	}
-	result := query().Update("priority", priority)
-	if result.Error != nil {
-		return result.Error
-	}
-	// 未变化的写入在 MySQL 上同样报 0 行，所以先补一次计数再回答「不存在」。
-	if result.RowsAffected == 0 {
-		var count int64
-		if err := query().Count(&count).Error; err != nil {
+	// [FORK] 先锁渠道行再写 abilities 行，与 UpdateAbilities 的重建串行化（锁序
+	// 「channel 行 → abilities 行」，与 AddAbility / DeleteAbility 一致）。否则重建的
+	// 「读旧值 → 删 → 插」会把这次写入覆盖回旧值，或在删行的瞬间让本次 UPDATE 影响
+	// 0 行、误报 404。关系定位与那两个入口共用 resolveAbilityRelation：group 用渠道
+	// 原始 token、model trim，否则多 group 渠道或带空白的模型名会查不到同一行。
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		channel, err := lockAbilityChannel(tx, channelId)
+		if err != nil {
 			return err
 		}
-		if count == 0 {
-			return ErrAbilityPriorityNotFound
+		rawGroup, resolvedModel, ok := resolveAbilityRelation(channel, group, modelName)
+		if !ok {
+			return ErrAbilityGroupNotFound
 		}
+		query := func() *gorm.DB {
+			return abilityRowQuery(tx, rawGroup, resolvedModel, channelId)
+		}
+		result := query().Update("priority", priority)
+		if result.Error != nil {
+			return result.Error
+		}
+		// 未变化的写入在 MySQL 上同样报 0 行，所以先补一次计数再回答「不存在」。
+		if result.RowsAffected == 0 {
+			var count int64
+			if err := query().Count(&count).Error; err != nil {
+				return err
+			}
+			if count == 0 {
+				return ErrAbilityPriorityNotFound
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	BumpSyncTopic(SyncTopicChannels)
 	return nil

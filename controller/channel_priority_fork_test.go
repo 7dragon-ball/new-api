@@ -77,6 +77,10 @@ func TestUpdateAbilityPriorityEndpoint(t *testing.T) {
 	missing := call(fmt.Sprintf(`{"model":"missing-model","channel_id":%d,"priority":3}`, channel.Id))
 	assert.Equal(t, http.StatusNotFound, missing.Code)
 	assert.Contains(t, missing.Body.String(), `"message_key":"The supply relation does not exist"`)
+	// 渠道不存在与「关系不存在」同为 404，与 Add/Delete 同口径。
+	missingChannel := call(fmt.Sprintf(`{"model":"priority-model","channel_id":%d,"priority":3}`, channel.Id+1000))
+	assert.Equal(t, http.StatusNotFound, missingChannel.Code)
+	assert.Contains(t, missingChannel.Body.String(), `"message_key":"Channel does not exist"`)
 	outOfRange := call(fmt.Sprintf(`{"model":"priority-model","channel_id":%d,"priority":1000}`, channel.Id))
 	assert.Equal(t, http.StatusBadRequest, outOfRange.Code)
 	assert.Contains(t, outOfRange.Body.String(), `"message_key":"Priority must be between 1 and 999"`)

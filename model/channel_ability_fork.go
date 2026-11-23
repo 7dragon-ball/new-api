@@ -29,29 +29,23 @@ func AddAbility(modelName string, channelId int, group string, upstreamModel str
 	if priority < minAbilityPriority || priority > maxAbilityPriority {
 		return ErrAbilityPriorityRange
 	}
-	modelName = strings.TrimSpace(modelName)
 	upstreamModel = strings.TrimSpace(upstreamModel)
-	if group == "" {
-		group = "default"
-	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		channel, err := lockAbilityChannel(tx, channelId)
 		if err != nil {
 			return err
 		}
-		rawGroup, ok := resolveAbilityGroup(channel, group)
+		rawGroup, resolvedModel, ok := resolveAbilityRelation(channel, group, modelName)
 		if !ok {
 			return ErrAbilityGroupNotFound
 		}
-		var count int64
-		if err := abilityRowQuery(tx, rawGroup, modelName, channelId).Count(&count).Error; err != nil {
-			return err
-		}
 		// 重复新增不静默成功：前端靠这条 400 判断「这条供应关系已经有了」。
-		if count > 0 {
+		// 存在性看 channels.models，不看 abilities 行：后者是重建产物，可能留下
+		// 孤儿行（models 里没有该模型），用行数判断会把新增挡在 400。
+		if channelHasAbilityModel(channel, resolvedModel) {
 			return ErrAbilityAlreadyExists
 		}
-		if err := applyAbilityChannelModel(tx, channel, modelName, upstreamModel, true); err != nil {
+		if err := applyAbilityChannelModel(tx, channel, resolvedModel, upstreamModel, true); err != nil {
 			return err
 		}
 		if err := channel.UpdateAbilities(tx); err != nil {
@@ -59,13 +53,14 @@ func AddAbility(modelName string, channelId int, group string, upstreamModel str
 		}
 		// UpdateAbilities 给新行的 priority 是 channel.Priority，这里改成调用方要求的值
 		// （缺省 1）。先确认重建后确实有这一行，避免把「模型列没写进去」当成成功。
-		if err := abilityRowQuery(tx, rawGroup, modelName, channelId).Count(&count).Error; err != nil {
+		var count int64
+		if err := abilityRowQuery(tx, rawGroup, resolvedModel, channelId).Count(&count).Error; err != nil {
 			return err
 		}
 		if count == 0 {
 			return ErrAbilityPriorityNotFound
 		}
-		return abilityRowQuery(tx, rawGroup, modelName, channelId).Update("priority", priority).Error
+		return abilityRowQuery(tx, rawGroup, resolvedModel, channelId).Update("priority", priority).Error
 	})
 	if err != nil {
 		return err
@@ -80,27 +75,22 @@ func AddAbility(modelName string, channelId int, group string, upstreamModel str
 // 已知边界：channels.models 是渠道级而不是 group 级的列，多 group 渠道删一条会
 // 连带移除其它 group 下的同名行——这与「在渠道接入改模型清单」的行为一致。
 func DeleteAbility(modelName string, channelId int, group string) error {
-	modelName = strings.TrimSpace(modelName)
-	if group == "" {
-		group = "default"
-	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		channel, err := lockAbilityChannel(tx, channelId)
 		if err != nil {
 			return err
 		}
-		rawGroup, ok := resolveAbilityGroup(channel, group)
+		_, resolvedModel, ok := resolveAbilityRelation(channel, group, modelName)
 		if !ok {
 			return ErrAbilityGroupNotFound
 		}
-		var existing Ability
-		if err := abilityRowQuery(tx, rawGroup, modelName, channelId).First(&existing).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrAbilityPriorityNotFound
-			}
-			return err
+		// 存在性同样看 channels.models：abilities 行可能正处在「已删、models 未改」
+		// 的重建中间态，用它判断会让一条仍在选路的关系删不掉，前端拿到 404 但渠道
+		// 仍被选路。模型不在 models 里就说明这条关系本来就不存在。
+		if !channelHasAbilityModel(channel, resolvedModel) {
+			return ErrAbilityPriorityNotFound
 		}
-		if err := applyAbilityChannelModel(tx, channel, modelName, "", false); err != nil {
+		if err := applyAbilityChannelModel(tx, channel, resolvedModel, "", false); err != nil {
 			return err
 		}
 		return channel.UpdateAbilities(tx)
@@ -129,6 +119,33 @@ func lockAbilityChannel(tx *gorm.DB, channelId int) (*Channel, error) {
 		return nil, err
 	}
 	return &channel, nil
+}
+
+// [FORK] 三个写接口（新增 / 删除 / 改优先级）共用的关系定位：统一 group 缺省值、
+// 渠道原始 group token 与 model 的空白归一化。
+//
+// abilities.group 写的是 channels.group 的原始 token（UpdateAbilities 不 trim），
+// abilities.model 写的是 trim 过的模型名，所以三个入口必须用同一套口径，否则同一个
+// 逻辑关系在不同接口里有的能查到、有的查不到（例如 channels.group = "default, vip"
+// 时原始 token 是 " vip"）。
+func resolveAbilityRelation(channel *Channel, group, modelName string) (rawGroup string, resolvedModel string, ok bool) {
+	if group == "" {
+		group = "default"
+	}
+	rawGroup, ok = resolveAbilityGroup(channel, group)
+	return rawGroup, strings.TrimSpace(modelName), ok
+}
+
+// [FORK] 渠道是否供应某个模型。判据只看 channels.models：缓存选路的候选列表由这一列
+// 派生，abilities 只是它的重建产物，可能在重建过程中短暂缺失。用 abilities 行判存在性
+// 会让 DELETE 删不掉一条仍在选路的关系，也会让新增被一条孤儿行挡住。
+func channelHasAbilityModel(channel *Channel, modelName string) bool {
+	for _, name := range channel.GetModels() {
+		if strings.TrimSpace(name) == modelName {
+			return true
+		}
+	}
+	return false
 }
 
 // [FORK] 在渠道的 group 列表里找到与调用方给定 group 对得上的原始 token。

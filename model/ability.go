@@ -285,6 +285,18 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 		}()
 	}
 
+	// [FORK] 重建是「读旧 priority → 删 → 插」的读改写，先锁住渠道行把它与单条优先级
+	// 写入串行化：UpdateAbilityPriority 走同一把锁，否则两者交错时重建会用读到的旧值
+	// 覆盖掉这次写入，或在行被删掉的那一瞬间让写入影响 0 行、误报 404。锁序统一为
+	// 「channel 行 → abilities 行」，与 AddAbility / DeleteAbility 一致。渠道正在被删除时
+	// 锁不到行，此时照常重建（渠道删除会连带删掉 abilities，不是本函数的职责）。
+	if err := lockForUpdate(tx).Select("id").Where("id = ?", channel.Id).Find(&Channel{}).Error; err != nil {
+		if isNewTx {
+			tx.Rollback()
+		}
+		return err
+	}
+
 	// [FORK] 重建时整行保留该渠道已有 abilities 的 priority（按 group|model 匹配）。
 	//
 	// 为什么无条件保留：abilities.priority 是本 fork 的选路依据，而它可能来自模型上架页
