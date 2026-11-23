@@ -63,6 +63,8 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	if err != nil {
 		return err
 	}
+	// [FORK] 身份快照字段必须与 MAC、结构版本一起整份写入：漏写一个，读回的 UserBase
+	// 就多一个空字段，而 MAC 校验照旧通过。新增字段要接在 ARGV 末尾并同步 userCacheSchemaVersion。
 	const script = `
 local incoming = tonumber(ARGV[1])
 local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
@@ -84,7 +86,9 @@ redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
-  'CacheExpiresAt', ARGV[13], 'CacheMAC', ARGV[14])
+  'CacheExpiresAt', ARGV[13], 'CacheMAC', ARGV[14],
+  -- [FORK] 身份快照：日志写热路径直接读这两个字段，不再回查 users/department。
+  'DisplayName', ARGV[15], 'DepartmentName', ARGV[16])
 if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
 end
@@ -94,7 +98,7 @@ return 1`
 		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
 		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
-		user.CacheExpiresAt, mac,
+		user.CacheExpiresAt, mac, user.DisplayName, user.DepartmentName,
 	).Int()
 	if err != nil {
 		return err

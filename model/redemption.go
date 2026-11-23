@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
@@ -23,6 +24,11 @@ type Redemption struct {
 	UsedUserId   int            `json:"used_user_id"`
 	DeletedAt    gorm.DeletedAt `gorm:"index"`
 	ExpiredTime  int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	// [FORK] 兑换人姓名快照：兑换成功那一刻从 users 抄过来，用户被硬删后列表照样能显示
+	// 当时是谁兑的。TEXT 而不是 VARCHAR(64)：源列在 PG/SQLite 是 text、MySQL 是
+	// varchar(191)，收窄会让超长名字在兑换时以 22001 失败，连整笔兑换事务一起回滚。
+	UsedUsername    string `json:"used_username" gorm:"type:text"`
+	UsedDisplayName string `json:"used_display_name" gorm:"type:text"`
 }
 
 func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total int64, err error) {
@@ -158,15 +164,29 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
 			return errors.New("redemption code expired")
 		}
+		// tx.Model(&User{}) 自带 deleted_at IS NULL：用户被并发删掉时这里就拿到
+		// ErrRecordNotFound 并回滚整笔事务，不会留下「码已用掉但没人」的脏数据。
+		var redeemer struct {
+			Username    string
+			DisplayName string
+		}
+		if err := tx.Model(&User{}).
+			Select("username", "display_name").
+			Where("id = ?", userId).
+			Take(&redeemer).Error; err != nil {
+			return fmt.Errorf("load redeemer %d: %w", userId, err)
+		}
 		// Compare-and-swap on status: only the transaction that flips
 		// enabled -> used may credit quota, so a concurrent redeem of the
 		// same code loses here even without a row lock (e.g. on SQLite).
 		result := tx.Model(&Redemption{}).
 			Where("id = ? AND status = ?", redemption.Id, common.RedemptionCodeStatusEnabled).
 			Updates(map[string]any{
-				"redeemed_time": common.GetTimestamp(),
-				"status":        common.RedemptionCodeStatusUsed,
-				"used_user_id":  userId,
+				"redeemed_time":     common.GetTimestamp(),
+				"status":            common.RedemptionCodeStatusUsed,
+				"used_user_id":      userId,
+				"used_username":     redeemer.Username,
+				"used_display_name": redeemer.DisplayName,
 			})
 		if result.Error != nil {
 			return result.Error
