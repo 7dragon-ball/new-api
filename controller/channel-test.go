@@ -503,8 +503,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			// 换掉再交给它；之后的 err 已经是脱敏后的文本，外面不用再包一层。
 			// 多 Key 渠道 channel.Key 是整串，实际下发的只有 SetupContextForSelectedChannel
 			// 选中的那一把，脱敏得用上下文里那把。
-			selectedKey := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
-			httpResp.Body = redactResponseBody(httpResp.Body, credentialSecrets(channel.Type, selectedKey))
+			httpResp.Body = redactResponseBody(httpResp.Body, selectedCredentialSecrets(c, channel))
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -578,7 +577,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			Other:            other,
 		})
 	}
-	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	// [FORK] 成功响应体同样可能回显它收到的凭据（base_url 误配到回显服务或调试网关），
+	// 这条日志是那次 body 唯一落盘的地方，写之前按本次下发的 Key 脱敏。
+	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id,
+		redactCredentialText(string(respBody), selectedCredentialSecrets(c, channel))))
 	return testResult{
 		context:     c,
 		localErr:    nil,
@@ -942,7 +944,7 @@ func TestChannel(c *gin.Context) {
 	// localErr / newAPIError（例如 200 响应体里就是「invalid api key: sk-xxx」），回
 	// 给前端等于绕开查看渠道密钥所需 ChannelSensitiveWrite。脱敏集合用本次实际下发的
 	// 那把 Key，多 Key 渠道同一条口径。
-	secrets := selectedCredentialSecrets(result, channel)
+	secrets := selectedCredentialSecrets(result.context, channel)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,

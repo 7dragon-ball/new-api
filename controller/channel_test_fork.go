@@ -143,11 +143,11 @@ func credentialSecrets(channelType int, key string) []string {
 }
 
 // selectedCredentialSecrets 用本次实际下发的 Key 组装脱敏集合。testChannel 会把选中的
-// 那一把写进 result.context（SetupContextForSelectedChannel），取不到时退回 channel.Key。
-func selectedCredentialSecrets(result testResult, channel *model.Channel) []string {
+// 那一把写进上下文（SetupContextForSelectedChannel），取不到时退回 channel.Key。
+func selectedCredentialSecrets(c *gin.Context, channel *model.Channel) []string {
 	key := channel.Key
-	if result.context != nil {
-		if selected := common.GetContextKeyString(result.context, constant.ContextKeyChannelKey); selected != "" {
+	if c != nil {
+		if selected := common.GetContextKeyString(c, constant.ContextKeyChannelKey); selected != "" {
 			key = selected
 		}
 	}

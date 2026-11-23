@@ -399,6 +399,35 @@ func TestPreviewTestChannelRedactsKeyInErrorLog(t *testing.T) {
 	}
 }
 
+// 上游 200 且响应体回显凭据时，成功路径那一条 SysLog（"testing channel ... response"）
+// 是正文唯一落盘的地方；它不能写明文 Key。
+func TestPreviewTestChannelRedactsKeyInSuccessLog(t *testing.T) {
+	previewTestEnv(t)
+	const key = "sk-success-log-secret"
+	// 必须能被 adaptor 解析成合法回复（否则先被 validateTestResponseBody 拦下），
+	// 同时把 Key 带进 body 模拟回显。
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","echo":"` + key + `","choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	var logged bytes.Buffer
+	previousWriter := gin.DefaultWriter
+	gin.DefaultWriter = &logged
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+	base := upstream.URL
+	ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: key, BaseURL: &base}
+	result := testChannel(t.Context(), ch, 7, "gpt-4o-mini", "", false)
+
+	require.Nil(t, result.localErr)
+	require.Nil(t, result.newAPIError)
+	require.Contains(t, logged.String(), "testing channel", "本用例只对成功路径那条 SysLog 有效")
+	assert.Contains(t, logged.String(), "[REDACTED]")
+	assert.NotContains(t, logged.String(), key, "容器日志里不得出现明文密钥")
+}
+
 // 响应体读到一半失败时不能 fail-open：拿到的那段 raw 同样可能是含凭据的原文。
 func TestRedactResponseBodyRedactsPartialBodyOnReadError(t *testing.T) {
 	body := redactResponseBody(&failingReadCloser{data: "token=sk-partial"}, []string{"sk-partial"})
