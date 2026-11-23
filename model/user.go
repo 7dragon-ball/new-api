@@ -134,6 +134,9 @@ func (user *User) ToBaseUser() *UserBase {
 		Status:      user.Status,
 		Role:        user.Role,
 		Username:    user.Username,
+		DisplayName: user.DisplayName,
+		// 部门名不在这里取（User 只有 id），由 baseUserWithDepartment 补。
+		// 也刻意不复制 DepartmentId：UserBase 靠结构体相等判断缓存一致性，指针字段会永远判不等。
 		Setting:     user.Setting,
 		Email:       user.Email,
 		AuthVersion: user.AuthVersion,

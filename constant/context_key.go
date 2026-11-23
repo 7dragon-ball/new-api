@@ -21,6 +21,8 @@ const (
 	ContextKeyTokenModelLimit        ContextKey = "token_model_limit"
 	ContextKeyTokenCrossGroupRetry   ContextKey = "token_cross_group_retry"
 	ContextKeyTokenAutoGroups        ContextKey = "token_auto_groups"
+	// [FORK] 秘钥使用方（tokens.owner）快照来源，写日志时直接读，不回查表。
+	ContextKeyTokenOwner ContextKey = "token_owner"
 
 	/* channel related keys */
 	ContextKeyChannelId                ContextKey = "channel_id"
@@ -39,6 +41,8 @@ const (
 	ContextKeyChannelIsMultiKey        ContextKey = "channel_is_multi_key"
 	ContextKeyChannelMultiKeyIndex     ContextKey = "channel_multi_key_index"
 	ContextKeyChannelKey               ContextKey = "channel_key"
+	// [FORK] 供应商名（= channels.tag）快照，写日志时直接读，不回查 channels 表。
+	ContextKeyChannelTag ContextKey = "channel_tag"
 	// ContextKeyProviderPlugin holds the jsplugin.PinnedPlugin whose relay
 	// routes serve this request on a task plugin channel.
 	ContextKeyProviderPlugin ContextKey = "provider_plugin"
@@ -61,6 +65,9 @@ const (
 	ContextKeyUserGroup   ContextKey = "user_group"
 	ContextKeyUsingGroup  ContextKey = "group"
 	ContextKeyUserName    ContextKey = "username"
+	// [FORK] 写日志/用量时直接读这两个键做身份快照，不回查 users 或 department 表。
+	ContextKeyUserDisplayName    ContextKey = "user_display_name"
+	ContextKeyUserDepartmentName ContextKey = "user_department_name"
 
 	ContextKeyLocalCountTokens ContextKey = "local_count_tokens"
 

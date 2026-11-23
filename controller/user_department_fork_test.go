@@ -9,9 +9,12 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -219,4 +222,50 @@ func TestUpdateUserDepartmentAllowsLowerRoleTarget(t *testing.T) {
 		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
 		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
 	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+}
+
+// 回归：改归属成功后必须刷新鉴权缓存。部门改动不动 auth_version，缓存不会自己失效，
+// 不刷新就有最多一个 TTL 的旧部门名；这期间 WriteContext 写出的日志与 quota_data
+// 快照会永久落在旧部门上（quota_data 的聚合键含 department，还会把同一用户拆成两行）。
+func TestUpdateUserDepartmentRefreshesAuthCache(t *testing.T) {
+	target, dept := setupDepartmentAssignTest(t)
+	server := miniredis.RunT(t)
+	previousRedisEnabled, previousRDB := common.RedisEnabled, common.RDB
+	common.RedisEnabled = true
+	common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() {
+		_ = common.RDB.Close()
+		common.RedisEnabled, common.RDB = previousRedisEnabled, previousRDB
+	})
+	// 先灌一份「改归属前」的缓存：此时用户没有部门。
+	cached, err := model.GetUserCache(target.Id)
+	require.NoError(t, err)
+	require.Empty(t, cached.DepartmentName)
+	require.NotEmpty(t, server.Keys(), "前提：缓存确实命中 Redis，否则本用例测不到陈旧快照")
+
+	_, resp := departmentRequest(t, http.MethodPut, "/api/user/"+strconv.Itoa(target.Id)+"/department",
+		`{"department_id":`+strconv.Itoa(dept.Id)+`}`,
+		gin.Params{{Key: "id", Value: strconv.Itoa(target.Id)}}, UpdateUserDepartment)
+	require.Equal(t, true, resp["success"], "message=%v", resp["message"])
+
+	cached, err = model.GetUserCache(target.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "技术部", cached.DepartmentName, "改归属后缓存里必须是新部门，否则后续日志快照会记成旧部门")
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	cached.WriteContext(c)
+	assert.Equal(t, "技术部", common.GetContextKeyString(c, constant.ContextKeyUserDepartmentName),
+		"写日志/用量的身份快照直接读上下文，这里必须是新部门")
+
+	// 快照链路端到端：紧接着写出的日志行必须是新部门。
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	previousLogConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = true
+	t.Cleanup(func() { common.LogConsumeEnabled = previousLogConsume })
+	model.RecordConsumeLog(c, target.Id, model.RecordConsumeLogParams{
+		ModelName: "dept-snapshot", Quota: 1, Group: "default", Other: model.NewLogOther(),
+	})
+	var written model.Log
+	require.NoError(t, model.LOG_DB.Order("id desc").First(&written).Error)
+	assert.Equal(t, "技术部", written.Department, "日志快照一旦写入无法回填，必须是新部门")
 }

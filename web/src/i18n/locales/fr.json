@@ -7063,6 +7063,7 @@
     "Type *": "Type *",
     "Type <username/> to confirm": "Saisissez <username/> pour confirmer",
     "Type a command or search...": "Tapez une commande ou recherchez...",
+    "type and model are required": "Le type et le modèle sont obligatoires",
     "Type the confirmation text here": "Saisissez ici le texte de confirmation",
     "Type-Specific Settings": "Paramètres spécifiques au type",
     "Type:": "Type :",

@@ -70,13 +70,24 @@ type Log struct {
 	UseTime           int    `json:"use_time" gorm:"default:0"`
 	IsStream          bool   `json:"is_stream"`
 	ChannelId         int    `json:"channel" gorm:"index"`
-	ChannelName       string `json:"channel_name" gorm:"->"`
 	TokenId           int    `json:"token_id" gorm:"default:0;index"`
 	Group             string `json:"group" gorm:"index"`
 	Ip                string `json:"ip" gorm:"index;default:''"`
 	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
 	UpstreamRequestId string `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
 	Other             string `json:"other"`
+	// [FORK] 身份快照：写入时从鉴权上下文抄一份，用户/渠道被删后仍能显示当时的名字。
+	// 一律 type:text（比所有源列都宽）：快照列比源列窄会让超长名字的 INSERT 以
+	// 22001 失败，而 createLog 只记一行错误——表现为日志静默丢失。
+	DisplayName string `json:"display_name" gorm:"type:text"`
+	Department  string `json:"department" gorm:"type:text"`
+	// [FORK] 渠道名快照：上游标了 `gorm:"->"`（永不写入），而渠道是硬删除，
+	// 删掉后只能靠这份快照。
+	ChannelName string `json:"channel_name" gorm:"type:text"`
+	// [FORK] 供应商名（channels.tag）快照，理由同 ChannelName。
+	ChannelTag string `json:"channel_tag" gorm:"type:text"`
+	// [FORK] 秘钥使用方（tokens.owner）快照：删用户会 Unscoped 连带硬删其令牌。
+	TokenOwner string `json:"token_owner" gorm:"type:text"`
 }
 
 // don't use iota, avoid change log type value
@@ -102,6 +113,54 @@ func createLog(log *Log) error {
 	return LOG_DB.Create(log).Error
 }
 
+// identitySnapshot 从鉴权上下文取身份快照（UserBase.WriteContext 写入）。
+// 拿不到就留空，不回查数据库——这是热路径。
+func identitySnapshot(c *gin.Context) (displayName, departmentName string) {
+	if c == nil {
+		return "", ""
+	}
+	return c.GetString(string(constant.ContextKeyUserDisplayName)),
+		c.GetString(string(constant.ContextKeyUserDepartmentName))
+}
+
+// identitySnapshotForUser 是没有请求上下文的路径（系统日志、任务计费）的快照来源：
+// 按 userId 走用户缓存，不查库；用户已删则留空。
+func identitySnapshotForUser(userId int) (displayName, departmentName string) {
+	if userId <= 0 {
+		return "", ""
+	}
+	base, err := GetUserCache(userId)
+	if err != nil || base == nil {
+		return "", ""
+	}
+	return base.DisplayName, base.DepartmentName
+}
+
+// channelTagSnapshot 取供应商名（channels.tag），理由同 channelNameSnapshot。
+func channelTagSnapshot(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	return c.GetString(string(constant.ContextKeyChannelTag))
+}
+
+// tokenOwnerSnapshot 取秘钥使用方（tokens.owner），由鉴权中间件写入上下文。
+func tokenOwnerSnapshot(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	return c.GetString(string(constant.ContextKeyTokenOwner))
+}
+
+// channelNameSnapshot 取分发阶段写进上下文的渠道名。渠道是硬删除，删掉后
+// channels 里就查不到名字了，所以只能写入时快照。
+func channelNameSnapshot(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	return c.GetString(string(constant.ContextKeyChannelName))
+}
+
 func clickHouseLogOrder(prefix string) string {
 	return prefix + "created_at desc, " + prefix + "request_id desc"
 }
@@ -112,10 +171,18 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 	}
 }
 
+// formatUserLog 抹掉普通用户不该看到的字段：渠道名 / 供应商 / 使用方都是管理侧口径。
+// 用户日志列表与用户导出共用它，两条读取路径的口径才不会分叉。
+func formatUserLog(log *Log) {
+	log.ChannelName = ""
+	log.ChannelTag = ""
+	log.TokenOwner = ""
+	log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+}
+
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
-		logs[i].ChannelName = ""
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
+		formatUserLog(logs[i])
 	}
 	assignDisplayLogIds(logs, startIdx)
 }
@@ -152,13 +219,17 @@ func RecordLog(userId int, logType int, content *common.Message) {
 	}
 	username, _ := GetUsernameById(userId, false)
 	other := NewLogOther()
+	// 系统日志（登录、注册奖励、管理操作等）没有请求上下文，快照按 userId 取。
+	displayName, departmentName := identitySnapshotForUser(userId)
 	log := &Log{
-		UserId:    userId,
-		Username:  username,
-		CreatedAt: common.GetTimestamp(),
-		Type:      logType,
-		Content:   other.setContent([]*common.Message{content}),
-		Other:     other.JSONString(),
+		UserId:      userId,
+		Username:    username,
+		DisplayName: displayName,
+		Department:  departmentName,
+		CreatedAt:   common.GetTimestamp(),
+		Type:        logType,
+		Content:     other.setContent([]*common.Message{content}),
+		Other:       other.JSONString(),
 	}
 	err := createLog(log)
 	if err != nil {
@@ -194,6 +265,10 @@ func RecordLogWithAdminInfo(userId int, logType int, content string, adminInfo *
 	}
 	if len(request) > 0 && request[0] != nil {
 		log.RequestId = request[0].GetString(common.RequestIdKey)
+		// 快照是「当前登录者」的；管理员代他人写日志时对不上目标用户，就不写，也不回查。
+		if request[0].GetInt("id") == userId {
+			log.DisplayName, log.Department = identitySnapshot(request[0])
+		}
 	}
 	if adminInfo != nil || operation != nil {
 		data, err := common.Marshal(AuditOther{AdminInfo: adminInfo, Op: operation})
@@ -261,14 +336,18 @@ func RecordTopupLog(userId int, content *common.Message, callerIp string, paymen
 		"callback_payment_method": callbackPaymentMethod,
 		"version":                 common.Version,
 	})
+	// 充值回调由支付网关驱动，没有请求上下文，快照按 userId 取。
+	displayName, departmentName := identitySnapshotForUser(userId)
 	log := &Log{
-		UserId:    userId,
-		Username:  username,
-		CreatedAt: common.GetTimestamp(),
-		Type:      LogTypeTopup,
-		Content:   other.setContent([]*common.Message{content}),
-		Ip:        callerIp,
-		Other:     other.JSONString(),
+		UserId:      userId,
+		Username:    username,
+		DisplayName: displayName,
+		Department:  departmentName,
+		CreatedAt:   common.GetTimestamp(),
+		Type:        LogTypeTopup,
+		Content:     other.setContent([]*common.Message{content}),
+		Ip:          callerIp,
+		Other:       other.JSONString(),
 	}
 	err := createLog(log)
 	if err != nil {
@@ -279,7 +358,12 @@ func RecordTopupLog(userId int, content *common.Message, callerIp string, paymen
 func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string, tokenName string, content string, tokenId int, useTimeSeconds int,
 	isStream bool, group string, other *LogOther) {
 	logger.LogInfo(c, common.LogText("record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s, content=%s", userId, channelId, modelName, tokenName, common.LocalLogPreview(content)))
-	username := c.GetString("username")
+	// 三列身份都从鉴权上下文取（`UserBase.WriteContext` 写的），写日志时零查询。
+	username := c.GetString(string(constant.ContextKeyUserName))
+	identityDisplayName, identityDepartment := identitySnapshot(c)
+	channelName := channelNameSnapshot(c)
+	channelTag := channelTagSnapshot(c)
+	tokenOwner := tokenOwnerSnapshot(c)
 	requestId := c.GetString(common.RequestIdKey)
 	upstreamRequestId := c.GetString(common.UpstreamRequestIdKey)
 	otherStr := other.JSONString()
@@ -293,6 +377,11 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 	log := &Log{
 		UserId:           userId,
 		Username:         username,
+		DisplayName:      identityDisplayName,
+		Department:       identityDepartment,
+		ChannelName:      channelName,
+		ChannelTag:       channelTag,
+		TokenOwner:       tokenOwner,
 		CreatedAt:        common.GetTimestamp(),
 		Type:             LogTypeError,
 		Content:          content,
@@ -345,7 +434,12 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		return
 	}
 	logger.LogInfo(c, common.LogText("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
-	username := c.GetString("username")
+	// 三列身份都从鉴权上下文取（`UserBase.WriteContext` 写的），写日志时零查询。
+	username := c.GetString(string(constant.ContextKeyUserName))
+	identityDisplayName, identityDepartment := identitySnapshot(c)
+	channelName := channelNameSnapshot(c)
+	channelTag := channelTagSnapshot(c)
+	tokenOwner := tokenOwnerSnapshot(c)
 	requestId := c.GetString(common.RequestIdKey)
 	upstreamRequestId := c.GetString(common.UpstreamRequestIdKey)
 	createdAt := common.GetTimestamp()
@@ -362,6 +456,11 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	log := &Log{
 		UserId:           userId,
 		Username:         username,
+		DisplayName:      identityDisplayName,
+		Department:       identityDepartment,
+		ChannelName:      channelName,
+		ChannelTag:       channelTag,
+		TokenOwner:       tokenOwner,
 		CreatedAt:        createdAt,
 		Type:             LogTypeConsume,
 		Content:          content,
@@ -397,9 +496,12 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 			// Do not add the 5m/1h breakdown again or infer tokens from prices.
 			cacheCreationTokens, _ = other.public["cache_write_tokens"].(int)
 		}
+		// 显示名与部门用上面那条日志的同一份快照，避免「日志显示 A、用量显示 B」。
 		LogQuotaData(QuotaDataLogParams{
 			UserID:              userId,
 			Username:            username,
+			DisplayName:         identityDisplayName,
+			Department:          identityDepartment,
 			ModelName:           params.ModelName,
 			Quota:               params.Quota,
 			CreatedAt:           createdAt,
@@ -433,26 +535,46 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
+	tokenOwner := ""
 	if params.TokenId > 0 {
 		if token, err := GetTokenById(params.TokenId); err == nil {
 			tokenName = token.Name
+			tokenOwner = token.Owner
+		}
+	}
+	// 任务计费没有请求上下文，渠道名/供应商只能在写日志时查一次。渠道是硬删除，
+	// 不写快照的话这几列在渠道删掉后永久为空（列表只能靠 channels 表反查）。
+	channelName := ""
+	channelTag := ""
+	if params.ChannelId > 0 {
+		if channel, err := CacheGetChannel(params.ChannelId); err == nil {
+			channelName = channel.Name
+			channelTag = channel.GetTag()
 		}
 	}
 	createdAt := common.GetTimestamp()
 	other := params.Other
+	// 任务计费来自后台 worker，没有请求上下文，快照按 userId 取：
+	// 身份是 quota_data 聚合键的一部分，留空会让任务用量与同步调用拆成两行。
+	displayName, departmentName := identitySnapshotForUser(params.UserId)
 	log := &Log{
-		UserId:    params.UserId,
-		Username:  username,
-		CreatedAt: createdAt,
-		Type:      params.LogType,
-		Content:   other.setContent(params.Content),
-		TokenName: tokenName,
-		ModelName: params.ModelName,
-		Quota:     params.Quota,
-		ChannelId: params.ChannelId,
-		TokenId:   params.TokenId,
-		Group:     params.Group,
-		Other:     other.JSONString(),
+		UserId:      params.UserId,
+		Username:    username,
+		DisplayName: displayName,
+		Department:  departmentName,
+		CreatedAt:   createdAt,
+		Type:        params.LogType,
+		Content:     other.setContent(params.Content),
+		TokenName:   tokenName,
+		ModelName:   params.ModelName,
+		Quota:       params.Quota,
+		ChannelId:   params.ChannelId,
+		TokenId:     params.TokenId,
+		Group:       params.Group,
+		Other:       other.JSONString(),
+		ChannelName: channelName,
+		ChannelTag:  channelTag,
+		TokenOwner:  tokenOwner,
 	}
 	err := createLog(log)
 	if err != nil {
@@ -464,15 +586,17 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 			nodeName = common.NodeName
 		}
 		LogQuotaData(QuotaDataLogParams{
-			UserID:    params.UserId,
-			Username:  username,
-			ModelName: params.ModelName,
-			Quota:     params.Quota,
-			CreatedAt: createdAt,
-			UseGroup:  params.Group,
-			TokenID:   params.TokenId,
-			ChannelID: params.ChannelId,
-			NodeName:  nodeName,
+			UserID:      params.UserId,
+			Username:    username,
+			DisplayName: displayName,
+			Department:  departmentName,
+			ModelName:   params.ModelName,
+			Quota:       params.Quota,
+			CreatedAt:   createdAt,
+			UseGroup:    params.Group,
+			TokenID:     params.TokenId,
+			ChannelID:   params.ChannelId,
+			NodeName:    nodeName,
 		})
 	}
 }
@@ -584,7 +708,10 @@ func GetAllLogs(filter LogFilter, startIdx int, num int) (logs []*Log, total int
 			channelMap[channel.Id] = channel.Name
 		}
 		for i := range logs {
-			logs[i].ChannelName = channelMap[logs[i].ChannelId]
+			// 渠道还在就用当前名字；已删则保留行内快照，不能被空串覆盖。
+			if name, ok := channelMap[logs[i].ChannelId]; ok && name != "" {
+				logs[i].ChannelName = name
+			}
 		}
 	}
 
@@ -639,7 +766,10 @@ func StreamAllLogs(ctx context.Context, filter LogFilter, role int, fn func(*Log
 				}
 				channelNames[log.ChannelId] = name
 			}
-			log.ChannelName = name
+			// 渠道已删时保留行内快照，不要覆盖
+			if name != "" {
+				log.ChannelName = name
+			}
 		}
 		log.Other = formatLogOtherJSON(log.Other, visibility)
 		return fn(log)
@@ -657,8 +787,7 @@ func StreamUserLogs(ctx context.Context, userId int, filter LogFilter, fn func(*
 	return streamLogs(tx, "logs.id desc", func(log *Log) error {
 		count++
 		log.Id = count
-		log.ChannelName = ""
-		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+		formatUserLog(log)
 		return fn(log)
 	})
 }

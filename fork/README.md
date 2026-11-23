@@ -84,6 +84,11 @@ model/goose_fork.go                      # goose.NewProvider + Up()，消费上�
 - **版本表名是 goose 默认的 `goose_db_version`**，与上游的 GORM 表都不撞名。
 - 新增 PG 迁移：往 `migrations/postgres/` 加文件 → 用 `TEST_POSTGRES_DSN` 跑
   `TestForkMigrationsOnPostgres`。没有 PG 实例时这条用例会 SKIP，**不算验证过**。
+- **AutoMigrate 管着的表不写迁移。** `logs`、`quota_data`、`redemptions` 都在 `migrateDB()` 的
+  AutoMigrate 列表里（独立日志库还有 `migrateLOGDB()` 再补一次），加列本来就在建表/启动时完成；
+  再写一份 goose SQL 就是同一列定义两处维护，改 tag 忘了改 SQL 只换来一次多余 `ALTER` 或迁移失败，
+  而独立日志库那份 SQL 压根不会被执行（goose 只跑主库）。所以身份快照这几列**只有 GORM tag**，
+  升级路径由 `TestForkMigrationsOnPostgres` 的「旧形状表 + AutoMigrate」用例验证。
 
 `fork/README.md` 之外**没有**额外的迁移文档；`token-master2-dept/` 的 goose 迁移与本仓库无关，
 那是业务库 `token_master` 的。
@@ -103,9 +108,9 @@ model/goose_fork.go                      # goose.NewProvider + Up()，消费上�
 da9b37f5c  feat(fork): 多 root 管理员与 fork 脚手架
 ac47e2383  feat(fork): 在 users 表记录真实的最近调用时刻
 522c044f9  feat(fork): 部门归属搬进 new_api 库
-（第四组「手机号」见下方「四、手机号」小节，第五组「上游密钥指纹」见「五、日志记录上游密钥指纹」，
-  第六组「批量重置密码」、第七组「供应关系优先级」见对应小节；它们都没有单独的补丁提交哈希，
-  与前三组一起随源码发布。）
+（第四组「手机号」见下方「四、手机号」小节，第五组「上游密钥指纹」见「五、日志记录上游密钥指纹」；
+  第六组「批量重置密码」、第七组「身份快照」、第八组「新建渠道按凭据测试连通性」、
+  第九组「供应关系优先级」见对应小节；它们都没有单独的补丁提交哈希，与前三组一起随源码发布。）
 ```
 
 基线是上游 `6ef123cd5`。这些都是**可直接 merge 的源码改动**，不是补丁。后四组不记短 hash——
@@ -254,7 +259,95 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 `user.batch_password_reset` 也没登记进 `web/src/features/usage-logs/lib/format.ts` 的
 `AUDIT_TEMPLATES`，控制台审计列表显示原始英文（与 `department.*` 一致）。
 
-### 七、供应关系优先级（`abilities.priority` 参与选路）
+### 七、身份快照（`feat/identity-snapshot` 的四个提交）
+
+**需求**：用户、部门、渠道都是**硬删除**（或改名）。删掉之后，历史日志/用量/兑换记录再没有任何地方
+能回答「当时是谁、哪个部门、哪个渠道」。所以要在产生数据的那一刻把名字抄一份存进去。
+
+**做法**：写入时抄名字，查询直接显示，不回查当前状态。
+
+- **热路径零查库**：鉴权中间件把 `display_name` / `department_name` 从用户缓存写进 gin 上下文
+  （`UserBase.WriteContext` → `constant.ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName`）；
+  分发中间件写渠道名。写日志/用量时只读上下文，一次额外查询都不发。
+- **缓存必须带名字**：`UserBase` 新增 `DisplayName` / `DepartmentName` 两个**值**字段，
+  `userCacheSchemaVersion` 升到 3，`user_auth_cache.go` 的内联 Lua 把两列连同 MAC/版本号整份写入。
+  部门名只能按 `user.DepartmentId` 查字典表，所以「写缓存」与「冷启动返回」共用
+  `baseUserWithDepartment`——三条旁路（populate / update / 冷启动）任何一条漏了，都会把部门名冲成空串。
+  部门 **id 不进** `UserBase`：`PublishUserAuthCache` 用 `*a == *b` 判断元数据是否还在变，
+  指针字段会让它永远判成在变，重试三次后报错。
+- **没有请求上下文的路径**（任务计费、充值回调、系统日志）按 `userId` 从用户缓存取
+  （`identitySnapshotForUser`），不额外查库。
+- **放哪里**：`logs.display_name` / `logs.department` / `logs.channel_name`（同机制还有
+  `logs.channel_tag` / `logs.token_owner`，取 `channels.tag` 与 `tokens.owner`），
+  `quota_data.display_name` / `quota_data.department`，
+  `redemptions.used_username` / `redemptions.used_display_name`。全列 TEXT：源列宽度不统一
+  （`users.display_name` 的 20 字上限只在请求校验层，OAuth 注册绕过它；`channels.name` 根本没限），
+  快照列收窄会让超长名字的 INSERT 失败，而 `createLog` 只记 error → 静默丢日志。
+- **身份进聚合键**：`quota_data` 的聚合键加了 `display_name`/`department`，所以改名前后是两行，
+  历史不会被改后的名字覆盖。键的唯一定义是 `model/usedata.go` 的 `quotaDataKeyParts()`：
+  内存分桶键与两条 upsert 判据（`Find` 的 Where、`UPDATE` 的 Where）都由它生成，不再手抄三份。
+- **不回填存量**：老日志/老用量/老兑换记录的身份列留空（NULL/空串），语义是「当时没记」。
+  `quota_data` 的存量行在这两列上是 NULL、新行是空串，所以 upsert 判据对这两列用
+  `COALESCE(col, '') = ?` 比较（`applyQuotaDataKey`）——直接 `= ''` 匹配不到 NULL，部署后
+  首次保存就会给同一聚合键再插一行。NULL 本身不改写，仍是「当时没记」。
+- **跨仓库契约（BFF 侧）**：上述列在本分支上线后才存在，且不保证有值；读之前先判空。
+  `quota_data` 的存量行仍可能是 NULL，拼接/展示时按「未知」处理。老日志按旧列名（`users`
+  反查）展示的旧逻辑不改也不补——两套数据共存时，新行显示快照，老行显示当前值/空。
+
+**已知缺口**：
+
+- 只对新建行生效，存量不回填、不做修复脚本（与渠道秘钥指纹同一形态）。
+- **部门改名不会立刻刷新成员缓存**：`UpdateDepartment` 只改 `department` 表，`user:<id>` 里的
+  `DepartmentName` 要等缓存过期（`SYNC_FREQUENCY`，默认 60s）才重建，所以这段时间内新产生的
+  日志/用量仍写旧名，`quota_data` 会把旧名/新名拆成两行。当前业务不会改名，接口虽仍在
+  `PUT /api/department/` 上可达，但没有调用方，故未加「按部门批量刷成员缓存」。若以后要启用
+  改名，在改名成功后按 `department_id` 取成员 id 逐个 `PublishUserAuthCache`——不要用
+  `invalidateUserCache`：那会连缓存里的 `Quota` 一起丢掉，而批量更新模式下数据库余额还没跟上
+  缓存，重建时会读出偏高的余额。
+
+### 八、新建渠道按凭据测试连通性
+
+上游只有 `GET /api/channel/test/:id`，必须先落库拿到 id 才能测。管理端「新建渠道」弹窗在保存前
+就要逐模型测连通性，于是加一个 `POST /api/channel/test`：
+
+- `controller/channel_test_fork.go` —— 用请求体里的 `type/base_url/key/model/endpoint_type?/stream?` 内存构造
+  `model.Channel`（`Id = 0`），复用现有 `testChannel()`。与 `POST /api/channel/fetch_models`
+  同一套「不落库预览」思路。多行秘钥只取第一把（`credentialKeyFor`，与 `fetch_models` 共用同一实现）；
+  key 允许为空，因为「自建算力」渠道走内网网关、上游不校验秘钥。`endpoint_type` / `stream` 与
+  `GET /test/:id` 同口径透传（新建弹窗要测非 chat 端点或流式）；未知的 `endpoint_type` 落回
+  `testChannel()` 默认分支（chat 端点 + OpenAI 格式），与老接口行为一致。
+- `controller/channel-test.go` 五处 `// [FORK]` —— `testChannel()` 开头算一次 `preview := channel.Id == 0`，
+  据此跳过定价校验（网关 `model_ratio` 与平台成本表是两套数据，不跳过会让未配价模型全部测试失败）、
+  结算/消费日志（否则记到 channel 0），并在调 `RelayErrorHandler` 前把上游响应体里的明文凭据
+  （含 Codex 的 OAuth token）替换成 `[REDACTED]`；`TestChannel` 的两个错误分支再对回给前端的
+  message 做一次同样的脱敏——这个接口只需要 `ChannelOperate`，上游回显 Key 等于绕开
+  `ChannelSensitiveWrite` 读到密钥。
+- 错误 message 过 `redactCredentialError`，脱敏集合由 `credentialSecrets()` 给出（秘钥本身 +
+  Codex 的 `access_token`/`id_token`/`refresh_token`），多 Key 渠道取上下文里本次实际下发的那把。
+  文本规则在 `redactCredentialText()` 里（原文 + QueryEscape + PathEscape 三种形式），
+  `redactCredentialError()` 只多一层「没替换到东西时原样返回原 error」——渠道测试要保留
+  `*common.Message` 的 `message_key`（前端靠它翻译），上游的 `sanitizeFetchModelsError()`
+  （`fetch_models` / 渠道余额）没这个需要，所以还是 `errors.New` 重包。
+
+  **上游那份 `sanitizeFetchModelsError()` 保持原样，fork 不改它**（它所在的
+  `controller/channel_upstream_update.go` 是上游高频改动的文件，为了一个无行为变化的
+  重构去碰它不值得）。代价是同一套替换规则存在两份等价实现：动了其中一份的语义要同步另一份。
+- `router/channel-router.go` 注册 `POST /test`，权限用 `authz.ChannelSensitiveWrite`（与 `POST /fetch_models` 一致）：
+  两者都是「带鉴权头打管理员临时输入的 base_url 并回显上游错误」，对只有 `ChannelOperate` 的管理员
+  等于一个有回显的内网探测能力。
+
+**已知缺口：依赖渠道 settings 的类型测不到。** 构造出来的临时渠道只有 `type/base_url/key`，
+`validateChannel()` 要求它们补齐 settings / `Other`，所以 `TaskPlugin`（缺 `task_plugin_key`）与
+`VertexAI`（缺部署区域）在预览态会直接 400。`POST /fetch_models` 用
+`applyTaskPluginModelPreview` / `buildAdvancedCustomModelPreviewChannel` 补齐了其中一部分；本接口
+**没有**跟着补——保存后走 `GET /api/channel/test/:id` 能测，新建弹窗对这些类型不能测。
+需要时再按同样的思路补，别指望它现在能覆盖全部渠道类型。
+
+400 的 message key `type and model are required` 已登记进 7 个前端语言包（与 `Invalid parameters` 同口径）。
+
+`testChannel()` 签名未变，既有两个调用点（`TestChannel` 与 `testChannelForHealthCheck`）零改动。
+
+### 九、供应关系优先级（`abilities.priority` 参与选路）
 
 **背景**：上游缓存选路只读 `channels.priority`；`abilities.priority` 虽然存在且 `GetChannel`
 （缓存关闭时的 DB 路径）会读它，但开着内存缓存时它**不参与任何选路**。而 `abilities` 的主键是
@@ -342,14 +435,27 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 因此若要把本 fork 部署到 MySQL，这几处必须先补 MySQL 分支并做三库实测。仅在当前 PG 部署下
 运行不受影响。
 
+### 独立日志库（ClickHouse）不在本部署范围内
+
+本 fork 只把日志表放在主库（`LOG_SQL_DSN` 不设置，`InitLogDB` 直接 `LOG_DB = DB`）。上游支持的
+「独立日志库」——包括 ClickHouse（`LOG_SQL_DSN=clickhouse://…`）——本部署不使用，也没有实测：
+
+- 身份快照新增的列（`display_name` / `department` / `channel_name` / `channel_tag` / `token_owner`）
+  已同步进 `model/main.go` 的 ClickHouse 建表语句（`clickHouseLogCreateTableSQL`），保证代码自洽；
+- 但**老 ClickHouse 日志库升级不补列**：`CREATE TABLE IF NOT EXISTS` 在已存在的表上是空操作，
+  且本 fork 未实现 `ALTER TABLE logs ADD COLUMN`。若将来真的要启用 ClickHouse，必须先补这一步，
+  否则老库升级后每条日志写入都会以 `NO_SUCH_COLUMN_IN_TABLE` 失败。
+- 不启用 ClickHouse 时，日志表随主库走 PG，由 `migrateDB()` 的 `AutoMigrate`（含 `&Log{}`）
+  在建表/启动时建列、补列，不受上述限制影响。
+
 ## 改了哪些文件
 
-共 75 个文件（39 个上游文件被改、36 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +6320/−84，`web/` 部分 +114/−0（都是 i18n 与类型联合）。
+共 95 个文件（50 个上游文件被改、45 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +8870/−194，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。39 个被改文件里有 9 个是 `web/`（见下表末三行）、4 个不是功能
+> 那不是定制，不计入上面的文件数。50 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
@@ -360,11 +466,14 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
 | `model/channel_cache.go` | 新增 `priorityLookupCache` 的构建与发布、`GetRandomSatisfiedChannel` 的优先级改读 `abilities.priority`（5 处 `[FORK]`） | **高**，逐请求热路径 |
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
-| `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 `(group, model) → priority`，重建时无条件沿用（改渠道级 priority 不生效，见「七」的取舍说明，2 处 `[FORK]`） | 中，8 个调用点的高频路径 |
+| `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 `(group, model) → priority`，重建时无条件沿用（改渠道级 priority 不生效，见「九」的取舍说明，2 处 `[FORK]`） | 中，8 个调用点的高频路径 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
-| `router/channel-router.go` | 权限路由表插入 `PUT /ability/priority`（1 处 `[FORK]`） | 低，单行 |
-| `router/channel_router_test.go` | 同上路由的权限断言 | 低 |
+| `router/channel-router.go` | 权限路由表插入两条：`PUT /ability/priority`（`ChannelWrite`）与 `POST /test`（`ChannelSensitiveWrite`，1 处 `[FORK]`） | 低，单行 |
+| `router/channel_router_test.go` | 同上两条路由的权限断言 | 低 |
+| `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志、错误日志脱敏，`TestChannel` 回前端前脱敏（5 处 `[FORK]`） | 中，逐模型测试热路径 |
+| `controller/channel.go` | `FetchModels` 的取 key 逻辑改为调 `credentialKeyFor`（1 处 `[FORK]`） | 低，单行 |
+| `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态用例（跳过定价/消费日志、日志脱敏） | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
 | `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
@@ -374,6 +483,15 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_authentication_test.go` | 补 `deleteUserAuthenticationData` 的用例（只清目标用户、软删行、失败传播） | 低 |
 | `service/log_info_generate.go` | `AppendRelayLogAdminInfo` 加一行调用写指纹 | 低，块内独立 |
 | `service/violation_fee.go` | 构建违规费日志处加一行调用写指纹 | 低 |
+| `model/user.go` | `UserBase` 加 `DisplayName` / `DepartmentName` 两个值字段（快照来源） | 低 |
+| `model/log.go` | `Log` 加快照列；写入路径按上下文/用户缓存填快照；列表与导出反查不到渠道时保留行内快照 | 中，写入路径多，漏一处就少一列 |
+| `model/usedata.go` | `QuotaData` 加 `display_name` / `department` 并入聚合键；`quotaDataKeyParts()` 成为 10 列键的唯一定义 | 中，聚合键写错只错数据、不报错 |
+| `model/user_cache.go` | `baseUserWithDepartment` 成为「用户 → 带部门名的 `UserBase`」的唯一实现，三个缓存路径共用 | 中 |
+| `model/user_auth_cache.go` | 内联 Lua 多写两列（ARGV 下标必须与 `UserBase` 字段顺序对齐）；`userCacheSchemaVersion` 升 3 | **最高**，漏写一列就永远读回空串 |
+| `model/redemption.go` | 兑换时抄一份兑换人用户名/显示名 | 低 |
+| `constant/context_key.go` | 新增 `ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName` | 低 |
+| `middleware/auth.go` | 鉴权通过后把身份写进上下文 | 低 |
+| `middleware/distributor.go` | 分发后把渠道名/供应商写进上下文 | 低 |
 | `service/task_billing.go` | `LogTaskConsumption` 加一行调用写指纹（任务型渠道的提交日志） | 低 |
 | `relay/responses_websocket.go` | lockedContext 白名单提成包级变量 `lockedContextKeys`（行为不变，为让白名单可被测试断言） | 低 |
 | `controller/token.go`、`model/token.go` | 令牌「使用方」`owner`：请求字段（指针区分未传）、128 字节校验、写库 | 低 |
@@ -399,6 +517,9 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
 | `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
 | `service/security_verification_fork.go` | `admin.user.manage` 的 proof 校验规则 |
+| `model/log_identity_snapshot_fork_test.go` | 身份快照的写入/读取侧回归（上下文、后台路径、删除后列表） |
+| `model/user_cache_fork_test.go` | 缓存往返、`updateUserCache`、冷启动返回值、Redis 关闭时不查部门 |
+| `model/usedata_fork_test.go` | `quota_data` 按身份快照分桶、同键累加的回归 |
 | `common/random_password_fork.go` | 8 位随机账号密码：三类字符必现、Fisher–Yates 打散位置、`crypto/rand` 无偏 |
 | `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
 | `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |
@@ -409,6 +530,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/channel_ability_fork.go` | 增删单条供应关系：以 `channels.models` 为权威写列、同步 `model_mapping`、重建 abilities |
 | `controller/channel_ability_fork.go` | `POST` / `DELETE /api/channel/ability` handler，写后 `InitChannelCache()` |
 | `model/channel_ability_fork_test.go`、`controller/channel_ability_fork_test.go` | 增删关系、映射同步、重复 400、写后可选路 |
+| `controller/channel_test_fork.go` | `POST /api/channel/test` handler：按凭据构造临时渠道、复用 `testChannel()`、错误脱敏 |
+| `controller/channel_test_fork_test.go` | handler 级用例：入参 400、空秘钥放行、上游失败不回 HTTP 错、密钥不回显、多行 key 口径、`endpoint_type`/`stream` 透传 |
 | `controller/user_batch_password_reset_fork_test.go` | controller 包测试（含锁内二次授权与整批回滚） |
 | `model/channel_priority_cache_fork_test.go` | 选路基线、查询表、逐渠道回退、缓存开关一致性、`UpdateAbilities` 保留优先级 |
 | `model/channel_priority_fork_test.go` | `UpdateAbilityPriority` 只改目标行、范围校验、缓存版本推进 |
@@ -428,27 +551,39 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 114 处、38 个文件：
+当前共 162 处、54 个文件：
 
 | 文件 | 处数 |
 |---|---|
 | `model/user.go` | 17 |
 | `controller/user.go` | 16 |
+| `model/channel_ability_fork.go` | 7 |
 | `model/channel_priority_cache_fork_test.go` | 7 |
 | `service/security_verification.go` | 7 |
+| `controller/channel-test.go` | 6 |
+| `controller/department_fork.go` | 6 |
 | `model/user_last_called_fork_test.go` | 6 |
 | `model/department_fork.go` | 6 |
-| `controller/department_fork.go` | 6 |
 | `model/channel_cache.go` | 5 |
+| `model/usedata.go` | 5 |
 | `model/channel_priority_cache_fork.go` | 5 |
+| `controller/channel_ability_fork.go` | 4 |
+| `model/log.go` | 4 |
+| `model/channel_ability_fork_test.go` | 4 |
 | `router/api-router.go` | 4 |
+| `constant/context_key.go` | 3 |
 | `model/channel_priority_fork.go` | 3 |
-| `model/ability.go` | 2 |
+| `router/channel-router.go` | 3 |
+| `middleware/auth.go` | 2 |
 | `controller/channel_priority_fork.go` | 2 |
-| `controller/channel_priority_fork_test.go` | 2 |
 | `controller/audit.go` | 2 |
+| `controller/channel_priority_fork_test.go` | 2 |
+| `controller/channel_ability_fork_test.go` | 2 |
+| `model/ability.go` | 2 |
+| `model/department_fork_test.go` | 2 |
+| `model/user_auth_cache.go` | 2 |
 | `service/security_verification_fork.go` | 2 |
-| `common/random_password_fork.go`、`controller/department_usage_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`model/channel_priority_fork_test.go`、`model/goose_fork.go`、`model/main.go`、`model/user_batch_password_fork.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`router/channel-router.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `middleware/distributor.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`controller/user_management_fork.go`、`controller/department_usage_fork.go`、`controller/user_unified_update_fork_test.go`、`controller/channel.go`、`controller/security_enrollment_test.go`、`controller/channel_test_fork.go`、`controller/user_batch_password_reset_fork.go`、`common/random_password_fork.go`、`model/user_batch_password_fork.go`、`model/channel_priority_fork_test.go`、`model/redemption.go`、`model/user_department_fork_test.go`、`model/goose_fork.go`、`model/user_cache.go`、`model/user_phone_fork.go`、`model/main.go`、`service/log_info_generate.go`、`service/task_billing.go`、`service/channel_key_fingerprint_fork.go`、`service/security_verification_batch_password_fork.go`、`service/access_token_scope.go`、`service/violation_fee.go`、`relay/responses_websocket.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
@@ -612,7 +747,7 @@ docker build \
   （`Priority must be between 1 and 999`），目标行不存在 → 404（`The supply relation does not exist`）。
   写后立即刷新路由缓存，不需等 3 秒 sync。
 - `POST /api/channel/priority/reorder` 仍按渠道级全量重排（`channels.priority` + 该渠道全部 abilities
-  行），与上面这条的语义区别见「定制清单 · 七、供应关系优先级」。
+  行），与上面这条的语义区别见「定制清单 · 九、供应关系优先级」。
 - `POST /api/channel/ability`：新增一条供应关系。body
   `{"model": "...", "channel_id": <id>, "group"?: "default", "upstream_model"?: "...", "priority"?: 1..999}`。
   `upstream_model` 与 `model` 不同时写成 `channels.model_mapping`，`priority` 缺省为 1。
@@ -621,6 +756,10 @@ docker build \
 - `DELETE /api/channel/ability`：删除一条供应关系。body `{"model": "...", "channel_id": <id>, "group"?: ...}`。
   从 `channels.models` 摘掉模型名、清掉对应映射并重建 abilities；行不存在 → 404。
   两者权限均为 `ChannelWrite`，写后立即刷新路由缓存。
+
+- 日志行（`GET /api/log/`、`/api/log/export`）多了快照字段 `display_name`、`department`、
+  `channel_name`、`channel_tag`、`token_owner`。**筛选参数没变**：`LogFilter` 没有按显示名/渠道名
+  筛选的能力，这些列只用于展示。
 
 调用约定：`grant_root` 只有 root 能调，`revoke_root` 受「至少留一个启用 root」约束；两者都要求
 目标用户存在且状态合法。部门的写操作与改归属都受 `canManageTargetRole` 约束（同级或更高角色的
@@ -659,6 +798,9 @@ docker build \
 | `grant_root` 会吊销目标会话 | role 变更走 `UpdateWithTx` 的 `authChanged` 分支，递增 auth version → `Update` 调 `RevokeAllUserSessions`。上游 `promote` 走同一路径，所以升权也会踢下线；目标用户需要重新登录。降权同理，且即时生效（鉴权读实时角色）。 |
 | 渠道测试固定取「第一个 root」当测试用户 | 多 root 下取到哪个不确定，行为可接受。 |
 | 渠道通知默认发给所有未显式配置的 root | 多 root 后收件人变多，行为可接受。 |
+| 关闭 Redis 的部署写不出部门快照 | 部门名只能从鉴权缓存带下来；`RedisEnabled=false` 时 `GetUserCache` 直接返回 `ToBaseUser()`（否则每个请求都要多查一次字典表），因此 `logs.department` / `quota_data.department` 恒为空。显示名不受影响。生产多节点部署必须开 Redis。 |
+| 已存在的 ClickHouse 日志库升级后缺快照列 | 见「数据库」→「独立日志库（ClickHouse）不在本部署范围内」：建表语句已补列保证代码自洽，但不做老库自动补列。 |
+| 部门用量聚合仍按当前归属算 | `GET /api/data/departments` 用 `users.department_id` 实时聚合（且 `deleted_at IS NULL`），用户转部门后历史用量跟着走，删掉的用户不计入。`quota_data.department` 快照已写入但尚未被该接口使用。 |
 | `CountEnabledRootUsers` 生产代码里没有调用点 | 守卫走的是加锁路径。该函数留给排查与测试用。 |
 | 新建用户的默认侧边栏配置不含 admin 区，事后 `grant_root` 不重算 | 只影响上游自带控制台；本 fork 的 `web/` 改动只有 i18n 与类型，没动侧边栏逻辑。 |
 | 极端情况下仍可能被人工操作清空 root（手工 SQL、迁移脚本） | 事故兜底：把可信账号 `UPDATE users SET role=100, status=1`，或删除 setups 记录后重启走初始化。**仅事故时人工执行，不可当控制手段。** |
