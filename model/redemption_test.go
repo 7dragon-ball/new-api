@@ -177,6 +177,46 @@ func TestRedemptionQuotaRejectsWalletOverflow(t *testing.T) {
 	require.Error(t, redemption.Insert())
 }
 
+func TestRedeemSnapshotsRedeemerName(t *testing.T) {
+	userId, key := setupRedeemFixture(t, 500)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", userId).
+		Updates(map[string]any{"display_name": "张三"}).Error)
+	_, err := Redeem(key, userId)
+	require.NoError(t, err)
+	var r Redemption
+	require.NoError(t, DB.First(&r, "key = ?", key).Error)
+	assert.Equal(t, "redeem-user", r.UsedUsername)
+	assert.Equal(t, "张三", r.UsedDisplayName)
+}
+
+// 兑换之后改名不能让历史行跟着变：快照的意义就在于冻住「当时」。
+func TestRedeemSnapshotSurvivesProfileChange(t *testing.T) {
+	userId, key := setupRedeemFixture(t, 500)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", userId).
+		Updates(map[string]any{"display_name": "原名"}).Error)
+	_, err := Redeem(key, userId)
+	require.NoError(t, err)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", userId).
+		Updates(map[string]any{"username": "renamed", "display_name": "新名"}).Error)
+	var r Redemption
+	require.NoError(t, DB.First(&r, "key = ?", key).Error)
+	assert.Equal(t, "redeem-user", r.UsedUsername)
+	assert.Equal(t, "原名", r.UsedDisplayName)
+}
+
+// 事务整体回滚时快照不得残留半成品：码还是可用状态、快照必须为空。
+func TestRedeemSnapshotRolledBackOnFailure(t *testing.T) {
+	userId, key := setupRedeemFixture(t, 11)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", userId).
+		Update("quota", common.MaxWalletQuota-10).Error)
+	_, err := Redeem(key, userId)
+	require.ErrorIs(t, err, ErrRedeemFailed)
+	var r Redemption
+	require.NoError(t, DB.First(&r, "key = ?", key).Error)
+	assert.Equal(t, common.RedemptionCodeStatusEnabled, r.Status)
+	assert.Equal(t, "", r.UsedUsername)
+}
+
 // Exactly one of several concurrent redeems of the same code may win, and
 // quota must be credited exactly once.
 func TestRedeemConcurrentSingleSuccess(t *testing.T) {

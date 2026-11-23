@@ -23,6 +23,11 @@ type Redemption struct {
 	UsedUserId   int            `json:"used_user_id"`
 	DeletedAt    gorm.DeletedAt `gorm:"index"`
 	ExpiredTime  int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	// [FORK] 兑换人姓名快照：兑换成功那一刻从 users 表抄过来。
+	// 用户可能被硬删（行物理消失），列表却还要显示当时是谁兑的，只能用写入时快照。
+	// gorm:"type:varchar(64)" 必须显式写：GORM 对 string 默认建 text，与迁移里的 VARCHAR(64) 不一致。
+	UsedUsername    string `json:"used_username" gorm:"type:varchar(64)"`
+	UsedDisplayName string `json:"used_display_name" gorm:"type:varchar(64)"`
 }
 
 func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total int64, err error) {
@@ -158,15 +163,31 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
 			return errors.New("redemption code expired")
 		}
+		// 在兑换那一刻抄下兑换人姓名。tx.Model(&User{}) 自带 GORM 的
+		// deleted_at IS NULL 过滤：用户若被并发删除，这里读到空快照，
+		// 随后 creditTopUpQuota 找不到人（ErrRecordNotFound）会回滚整笔事务，
+		// 不会留下「码已用掉但没人」的脏数据。
+		var redeemer struct {
+			Username    string
+			DisplayName string
+		}
+		if err := tx.Model(&User{}).
+			Select("username", "display_name").
+			Where("id = ?", userId).
+			Scan(&redeemer).Error; err != nil {
+			return err
+		}
 		// Compare-and-swap on status: only the transaction that flips
 		// enabled -> used may credit quota, so a concurrent redeem of the
 		// same code loses here even without a row lock (e.g. on SQLite).
 		result := tx.Model(&Redemption{}).
 			Where("id = ? AND status = ?", redemption.Id, common.RedemptionCodeStatusEnabled).
 			Updates(map[string]any{
-				"redeemed_time": common.GetTimestamp(),
-				"status":        common.RedemptionCodeStatusUsed,
-				"used_user_id":  userId,
+				"redeemed_time":     common.GetTimestamp(),
+				"status":            common.RedemptionCodeStatusUsed,
+				"used_user_id":      userId,
+				"used_username":     redeemer.Username,
+				"used_display_name": redeemer.DisplayName,
 			})
 		if result.Error != nil {
 			return result.Error
