@@ -297,34 +297,25 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 		return err
 	}
 
-	// [FORK] 重建时整行保留该渠道已有 abilities 的 priority（按 group|model 匹配）。
+	// [FORK] 重建时保留该渠道已有 abilities 的 priority。
 	//
-	// 为什么无条件保留：abilities.priority 是本 fork 的选路依据，而它可能来自模型上架页
-	// 的单条设置（PUT /api/channel/ability/priority，只写 abilities、不写 channels）。
-	// 若重建时按 channels.priority 重算，管理员设过的单条优先级会被「改渠道名 / 权重 /
-	// 模型列表 / 批量打标签 / 上游模型同步」任一日常动作清空。所以这里只看「行是否存在」，
-	// 存在就沿用该行的 priority（含 nil）。
+	// 为什么保留：abilities.priority 是本 fork 的选路依据，而它可能来自模型上架页的单条
+	// 设置（PUT /api/channel/ability/priority，只写 abilities、不写 channels）。若重建时
+	// 一律按 channels.priority 重算，管理员设过的单条优先级会被「改渠道名 / 权重 / 模型
+	// 列表 / 批量打标签 / 上游模型同步」任一日常动作清空。
 	//
-	// 已知取舍——本产品的既定边界，不是待修的 bug：
-	// 因为沿用是无条件的，**改 channels.priority 后重建不会更新这些行的 priority**。
-	// 也就是说，只在「渠道建好之后再改渠道级 priority」时，选路才看不到这次改动：
-	//   - 走 Channel.Update()（PUT /api/channel/ 带 priority，内置控制台的优先级
-	//     spinner / 编辑抽屉）；
-	//   - 走 EditChannelByTag，且同时带 models/group 才会重建；只带 priority/weight 时
-	//     走 UpdateAbilityByTag，会直接改 abilities.priority，不受此限。
+	// 为什么不是无条件保留：改渠道级 priority（PUT /api/channel/ 带 priority，内置控制台
+	// 的优先级 spinner / 编辑抽屉；且同样随二进制发布、可达）必须真的改道，否则就是返回
+	// 200 而选路不变的静默契约变更。所以调用方把编辑前的 channels.priority
+	// 填进 channel.PreviousPriority：与之相等的行是「沿袭渠道级」，跟着新值走；与之不同的是
+	// 单条覆盖，原样保留。单条覆盖恰好等于渠道级值的情况无法区分，按沿袭处理（下次改
+	// 渠道级 priority 时会被带走）。没填（nil）表示调用方没动渠道级 priority，一切沿用。
 	//
-	// 自带 `web/` 控制台仍随二进制发布、可达，所以「本产品不用它」只是使用约定，不是技术
-	// 隔离：用它改渠道级 priority 会返回 200 而选路不变（管理 API 契约的静默变更）。现状由
-	// TestChannelUpdateDoesNotRewriteRelationPriority 固定，要修就得让这里能分辨
-	// 「沿袭值 vs 单条覆盖」——需要调用方传入编辑前的渠道 priority，并让每行承担一次额外
-	// 的字段比对。本产品的优先级一律走 PUT /api/channel/ability/priority 按「模型 × 渠道」
-	// 单条设置，那条路径不经过本函数。
-	//
-	// 另一条已知边界：保留键是 group|model，所以**改 channels.group 会重置该渠道所有单条
-	// priority**（旧键不再匹配，行按 channels.priority 重建），那部分数据只存在 abilities 里、
-	// 无法恢复。现状由 TestChannelGroupChangeResetsRelationPriority 固定。
-	//
-	// 要修上面两条，必须让这里能分辨两类来源，见 fork/README.md「九、供应关系优先级」。
+	// group 变化（default → vip）时 group|model 键失配，保留键退化为 model：同名的行沿用
+	// 该 model 的 priority（多个旧 group 给出不同值时取较大者，既不压低已有优先级，结果也
+	// 确定）。不用「新旧 group 有无交集」做条件：本产品只建单 group 渠道，一换组就必然无交集，
+	// 那等于换一个说法保留静默丢失。代价是换了 priority 量级不同的 group 时旧值会被带过去，
+	// 要回渠道级值用 PUT /api/channel/ability/priority 单条改，或跑 FixAbility 重建。
 	var existingAbilities []Ability
 	err := tx.Select(commonGroupCol+", model, priority").
 		Where("channel_id = ?", channel.Id).Find(&existingAbilities).Error
@@ -334,10 +325,24 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 		}
 		return err
 	}
-	keptPriorities := make(map[string]*int64, len(existingAbilities))
+	keptByRelation := make(map[string]*int64, len(existingAbilities))
+	keptByModel := make(map[string]*int64, len(existingAbilities))
 	for _, existing := range existingAbilities {
 		// nil 也原样传回：GORM 对带 default:0 的 nil 指针落 0，与选路「nil 视作 0」一致。
-		keptPriorities[existing.Group+"|"+existing.Model] = existing.Priority
+		keptByRelation[existing.Group+"|"+existing.Model] = existing.Priority
+		// 同一 model 在多个旧 group 下给出不同值时取较大者：结果确定，且不压低已有优先级。
+		value := int64(0)
+		if existing.Priority != nil {
+			value = *existing.Priority
+		}
+		kept, ok := keptByModel[existing.Model]
+		keptValue := int64(0)
+		if kept != nil {
+			keptValue = *kept
+		}
+		if !ok || value > keptValue {
+			keptByModel[existing.Model] = existing.Priority
+		}
 	}
 
 	// First delete all abilities of this channel
@@ -354,6 +359,7 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 	groups_ := strings.Split(channel.Group, ",")
 	abilitySet := make(map[string]struct{})
 	abilities := make([]Ability, 0, len(models_))
+	previousPriority := channel.PreviousPriority
 	for _, model := range models_ {
 		for _, group := range groups_ {
 			key := group + "|" + model
@@ -361,10 +367,18 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 				continue
 			}
 			abilitySet[key] = struct{}{}
-			// [FORK] 已有行沿用它的优先级（含 nil），新行用渠道优先级。见上面的取舍说明。
+			// [FORK] 已有行沿用它的优先级（含 nil），新行用渠道优先级。见上面说明。
 			priority := channel.Priority
-			if kept, ok := keptPriorities[key]; ok {
+			kept, ok := keptByRelation[key]
+			if !ok {
+				kept, ok = keptByModel[model]
+			}
+			if ok {
 				priority = kept
+				// 等于编辑前的渠道级值 = 沿袭行，跟随新值；其余是单条覆盖，保留。
+				if previousPriority != nil && equalPriority(kept, previousPriority) {
+					priority = channel.Priority
+				}
 			}
 			ability := Ability{
 				Group:     group,

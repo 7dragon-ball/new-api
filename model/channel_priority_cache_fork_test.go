@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -376,32 +377,49 @@ func TestUpdateAbilitiesKeepsPerModelPriority(t *testing.T) {
 	assert.Equal(t, int64(5), *kept)
 }
 
-// [FORK] 已知边界回归：`PUT /api/channel/` 带 priority（`Channel.Update`）只写
-// `channels.priority`，已有 abilities 行沿用编辑前的值，所以选路不变。内置控制台的
-// 优先级 spinner / 编辑抽屉走的就是这条路径。要真正改一条供应关系的优先级，用
-// `PUT /api/channel/ability/priority`。见 fork/README.md「九」的已知取舍。
-func TestChannelUpdateDoesNotRewriteRelationPriority(t *testing.T) {
+// [FORK] 改渠道级 priority 必须真的改道（`PUT /api/channel/` 带 priority，内置控制台的
+// 优先级 spinner / 编辑抽屉走的就是这条路径），而模型上架页设的单条覆盖不能被一起清掉。
+// 「沿袭行」按编辑前的 channels.priority 认：等于它的行跟着新值走，其余保留。
+func TestChannelUpdateAppliesChannelPriorityToInheritedRows(t *testing.T) {
 	useScheduledChannelDatabase(t)
-	const modelName = "update-priority-model"
+	const inheritModel, overrideModel = "update-inherit", "update-override"
 	weight := uint(1)
-	newChannel := func(name string, priority int64) *Channel {
-		channel := &Channel{
-			Name:     name,
-			Key:      "test-only",
-			Models:   modelName,
-			Group:    "default",
-			Status:   common.ChannelStatusEnabled,
-			Priority: &priority,
-			Weight:   &weight,
-		}
-		require.NoError(t, channel.Insert())
-		return channel
+	editable := &Channel{
+		Name:     "update-a",
+		Key:      "test-only",
+		Models:   inheritModel + "," + overrideModel,
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   &weight,
 	}
-	low, high := newChannel("update-low", 3), newChannel("update-high", 5)
+	require.NoError(t, editable.Insert())
+	neighbour := &Channel{
+		Name:     "update-b",
+		Key:      "test-only",
+		Models:   inheritModel,
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(5)),
+		Weight:   &weight,
+	}
+	require.NoError(t, neighbour.Insert())
+	raised := DB.Model(&Ability{}).
+		Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", overrideModel, editable.Id).
+		Update("priority", int64(7))
+	require.NoError(t, raised.Error)
+	require.EqualValues(t, 1, raised.RowsAffected)
+
+	priorityOf := func(modelName string, channelId int) *int64 {
+		var ability Ability
+		require.NoError(t, DB.Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, channelId).
+			First(&ability).Error)
+		return ability.Priority
+	}
 	pick := func(retry int) map[int]bool {
 		got := make(map[int]bool)
 		for range 200 {
-			channel, err := GetRandomSatisfiedChannel("default", modelName, retry, nil)
+			channel, err := GetRandomSatisfiedChannel("default", inheritModel, retry, nil)
 			require.NoError(t, err)
 			require.NotNil(t, channel)
 			got[channel.Id] = true
@@ -410,43 +428,82 @@ func TestChannelUpdateDoesNotRewriteRelationPriority(t *testing.T) {
 	}
 
 	InitChannelCache()
-	assert.Equal(t, map[int]bool{high.Id: true}, pick(0))
-	assert.Equal(t, map[int]bool{low.Id: true}, pick(1))
+	assert.Equal(t, map[int]bool{neighbour.Id: true}, pick(0))
+	assert.Equal(t, map[int]bool{editable.Id: true}, pick(1))
 
-	edited, err := GetChannelById(low.Id, true)
+	edited, err := GetChannelById(editable.Id, true)
 	require.NoError(t, err)
-	raised := int64(10)
-	edited.Priority = &raised
+	edited.Priority = lo.ToPtr(int64(10))
 	require.NoError(t, edited.Update())
 	assert.Equal(t, int64(10), edited.GetPriority(), "channels.priority 按请求写入")
 
-	var ability Ability
-	require.NoError(t, DB.Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, low.Id).
-		First(&ability).Error)
-	require.NotNil(t, ability.Priority)
-	assert.Equal(t, int64(3), *ability.Priority, "abilities.priority 沿用编辑前的值")
+	inherited := priorityOf(inheritModel, editable.Id)
+	require.NotNil(t, inherited)
+	assert.Equal(t, int64(10), *inherited, "沿袭渠道级的行跟着新值走")
+	overridden := priorityOf(overrideModel, editable.Id)
+	require.NotNil(t, overridden)
+	assert.Equal(t, int64(7), *overridden, "单条覆盖不被改渠道级 priority 清掉")
 
 	InitChannelCache()
-	assert.Equal(t, map[int]bool{high.Id: true}, pick(0), "改渠道级 priority 不影响选路（已知边界）")
-	assert.Equal(t, map[int]bool{low.Id: true}, pick(1), "改渠道级 priority 不影响选路（已知边界）")
+	assert.Equal(t, map[int]bool{editable.Id: true}, pick(0), "改渠道级 priority 后选路随之变化")
+	assert.Equal(t, map[int]bool{neighbour.Id: true}, pick(1))
 }
 
-// [FORK] 已知边界回归：改 channels.group 会重置该渠道所有单条 priority。
-// UpdateAbilities 按「group|model」保留旧行，group 一变 key 不再匹配，行按
-// channels.priority 重建，只存在 abilities 里、已设好的单条值随之丢失。
-// 见 fork/README.md「九」的已知取舍：本产品只建单 group 渠道，也不改 group。
-func TestChannelGroupChangeResetsRelationPriority(t *testing.T) {
+// [FORK] tag 编辑同时带 models/group 时会重建 abilities，priority 也要按编辑前的渠道级值
+// 判断沿袭与覆盖（`EditChannelByTag` 先按 id 读旧值，因为一条 tag 下有多个渠道）。
+func TestEditChannelByTagAppliesChannelPriorityToInheritedRows(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	weight := uint(1)
+	channel := &Channel{
+		Name:     "tag-edit",
+		Key:      "test-only",
+		Models:   "tag-inherit,tag-override",
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   &weight,
+		Tag:      lo.ToPtr("fork-tag-edit"),
+	}
+	require.NoError(t, channel.Insert())
+	raised := DB.Model(&Ability{}).
+		Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", "tag-override", channel.Id).
+		Update("priority", int64(7))
+	require.NoError(t, raised.Error)
+	require.EqualValues(t, 1, raised.RowsAffected)
+
+	models := "tag-inherit,tag-override,tag-new"
+	require.NoError(t, EditChannelByTag("fork-tag-edit", nil, nil, &models, nil, lo.ToPtr(int64(10)), nil, nil, nil))
+
+	priorityOf := func(modelName string) *int64 {
+		var ability Ability
+		require.NoError(t, DB.Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, channel.Id).
+			First(&ability).Error)
+		return ability.Priority
+	}
+	inherited := priorityOf("tag-inherit")
+	require.NotNil(t, inherited)
+	assert.Equal(t, int64(10), *inherited, "沿袭渠道级的行跟着新值走")
+	overridden := priorityOf("tag-override")
+	require.NotNil(t, overridden)
+	assert.Equal(t, int64(7), *overridden, "单条覆盖保留")
+	added := priorityOf("tag-new")
+	require.NotNil(t, added)
+	assert.Equal(t, int64(10), *added, "新行用新的渠道级 priority")
+}
+
+// [FORK] 改 channels.group 时保留键 group|model 会失配，此时退化为按 model 迁移，且只从
+// 「新旧 group 集合的交集」取值：单条覆盖不因为换组而丢失（曾经是静默数据丢失）。
+func TestChannelGroupChangeKeepsPerModelPriority(t *testing.T) {
 	useScheduledChannelDatabase(t)
 	const modelName = "group-change-model"
-	channelPriority, weight := int64(3), uint(1)
 	channel := &Channel{
 		Name:     "group-change",
 		Key:      "test-only",
-		Models:   modelName,
+		Models:   modelName + ",group-plain-model",
 		Group:    "default",
 		Status:   common.ChannelStatusEnabled,
-		Priority: &channelPriority,
-		Weight:   &weight,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   lo.ToPtr(uint(1)),
 	}
 	require.NoError(t, channel.Insert())
 	raised := DB.Model(&Ability{}).
@@ -461,9 +518,15 @@ func TestChannelGroupChangeResetsRelationPriority(t *testing.T) {
 	require.NoError(t, edited.Update())
 
 	var abilities []Ability
-	require.NoError(t, DB.Where("channel_id = ?", channel.Id).Order(commonGroupCol).Find(&abilities).Error)
-	require.Len(t, abilities, 1, "旧 group 的行随重建消失")
-	assert.Equal(t, "vip", abilities[0].Group)
-	require.NotNil(t, abilities[0].Priority)
-	assert.Equal(t, channelPriority, *abilities[0].Priority, "单条优先级被重置成 channels.priority")
+	require.NoError(t, DB.Where("channel_id = ?", channel.Id).Order(commonGroupCol+", model").Find(&abilities).Error)
+	require.Len(t, abilities, 2, "旧 group 的行随重建消失，新 group 各一行")
+	kept := map[string]*int64{}
+	for _, ability := range abilities {
+		require.Equal(t, "vip", ability.Group)
+		kept[ability.Model] = ability.Priority
+	}
+	require.NotNil(t, kept[modelName])
+	assert.Equal(t, int64(5), *kept[modelName], "单条覆盖按 model 迁移到新 group")
+	require.NotNil(t, kept["group-plain-model"])
+	assert.Equal(t, int64(3), *kept["group-plain-model"], "没设过覆盖的行仍用渠道级值")
 }
