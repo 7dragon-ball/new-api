@@ -101,9 +101,17 @@ func quotaDataCacheKey(quotaData *QuotaData) string {
 }
 
 // [FORK] applyQuotaDataKey 把聚合键铺成 upsert 的 WHERE 条件。
+// 两个快照列在存量行里是 NULL（AutoMigrate 加列），新行是空串（GORM 写零值）；
+// 不统一就匹配不到旧行，部署后首次保存会给同一聚合键再插一行，旧行从此不再累加。
+// COALESCE 在 SQLite / MySQL / PostgreSQL 上语义一致，这两列也没有索引可依赖。
 func applyQuotaDataKey(tx *gorm.DB, quotaData *QuotaData) *gorm.DB {
 	for _, part := range quotaDataKeyParts(quotaData) {
-		tx = tx.Where(part.Column+" = ?", part.Value)
+		switch part.Column {
+		case "display_name", "department":
+			tx = tx.Where("COALESCE("+part.Column+", '') = ?", part.Value)
+		default:
+			tx = tx.Where(part.Column+" = ?", part.Value)
+		}
 	}
 	return tx
 }

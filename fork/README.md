@@ -284,8 +284,11 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   历史不会被改后的名字覆盖。键的唯一定义是 `model/usedata.go` 的 `quotaDataKeyParts()`：
   内存分桶键与两条 upsert 判据（`Find` 的 Where、`UPDATE` 的 Where）都由它生成，不再手抄三份。
 - **不回填存量**：老日志/老用量/老兑换记录的身份列留空（NULL/空串），语义是「当时没记」。
+  `quota_data` 的存量行在这两列上是 NULL、新行是空串，所以 upsert 判据对这两列用
+  `COALESCE(col, '') = ?` 比较（`applyQuotaDataKey`）——直接 `= ''` 匹配不到 NULL，部署后
+  首次保存就会给同一聚合键再插一行。NULL 本身不改写，仍是「当时没记」。
 - **跨仓库契约（BFF 侧）**：上述列在本分支上线后才存在，且不保证有值；读之前先判空。
-  `quota_data` 的存量行是 NULL 而不是空串，拼接/展示时按「未知」处理。老日志按旧列名（`users`
+  `quota_data` 的存量行仍可能是 NULL，拼接/展示时按「未知」处理。老日志按旧列名（`users`
   反查）展示的旧逻辑不改也不补——两套数据共存时，新行显示快照，老行显示当前值/空。
 
 **已知缺口**：
@@ -293,10 +296,11 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 - 只对新建行生效，存量不回填、不做修复脚本（与渠道秘钥指纹同一形态）。
 - **部门改名不会立刻刷新成员缓存**：`UpdateDepartment` 只改 `department` 表，`user:<id>` 里的
   `DepartmentName` 要等缓存过期（`SYNC_FREQUENCY`，默认 60s）才重建，所以这段时间内新产生的
-  日志/用量仍写旧名，`quota_data` 会把旧名/新名拆成两行。当前业务没有部门改名操作，故未加
-  「按部门批量刷成员缓存」的代码。若以后要启用改名，在改名成功后按 `department_id` 取成员 id
-  逐个 `PublishUserAuthCache`——不要用 `invalidateUserCache`：那会连缓存里的 `Quota` 一起丢掉，
-  而批量更新模式下数据库余额还没跟上缓存，重建时会读出偏高的余额。
+  日志/用量仍写旧名，`quota_data` 会把旧名/新名拆成两行。当前业务不会改名，接口虽仍在
+  `PUT /api/department/` 上可达，但没有调用方，故未加「按部门批量刷成员缓存」。若以后要启用
+  改名，在改名成功后按 `department_id` 取成员 id 逐个 `PublishUserAuthCache`——不要用
+  `invalidateUserCache`：那会连缓存里的 `Quota` 一起丢掉，而批量更新模式下数据库余额还没跟上
+  缓存，重建时会读出偏高的余额。
 
 ## 数据库
 
