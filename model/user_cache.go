@@ -26,11 +26,9 @@ type UserBase struct {
 	CacheSchema    int    `json:"-"`
 	CacheExpiresAt int64  `json:"-"`
 	CacheMAC       string `json:"-"`
-	// [FORK] 身份快照随鉴权缓存一起下发：日志/用量写入是每次调用都走的
-	// 热路径，绝不能在写日志时再查一次库。
-	// 只放**名字**，不放 DepartmentId：`PublishUserAuthCache` 用 `*a == *b` 比较两次
-	// 独立 DB 读取的结果，指针字段会让「值相同」被判成不等，函数跑满重试后误报
-	// 「元数据仍在变」。而这里确实只需要名字——写日志不需要 id。
+	// [FORK] 身份快照随鉴权缓存下发，写日志/用量时不用回查库。
+	// 只放名字、不放 DepartmentId：PublishUserAuthCache 用 `*a == *b` 比较两次独立
+	// 读取的结果，指针字段会让「值相同」被判成不等，重试耗尽后误报「元数据仍在变」。
 	DisplayName    string `json:"display_name"`
 	DepartmentName string `json:"department_name"`
 }
@@ -88,15 +86,12 @@ func invalidateUserCache(userId int) error {
 	return common.RedisDelKey(getUserCacheKey(userId))
 }
 
-// baseUserWithDepartment 构造带部门名的 UserBase。
+// baseUserWithDepartment 构造带部门名的 UserBase：`User` 里只有 DepartmentId，
+// 部门名得查字典表，而日志/用量的身份快照直接读这个字段——所以写缓存与冷启动的
+// 返回值都必须经过它，绕过一处就会把部门名冲成空串。
 //
-// 部门名只能按 `user.DepartmentId` 查字典表得到（`User` 里只有 id），而缓存的所有
-// 写入与返回值都必须带上它——日志/用量的身份快照直接取这个字段。曾经只有
-// populateUserCache 补名字，另外两条路径（updateUserCache 写、GetUserCache 冷启动
-// 返回）绕过它，结果改一次资料或冷启动一次就把部门名冲成空串。
-//
-// 只在写缓存/缓存 miss 时调用，不在请求热路径上，这一次查询可接受。
-// 部门已被删时查不到，留空——日志侧退化为无部门，与「当时没有部门」同义。
+// 只在写缓存/缓存 miss 时调用，不在请求热路径上。部门已删就留空；查询失败记日志后
+// 同样留空：调用点都是「先提交事务再刷缓存」，往上抛等于数据改成功了却告诉客户端失败。
 func baseUserWithDepartment(user User) *UserBase {
 	base := user.ToBaseUser()
 	if user.DepartmentId == nil {
@@ -104,12 +99,15 @@ func baseUserWithDepartment(user User) *UserBase {
 	}
 	var name string
 	if err := DB.Model(&Department{}).Where("id = ?", *user.DepartmentId).
-		Select("name").Scan(&name).Error; err == nil {
-		base.DepartmentName = name
+		Select("name").Scan(&name).Error; err != nil {
+		common.SysLog(common.LogText("failed to resolve department name for user %d: %s", user.Id, err.Error()))
+		return base
 	}
+	base.DepartmentName = name
 	return base
 }
 
+// populateUserCache 把用户（连部门名）整份写进缓存，用于缓存冷启动灌入。
 func populateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
@@ -122,8 +120,7 @@ func populateUserCache(user User) error {
 // by stale user snapshots from profile/settings updates.
 //
 // 必须走 baseUserWithDepartment：直接写 ToBaseUser() 会把部门名冲成空串，
-// 而这条路径覆盖改密码/改角色/改部门/2FA/passkey 等十几处，等于「用户改过一次
-// 资料，之后一个缓存周期内写入的日志都没有部门」。
+// 而这条路径覆盖改密码/改角色/改部门/2FA/passkey 等十几处。
 func updateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
@@ -146,21 +143,23 @@ func GetUserCache(userId int) (*UserBase, error) {
 	if err != nil {
 		return nil, err
 	}
-	if common.RedisEnabled {
-		floor, floorErr := getUserAuthVersionFloor(userId)
-		if floorErr == nil && floor > user.AuthVersion {
-			return nil, ErrUserAuthCachePending
-		}
-		if err := populateUserCache(*user); err != nil {
-			if errors.Is(err, ErrUserAuthCachePending) {
-				return nil, err
-			}
-			common.SysLog(common.LogText("failed to synchronously populate user cache: %s", err.Error()))
-		}
+	// Redis 关闭时没有缓存可写：直接返回 ToBaseUser()。这里不能查部门——那会让每次
+	// 鉴权（TokenAuth 等都会调 GetUserCache）多一次查询，且没有缓存可复用结果。
+	if !common.RedisEnabled {
+		return user.ToBaseUser(), nil
 	}
-	// 返回带部门名的 base：populateUserCache 写进 Redis 的是它，直接返回
-	// user.ToBaseUser() 会让「缓存冷启动后的第一条请求」拿到空部门，每个
-	// 缓存周期（默认 60s）都漏一条没有部门的日志。
+	floor, floorErr := getUserAuthVersionFloor(userId)
+	if floorErr == nil && floor > user.AuthVersion {
+		return nil, ErrUserAuthCachePending
+	}
+	if err := populateUserCache(*user); err != nil {
+		if errors.Is(err, ErrUserAuthCachePending) {
+			return nil, err
+		}
+		common.SysLog(common.LogText("failed to synchronously populate user cache: %s", err.Error()))
+	}
+	// 返回带部门名的 base：写进 Redis 的是它，返回值就得是同一份，否则每个缓存周期
+	// 的第一条请求都会漏一条没有部门的日志。
 	return baseUserWithDepartment(*user), nil
 }
 

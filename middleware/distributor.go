@@ -670,6 +670,8 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)
+	// [FORK] 供应商名（tag）也要快照进日志：渠道是硬删除，删掉后 channels 里就查不到 tag 了。
+	common.SetContextKey(c, constant.ContextKeyChannelTag, channel.GetTag())
 	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
 	common.SetContextKey(c, constant.ContextKeyChannelCreateTime, channel.CreatedTime)
 	common.SetContextKey(c, constant.ContextKeyChannelSetting, channel.GetSetting())

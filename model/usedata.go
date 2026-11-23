@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,10 +26,12 @@ type QuotaData struct {
 	Quota               int    `json:"quota" gorm:"default:0"`
 	CacheReadTokens     int64  `json:"cache_read_tokens" gorm:"default:0"`
 	CacheCreationTokens int64  `json:"cache_creation_tokens" gorm:"default:0"`
-	// [FORK] 身份快照：与 Username 同一性质，写入时固化。
-	// 用户/部门都是硬删，运行时 JOIN 会丢归属，所以在产生用量的那一刻抄一份。
-	DisplayName string `json:"display_name" gorm:"size:64;default:''"`
-	Department  string `json:"department" gorm:"size:30;default:''"`
+	// [FORK] 身份快照，与 Username 同一性质：用户/部门都是硬删，产生用量的那一刻抄一份。
+	// type:text 取源列最宽的一侧，免得比源列先截断而让整条用量写入失败。
+	// 不带 default:''（MySQL 不允许 TEXT 带字面默认值，ERROR 1101）：没有 default tag，
+	// GORM 就会把零值写进 INSERT，新行一律是空串，聚合键用 = '' 比较。
+	DisplayName string `json:"display_name" gorm:"type:text"`
+	Department  string `json:"department" gorm:"type:text"`
 }
 
 type QuotaDataLogParams struct {
@@ -61,21 +64,52 @@ func UpdateQuotaData() {
 var CacheQuotaData = make(map[string]*QuotaData)
 var CacheQuotaDataLock = sync.Mutex{}
 
+// [FORK] quotaDataKeyPart 是 quota_data 聚合键的一列。
+type quotaDataKeyPart struct {
+	Column string
+	Value  any
+}
+
+// [FORK] quotaDataKeyParts 是聚合键的唯一定义：这些列全相同才累加进同一行。
+// 内存分桶键与两条 upsert 判据都由它生成，三处各写一遍时漏一列不报错，
+// 只会「内存两行、库里一行」。身份两列在键里，改名前后各是一行，历史不会被覆盖。
+func quotaDataKeyParts(quotaData *QuotaData) []quotaDataKeyPart {
+	return []quotaDataKeyPart{
+		{"user_id", quotaData.UserID},
+		{"username", quotaData.Username},
+		{"display_name", quotaData.DisplayName},
+		{"department", quotaData.Department},
+		{"model_name", quotaData.ModelName},
+		{"created_at", quotaData.CreatedAt},
+		{"use_group", quotaData.UseGroup},
+		{"token_id", quotaData.TokenID},
+		{"channel_id", quotaData.ChannelID},
+		{"node_name", quotaData.NodeName},
+	}
+}
+
+// [FORK] quotaDataCacheKey 把聚合键拼成内存分桶键，用 \x00 分隔，避免两组值撞成同一个键。
+func quotaDataCacheKey(quotaData *QuotaData) string {
+	var builder strings.Builder
+	for i, part := range quotaDataKeyParts(quotaData) {
+		if i > 0 {
+			builder.WriteByte(0)
+		}
+		fmt.Fprintf(&builder, "%v", part.Value)
+	}
+	return builder.String()
+}
+
+// [FORK] applyQuotaDataKey 把聚合键铺成 upsert 的 WHERE 条件。
+func applyQuotaDataKey(tx *gorm.DB, quotaData *QuotaData) *gorm.DB {
+	for _, part := range quotaDataKeyParts(quotaData) {
+		tx = tx.Where(part.Column+" = ?", part.Value)
+	}
+	return tx
+}
+
 func logQuotaDataCache(quotaData *QuotaData) {
-	// 键必须与 SaveQuotaDataCache 的 upsert 判据逐字段一致：
-	// 少一个字段就会「内存里两行、库里一行」或反之，数据错但不报错。
-	key := fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%d\x00%s",
-		quotaData.UserID,
-		quotaData.Username,
-		quotaData.DisplayName,
-		quotaData.Department,
-		quotaData.ModelName,
-		quotaData.CreatedAt,
-		quotaData.UseGroup,
-		quotaData.TokenID,
-		quotaData.ChannelID,
-		quotaData.NodeName,
-	)
+	key := quotaDataCacheKey(quotaData)
 	count := quotaData.Count
 	quota := quotaData.Quota
 	tokenUsed := quotaData.TokenUsed
@@ -127,12 +161,8 @@ func SaveQuotaDataCache() {
 	// 3. 如果没有数据，就插入数据
 	for _, quotaData := range CacheQuotaData {
 		quotaDataDB := &QuotaData{}
-		// 判据必须与 logQuotaDataCache 的内存键逐字段一致，见该函数注释。
-		DB.Table("quota_data").
-			Where("user_id = ? and username = ? and display_name = ? and department = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
-				quotaData.UserID, quotaData.Username, quotaData.DisplayName, quotaData.Department,
-				quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
-			First(quotaDataDB)
+		// 判据与内存键同源，见 quotaDataKeyParts。
+		applyQuotaDataKey(DB.Table("quota_data"), quotaData).First(quotaDataDB)
 		if quotaDataDB.Id > 0 {
 			//quotaDataDB.Count += quotaData.Count
 			//quotaDataDB.Quota += quotaData.Quota
@@ -147,10 +177,7 @@ func SaveQuotaDataCache() {
 }
 
 func increaseQuotaData(quotaData *QuotaData) {
-	err := DB.Table("quota_data").
-		Where("user_id = ? and username = ? and display_name = ? and department = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
-			quotaData.UserID, quotaData.Username, quotaData.DisplayName, quotaData.Department,
-			quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
+	err := applyQuotaDataKey(DB.Table("quota_data"), quotaData).
 		Updates(map[string]any{
 			"count":                 gorm.Expr("count + ?", quotaData.Count),
 			"quota":                 gorm.Expr("quota + ?", quotaData.Quota),

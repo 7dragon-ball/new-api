@@ -521,6 +521,8 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		c.Set("id", token.UserId)
 		c.Set("token_id", token.Id)
 		c.Set("token_key", token.Key)
+		// [FORK] 秘钥使用方快照来源，理由见 model.Log.TokenOwner。
+		common.SetContextKey(c, constant.ContextKeyTokenOwner, token.Owner)
 		c.Next()
 	}
 }
@@ -678,6 +680,8 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 	c.Set("token_id", token.Id)
 	c.Set("token_key", token.Key)
 	c.Set("token_name", token.Name)
+	// [FORK] 秘钥使用方快照来源，理由见 model.Log.TokenOwner。
+	common.SetContextKey(c, constant.ContextKeyTokenOwner, token.Owner)
 	c.Set("token_unlimited_quota", token.UnlimitedQuota)
 	if !token.UnlimitedQuota {
 		c.Set("token_quota", token.RemainQuota)

@@ -21,6 +21,8 @@ const (
 	ContextKeyTokenModelLimit        ContextKey = "token_model_limit"
 	ContextKeyTokenCrossGroupRetry   ContextKey = "token_cross_group_retry"
 	ContextKeyTokenAutoGroups        ContextKey = "token_auto_groups"
+	// [FORK] 秘钥使用方（tokens.owner）快照来源，写日志时直接读，不回查表。
+	ContextKeyTokenOwner ContextKey = "token_owner"
 
 	/* channel related keys */
 	ContextKeyChannelId                ContextKey = "channel_id"
@@ -39,6 +41,8 @@ const (
 	ContextKeyChannelIsMultiKey        ContextKey = "channel_is_multi_key"
 	ContextKeyChannelMultiKeyIndex     ContextKey = "channel_multi_key_index"
 	ContextKeyChannelKey               ContextKey = "channel_key"
+	// [FORK] 供应商名（= channels.tag）快照，写日志时直接读，不回查 channels 表。
+	ContextKeyChannelTag ContextKey = "channel_tag"
 	// ContextKeyProviderPlugin holds the jsplugin.PinnedPlugin whose relay
 	// routes serve this request on a task plugin channel.
 	ContextKeyProviderPlugin ContextKey = "provider_plugin"

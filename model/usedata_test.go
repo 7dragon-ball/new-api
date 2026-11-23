@@ -8,9 +8,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// 必须用真实量级的 Unix 秒：LogQuotaData 按小时截断，太小的值会截成 0，
-// 而 0 会被 GORM 的 autoCreateTime 当成「未设置」覆盖成写入时刻，
-// 导致 upsert 的判据永远匹配不到已插入行，测试就测不到聚合键。
+// 必须用真实量级的 Unix 秒：LogQuotaData 按小时截断，太小的值截成 0 会被 GORM 的
+// autoCreateTime 当成未设置覆盖掉，upsert 判据就永远匹配不到已插入行。
 const testQuotaTS = 1795162654
 
 // resetQuotaDataState 清空内存缓存与表数据。
@@ -28,8 +27,7 @@ func resetQuotaDataState(t *testing.T) {
 	t.Cleanup(reset)
 }
 
-// 显示名与部门必须进聚合键：不进的话改名后新旧记录会被合并成一行，
-// 内存缓存与数据库 upsert 两处必须是同一套键（漏一处会「内存两行、库里一行」）。
+// 显示名与部门必须进聚合键：不进的话改名后新旧记录会被合并，历史被改后的名字覆盖。
 func TestQuotaDataAggregatesByDisplayName(t *testing.T) {
 	resetQuotaDataState(t)
 
@@ -68,8 +66,7 @@ func TestQuotaDataAggregatesByDepartment(t *testing.T) {
 	require.Len(t, rows, 2, "部门不同必须是两行，不能合并")
 }
 
-// 反向保障：键里加了字段后，完全相同的用量仍必须累加进同一行。
-// 只测「拆成两行」抓不到「键被改坏、永远合不上」。
+// 反向保障：只测「拆成两行」抓不到「键被改坏、永远合不上」，相同的用量仍必须累加。
 func TestQuotaDataMergesIdenticalRows(t *testing.T) {
 	resetQuotaDataState(t)
 

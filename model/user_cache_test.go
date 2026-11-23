@@ -1,7 +1,6 @@
 package model
 
 import (
-	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -13,25 +12,16 @@ import (
 )
 
 // UserBase 新增字段必须体现在缓存往返与上下文写入两处。
-func TestUserBaseCarriesDisplayNameAndDepartment(t *testing.T) {
-	truncateTables(t)
-	dept := &Department{Id: 7, Name: "技术部"}
-	require.NoError(t, DB.Create(dept).Error)
-	t.Cleanup(func() { DB.Unscoped().Delete(&Department{}, 7) })
-	deptID := dept.Id
-	user := &User{Id: 42, Username: "zhangwei", DisplayName: "张三", Group: "default", DepartmentId: &deptID}
+func TestUserBaseCarriesDisplayName(t *testing.T) {
+	user := &User{Id: 42, Username: "zhangwei", DisplayName: "张三", Group: "default"}
 	base := user.ToBaseUser()
 	assert.Equal(t, "张三", base.DisplayName, "显示名必须进缓存，否则日志热路径只能查库")
-	// 部门 id 刻意不进 UserBase：结构体相等用于缓存一致性判断，指针字段会误判。
-	assert.NotContains(t, fmt.Sprintf("%+v", *base), "DepartmentId")
+	// 部门名不在这里取：User 只有部门 id，名字由 baseUserWithDepartment 查字典表补上。
+	assert.Equal(t, "", base.DepartmentName)
 }
 
-// 回归：UserBase 里不能出现指针字段。
-//
-// PublishUserAuthCache 用 `*a == *b` 比较两次独立 DB 读取的结果来判断
-// 「元数据是否还在变」。带着 *int 字段时，同一个人两次读取的指针必然不同，
-// 会被判成永远在变，函数跑满 3 次重试后返回错误——而它被改用户、批量重置
-// 密码、passkey、2FA 等十几处调用。
+// 回归：UserBase 里不能出现指针字段。PublishUserAuthCache 用 `*a == *b` 比较两次
+// 独立 DB 读取的结果，`*int` 字段会让同一个人永远判不等，跑满重试后报错。
 func TestPublishUserAuthCacheSucceedsWithDepartment(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -48,9 +38,8 @@ func TestPublishUserAuthCacheSucceedsWithDepartment(t *testing.T) {
 	require.NoError(t, PublishUserAuthCache(user.Id))
 }
 
-// 缓存是逐字段写 Redis 的（Lua 脚本里列了字段名），光改结构体不会让新字段落库。
-// 这条用例真的走一遍 populate → HGETALL，钉住脚本与结构体同步，否则上线后
-// 字段永远读回空串，而 MAC 又因为结构体变了而对不上。
+// 缓存是逐字段写 Redis 的（Lua 脚本里列了字段名），光加结构体字段不会落库：
+// 走一遍 populate → HGETALL，钉住脚本与结构体同步。
 func TestUserBaseIdentitySurvivesCacheRoundTrip(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -92,16 +81,11 @@ func TestUserBaseNilDepartmentRoundTrip(t *testing.T) {
 	assert.Equal(t, "", cached.DepartmentName)
 }
 
-// 结构变更后旧缓存必须被判定为过期，否则老数据会一直缺这些字段。
-func TestUserBaseSchemaVersionBumped(t *testing.T) {
-	assert.Equal(t, 3, userCacheSchemaVersion,
-		"UserBase 加字段必须升版本号，否则旧 Redis 缓存继续通过 MAC 校验")
-}
+// 结构变更后旧缓存必须被判为过期，否则老数据会一直缺这些字段。版本号本身不单独立
+// 用例（它是写进缓存自己 MAC 里的私有常量），真实约束由下面的往返用例覆盖。
 
-// 回归：updateUserCache 不能把部门名冲成空串。
-//
-// 它覆盖改密码 / 改角色 / 改部门 / 2FA / passkey 等十几处调用；只写
-// ToBaseUser() 会让「用户改过一次资料」之后一个缓存周期内写入的日志全无部门。
+// 回归：updateUserCache 不能把部门名冲成空串——它覆盖改密码、改角色、改部门、
+// 2FA、passkey 等十几处调用，只写 ToBaseUser() 会让这些操作之后的日志全无部门。
 func TestUpdateUserCacheKeepsDepartmentName(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -122,10 +106,8 @@ func TestUpdateUserCacheKeepsDepartmentName(t *testing.T) {
 	assert.Equal(t, "技术部", cached.DepartmentName, "改资料后部门名必须还在")
 }
 
-// 回归：GetUserCache 冷启动（Redis miss）的返回值也要带部门名。
-//
-// 旧实现 miss 分支先 populateUserCache 灌对了 Redis，却返回 user.ToBaseUser()，
-// 于是每个缓存周期都有一条请求拿到空部门。
+// 回归：GetUserCache 冷启动（Redis miss）的返回值也要带部门名，与写进 Redis 的是
+// 同一份——直接返回 ToBaseUser() 会让每个缓存周期的第一条请求拿到空部门。
 func TestGetUserCacheColdMissCarriesDepartmentName(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -145,4 +127,27 @@ func TestGetUserCacheColdMissCarriesDepartmentName(t *testing.T) {
 	warm, err := GetUserCache(user.Id)
 	require.NoError(t, err)
 	assert.Equal(t, "冷启动部", warm.DepartmentName)
+}
+
+// Redis 关闭时 GetUserCache 是鉴权热路径（每个请求都调），不能去查 department：
+// 没有缓存复用结果，等于每个请求多一次查询。部门名此时留空。
+func TestGetUserCacheWithoutRedisSkipsDepartmentLookup(t *testing.T) {
+	truncateTables(t)
+	prevRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = prevRedis })
+
+	dept := &Department{Name: "热路径部"}
+	require.NoError(t, DB.Create(dept).Error)
+	t.Cleanup(func() { DB.Unscoped().Delete(dept) })
+	deptID := dept.Id
+	user := User{Username: "no-redis", DisplayName: "王五", Group: "default",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled,
+		AuthVersion: 1, DepartmentId: &deptID}
+	require.NoError(t, DB.Create(&user).Error)
+
+	cached, err := GetUserCache(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "王五", cached.DisplayName, "显示名不依赖字典表，必须照常返回")
+	assert.Equal(t, "", cached.DepartmentName, "Redis 关闭时不为部门名额外查库")
 }
