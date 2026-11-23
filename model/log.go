@@ -535,9 +535,21 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
+	tokenOwner := ""
 	if params.TokenId > 0 {
 		if token, err := GetTokenById(params.TokenId); err == nil {
 			tokenName = token.Name
+			tokenOwner = token.Owner
+		}
+	}
+	// 任务计费没有请求上下文，渠道名/供应商只能在写日志时查一次。渠道是硬删除，
+	// 不写快照的话这几列在渠道删掉后永久为空（列表只能靠 channels 表反查）。
+	channelName := ""
+	channelTag := ""
+	if params.ChannelId > 0 {
+		if channel, err := CacheGetChannel(params.ChannelId); err == nil {
+			channelName = channel.Name
+			channelTag = channel.GetTag()
 		}
 	}
 	createdAt := common.GetTimestamp()
@@ -560,6 +572,9 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		TokenId:     params.TokenId,
 		Group:       params.Group,
 		Other:       other.JSONString(),
+		ChannelName: channelName,
+		ChannelTag:  channelTag,
+		TokenOwner:  tokenOwner,
 	}
 	err := createLog(log)
 	if err != nil {

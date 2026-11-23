@@ -259,3 +259,64 @@ func TestRecordTaskBillingLogSnapshotsCachedIdentity(t *testing.T) {
 		assert.Equal(t, "算法部", quotaData.Department)
 	}
 }
+
+// 回归：任务计费日志没有请求上下文，渠道名 / 供应商 / 秘钥使用方只能写入时取一次。
+// 渠道是硬删除，不写快照的话这几列在渠道删掉后永久为空——而列表回填只补 channel_name，
+// 同一列在同步请求日志和任务日志上会变成两种语义。
+func TestRecordTaskBillingLogSnapshotsChannelNameAndTag(t *testing.T) {
+	truncateTables(t)
+	prevConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = true
+	t.Cleanup(func() { common.LogConsumeEnabled = prevConsume })
+	// 导出流边遍历结果集边反查渠道：sqlite 测试库是单连接，回查库会死锁。
+	prevMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = prevMemoryCache
+		InitChannelCache()
+	})
+
+	token := &Token{UserId: 424242, Name: "任务令牌", Key: "task-snapshot-token-key", Owner: "算法组"}
+	require.NoError(t, DB.Create(token).Error)
+	channel := &Channel{Name: "任务渠道"}
+	channel.SetTag("OpenAI")
+	require.NoError(t, DB.Create(channel).Error)
+	InitChannelCache()
+
+	RecordTaskBillingLog(RecordTaskBillingLogParams{
+		UserId:    424242,
+		LogType:   LogTypeConsume,
+		Content:   []*common.Message{common.NewMessage("task billing")},
+		ChannelId: channel.Id,
+		ModelName: "task-model",
+		Quota:     1,
+		TokenId:   token.Id,
+		Group:     "default",
+		Other:     NewLogOther(),
+	})
+
+	var logRow Log
+	require.NoError(t, LOG_DB.Where("user_id = ?", 424242).First(&logRow).Error)
+	assert.Equal(t, "任务渠道", logRow.ChannelName)
+	assert.Equal(t, "OpenAI", logRow.ChannelTag)
+	assert.Equal(t, "算法组", logRow.TokenOwner)
+
+	// 渠道与令牌都被硬删除后，读取侧只能靠行内快照。
+	require.NoError(t, DB.Unscoped().Delete(channel).Error)
+	require.NoError(t, DB.Unscoped().Delete(token).Error)
+	InitChannelCache()
+
+	logs, _, err := GetAllLogs(LogFilter{Type: LogTypeConsume}, 0, 100)
+	require.NoError(t, err)
+	var listed *Log
+	for _, log := range logs {
+		if log.UserId == 424242 {
+			listed = log
+			break
+		}
+	}
+	require.NotNil(t, listed)
+	assert.Equal(t, "任务渠道", listed.ChannelName, "渠道已删，列表不得把快照盖成空串")
+	assert.Equal(t, "OpenAI", listed.ChannelTag)
+	assert.Equal(t, "算法组", listed.TokenOwner)
+}
