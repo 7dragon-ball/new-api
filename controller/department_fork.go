@@ -190,6 +190,12 @@ func UpdateUserDepartment(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	// 部门改动不动 auth_version，鉴权缓存不会自己失效；不刷新就有最多一个 TTL 的
+	// 旧部门名，这期间写出的日志与 quota_data 快照会永久记在旧部门上。与合并编辑
+	// 路径（PUT /api/user/）同口径：事务已提交，刷新失败只记日志不回滚。
+	if err := model.PublishUserAuthCache(id); err != nil {
+		common.SysLog(common.LogText("failed to publish auth cache for user %d: %s", id, err.Error()))
+	}
 	// 审计参数传解引用后的值而不是 *int：auditContentEN 用 %v 渲染模板里的占位符，
 	// 传指针会让 Content 写成 "0xc0004a21b0"（清空时是 "<nil>"）。
 	var auditDepartmentID any
