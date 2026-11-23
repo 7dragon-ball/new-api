@@ -1715,10 +1715,9 @@ func FetchModels(c *gin.Context) {
 			baseURL = constant.GetChannelBaseURL(req.Type)
 		}
 
-		key := strings.TrimSpace(req.Key)
-		if req.Type != constant.ChannelTypeCodex {
-			key = strings.Split(key, "\n")[0]
-		}
+		// [FORK] 与 POST /api/channel/test 共用 credentialKeyFor，
+		// 避免两处「先 trim 再取第一把、Codex 保留多行」的口径分叉。
+		key := credentialKeyFor(req.Type, req.Key)
 		channel = &model.Channel{
 			Type:    req.Type,
 			Key:     key,

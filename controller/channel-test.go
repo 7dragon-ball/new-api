@@ -104,6 +104,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		ctx = context.Background()
 	}
 	tik := time.Now()
+	// [FORK] 预览态：未落库的临时渠道（Id == 0，见 TestChannelByCredentials）。
+	// 预览态不读网关定价、不结算、不写消费日志。
+	preview := channel.Id == 0
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
 		constant.ChannelTypeMidjourneyPlus,
@@ -338,11 +341,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//logInfo.ApiKey = ""
 	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
 
-	// [FORK] 预览态（未落库的临时渠道，Id == 0）跳过定价校验：
-	// 成本表在 BFF 的 channel_costs，与网关 model_ratio 是两套数据，
-	// 不跳过会让「新建渠道测试」在网关未配价的模型上全部失败，且失败原因与连通性无关。
+	// [FORK] 预览态跳过定价校验：成本表在 BFF 的 channel_costs，与网关 model_ratio
+	// 是两套数据，不跳过会让「新建渠道测试」在网关未配价的模型上全部失败，
+	// 且失败原因与连通性无关。
 	priceData := hosttypes.PriceData{}
-	if channel.Id > 0 {
+	if !preview {
 		priceData, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
 		if err != nil {
 			return testResult{
@@ -497,10 +500,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		if httpResp.StatusCode != http.StatusOK {
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			// [FORK] 预览态的 key 来自请求体（任意管理员可提交），上游错误体可能回显它；
-			// 落 syslog 前按同一口径脱敏，否则容器日志里会出现明文密钥。
+			// 落 syslog 前按与响应体相同的口径脱敏，否则容器日志里会出现明文密钥。
+			// err 的静态类型是 *types.NewAPIError，这里要的是 error。
 			var logErr error = err
-			if channel.Id == 0 {
-				logErr = redactKeyInError(logErr, channel.Key)
+			if preview {
+				logErr = sanitizeFetchModelsError(logErr, channel.Key)
 			}
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -554,7 +558,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	info.SetEstimatePromptTokens(usage.PromptTokens)
 
 	// [FORK] 预览态不结算、不写消费日志：Id == 0 会把这些记录挂到 channel 0 上。
-	if channel.Id > 0 {
+	if !preview {
 		quota, tieredResult := settleTestQuota(info, priceData, usage)
 		tok := time.Now()
 		milliseconds := tok.Sub(tik).Milliseconds()

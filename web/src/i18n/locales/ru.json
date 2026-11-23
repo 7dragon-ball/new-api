@@ -7058,6 +7058,7 @@
     "Type *": "Тип *",
     "Type <username/> to confirm": "Введите <username/> для подтверждения",
     "Type a command or search...": "Введите команду или поиск...",
+    "type and model are required": "Укажите тип и модель",
     "Type the confirmation text here": "Введите текст подтверждения здесь",
     "Type-Specific Settings": "Настройки для конкретного типа",
     "Type:": "Тип:",

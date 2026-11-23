@@ -7058,6 +7058,7 @@
     "Type *": "類型 *",
     "Type <username/> to confirm": "輸入 <username/> 以確認",
     "Type a command or search...": "輸入命令或搜尋...",
+    "type and model are required": "渠道類型和模型不能為空",
     "Type the confirmation text here": "在此輸入確認文字",
     "Type-Specific Settings": "特定類型設定",
     "Type:": "類型：",

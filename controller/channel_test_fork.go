@@ -17,13 +17,15 @@ import (
 //
 // 与 GET /api/channel/test/:id 跑的是同一个 testChannel()，区别只在渠道对象来自请求体
 // 而不是数据库：Id 保持 0，testChannel 会据此跳过定价校验与结算/消费日志。
-// body: { type, base_url?, key, model }；响应形状与 TestChannel 完全一致。
+// body: { type, base_url?, key, model, endpoint_type?, stream? }；响应形状与 TestChannel 完全一致。
 func TestChannelByCredentials(c *gin.Context) {
 	var req struct {
-		Type    int    `json:"type"`
-		BaseURL string `json:"base_url"`
-		Key     string `json:"key"`
-		Model   string `json:"model"`
+		Type         int    `json:"type"`
+		BaseURL      string `json:"base_url"`
+		Key          string `json:"key"`
+		Model        string `json:"model"`
+		EndpointType string `json:"endpoint_type"`
+		Stream       bool   `json:"stream"`
 	}
 	if err := common.DecodeJsonBody(c.Request.Body, &req); err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
@@ -48,8 +50,13 @@ func TestChannelByCredentials(c *gin.Context) {
 	channel := &model.Channel{Type: req.Type, Key: key, BaseURL: &baseURL}
 
 	// 复用保存渠道时的前置校验（代理格式、HTTP transport 设置等）。
-	// 注意它**不校验 base_url 格式**（`controller/channel.go:580-700`），非法地址会在
-	// testChannel 的 adaptor 阶段或 DoRequest 处失败，最终以 success:false 回给前端。
+	// 注意两点：
+	//   - 它**不校验 base_url 格式**（`controller/channel.go:580-700`），非法地址会在
+	//     testChannel 的 adaptor 阶段或 DoRequest 处失败，最终以 success:false 回给前端。
+	//   - 它要求依赖渠道 settings/Other 的类型带上对应配置，而本接口只收
+	//     type/base_url/key/model，所以 TaskPlugin（缺 task_plugin_key）与 VertexAI
+	//     （缺部署区域）等类型会在这里返回 400，测不到连通性。save 之后走
+	//     `GET /api/channel/test/:id` 能测，新建弹窗不能。
 	if err := validateChannel(channel, false); err != nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, sanitizeFetchModelsError(err, key))
 		return
@@ -66,7 +73,7 @@ func TestChannelByCredentials(c *gin.Context) {
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	result := testChannel(requestCtx, channel, testUserID, modelName, "", false)
+	result := testChannel(requestCtx, channel, testUserID, modelName, strings.TrimSpace(req.EndpointType), req.Stream)
 	consumedTime := time.Since(tik).Seconds()
 
 	if result.localErr != nil {
@@ -97,18 +104,13 @@ func TestChannelByCredentials(c *gin.Context) {
 }
 
 // credentialKeyFor 从用户提交的秘钥串里取出这次要用的一把，
-// 口径与 POST /api/channel/fetch_models（controller/channel.go:1717-1720）一致：
+// 口径与 POST /api/channel/fetch_models（controller/channel.go:1717）一致：
 // 先整体 trim，Codex 保留完整多行 JSON，其余类型取第一行。
+// 两边共用本函数，不要再各自内联一份。
 func credentialKeyFor(channelType int, raw string) string {
 	key := strings.TrimSpace(raw)
 	if channelType != constant.ChannelTypeCodex {
 		key = strings.Split(key, "\n")[0]
 	}
 	return key
-}
-
-// redactKeyInError 把错误文本里的明文密钥替换掉，用于写日志。
-// 上游 401 的响应体会被 RelayErrorHandler 原样拼进 err，而预览态的 key 来自请求体。
-func redactKeyInError(err error, key string) error {
-	return sanitizeFetchModelsError(err, key)
 }

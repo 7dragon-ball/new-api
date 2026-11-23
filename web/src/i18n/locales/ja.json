@@ -7058,6 +7058,7 @@
     "Type *": "タイプ *",
     "Type <username/> to confirm": "確認のため <username/> と入力してください",
     "Type a command or search...": "コマンドまたは検索を入力...",
+    "type and model are required": "タイプとモデルは必須です",
     "Type the confirmation text here": "確認テキストをここに入力",
     "Type-Specific Settings": "タイプ固有の設定",
     "Type:": "タイプ:",
