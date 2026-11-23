@@ -573,6 +573,42 @@ func TestPreviewTestChannelRedactsKeyInErrorLog(t *testing.T) {
 	}
 }
 
+// 多 Key 渠道 channel.Key 是整串（换行分隔或 Vertex 的 JSON 数组），实际下发的只是
+// SetupContextForSelectedChannel 选中的那一把。已保存渠道同样会被脱敏，所以要用上下
+// 文里那把选中 Key，否则上游回显 Authorization 时明文照样落日志。
+func TestSavedMultiKeyChannelRedactsSelectedKeyInErrorLog(t *testing.T) {
+	previewTestEnv(t)
+	pricedModel(t, "multi-key-model")
+	const firstKey = "sk-first-key-secret"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad auth: ` + r.Header.Get("Authorization") + `"}}`))
+	}))
+	defer upstream.Close()
+
+	var logged bytes.Buffer
+	previousWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logged
+	t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
+
+	base := upstream.URL
+	ch := &model.Channel{
+		Id:          42,
+		Type:        constant.ChannelTypeOpenAI,
+		Key:         firstKey + "\nsk-second-key-secret",
+		BaseURL:     &base,
+		ChannelInfo: model.ChannelInfo{IsMultiKey: true},
+	}
+	result := testChannel(t.Context(), ch, 7, "multi-key-model", "", false)
+
+	require.NotNil(t, result.localErr, "上游 401 必须失败")
+	require.Contains(t, logged.String(), "channel test bad response")
+	assert.NotContains(t, logged.String(), firstKey, "容器日志里不得出现本次选中的明文 Key")
+	assert.NotContains(t, result.localErr.Error(), firstKey)
+}
+
 // pricedModel 给模型配一个 ratio，让测试能越过定价校验走到发请求与结算那一步。
 func pricedModel(t *testing.T, name string) {
 	t.Helper()

@@ -501,7 +501,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			// [FORK] 上游错误体可能回显它收到的凭据。RelayErrorHandler 自己会把
 			// 「取不到 error message」的原始 body 打进日志，所以先把 body 里的凭据
 			// 换掉再交给它；之后的 err 已经是脱敏后的文本，外面不用再包一层。
-			httpResp.Body = redactResponseBody(httpResp.Body, credentialSecrets(channel.Type, channel.Key))
+			// 多 Key 渠道 channel.Key 是整串，实际下发的只有 SetupContextForSelectedChannel
+			// 选中的那一把，脱敏得用上下文里那把。
+			selectedKey := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+			httpResp.Body = redactResponseBody(httpResp.Body, credentialSecrets(channel.Type, selectedKey))
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
