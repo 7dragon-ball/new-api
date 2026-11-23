@@ -386,6 +386,10 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
     「沿袭自 `channels.priority` 的值」与「模型上架页单独设过的值」：做法是调用方传入编辑前的
     `channels.priority`，只有与之不同的行才视为单条覆盖保留，等于旧值的行按新 `channel.Priority`
     重算。代码注释（`model/ability.go` 的 `[FORK]` 段落）同此口径，审查时以此为据。
+  - 「`PUT /api/channel/` 带 priority 返回成功但选路不变，属于对管理 API 契约的静默变更」
+    同样按此边界处理：不补回归测试去固定一个产品不使用的行为，也不改成拒绝 priority。前提一旦
+    变化（启用控制台、BFF 或脚本开始改渠道级 priority），按上一条补「沿袭值 vs 单条覆盖」的区分
+    逻辑并补 `Channel.Update` 的回归测试，而不是保留现在的静默行为。
 
 - **`FixAbility`（`POST /api/channel/fix`）不保留逐条 priority。** 它与 `UpdateAbilities` 相反：
   `TRUNCATE` 后按 `channels` 用 `AddAbilities` 重建，每行 priority 取 `channels.priority`（渠道无该值时
@@ -411,8 +415,20 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 - **group 用渠道原始 token**：`UpdateAbilities` 按 `channels.group` 的原始 token 写 group 列
   （不 trim），所以校验与回写都用原始 token，否则刚重建出来的行查不到。
 - **重复新增返回 400**（`The supply relation already exists`），不静默成功；删除不存在的行返回 404。
-- **已知边界**：`channels.models` 是渠道级而不是 group 级的列，多 group 渠道删一条会连带移除
-  其它 group 下的同名行——与「在渠道接入改模型清单」的行为一致。
+- **已知边界：单条增删只对单 group 渠道语义正确，多 group 渠道会连带影响其它 group。**
+  `channels.models` 是渠道级而不是 group 级的列，`abilities` 又按它重建，所以两处都不是 group 级：
+  - 新增（`POST /api/channel/ability`）：请求 `group=vip` 时模型名照样写进 `channels.models`，
+    重建会给该渠道**每个 group** 各插一行。请求里那条（`vip`）的 priority 用 body 传入值，其它
+    group（如 `default`）的新行取 `channels.priority`——原本不服务该模型的 `default` 也可能开始
+    被选路。
+  - 删除（`DELETE /api/channel/ability`）：摘掉模型名后，其它 group 下的同名行一起消失——与
+    「在渠道接入改模型清单」的行为一致。
+
+  两条路径的响应都只回请求里那一行，不返回实际受影响的 group，调用方无法从结果判断影响范围。
+  **本产品只建单 group 渠道**（BFF 也固定写 `default`，见本节末的已知边界），所以不为此改成
+  group 级模型清单，也不在接口里拒绝多 group 渠道。若将来允许建多 group 渠道，必须二选一：改成
+  group 级模型清单，或在这两个接口里显式拒绝 group 数 > 1 的渠道（400），并补一条 `default,vip`
+  渠道的回归测试，断言只影响请求的 group。
 
 **已知边界**：BFF 的写接口固定落 `default` 组；查询表本身不做 group 过滤，但部署里若存在多 group
 渠道，单条优先级目前只对 `default` 组生效。
