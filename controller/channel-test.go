@@ -104,6 +104,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		ctx = context.Background()
 	}
 	tik := time.Now()
+	// [FORK] 预览态：未落库的临时渠道（Id == 0，见 TestChannelByCredentials）。
+	// 预览态不读网关定价、不结算、不写消费日志。
+	preview := channel.Id == 0
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
 		constant.ChannelTypeMidjourneyPlus,
@@ -338,12 +341,18 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//logInfo.ApiKey = ""
 	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
 
-	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+	// [FORK] 预览态跳过定价校验：成本表在 BFF 的 channel_costs，与网关 model_ratio
+	// 是两套数据，不跳过会让「新建渠道测试」在网关未配价的模型上全部失败，
+	// 且失败原因与连通性无关。
+	priceData := hosttypes.PriceData{}
+	if !preview {
+		priceData, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+			}
 		}
 	}
 
@@ -489,6 +498,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
+			// [FORK] 上游错误体可能回显它收到的凭据。RelayErrorHandler 自己会把
+			// 「取不到 error message」的原始 body 打进日志，所以先把 body 里的凭据
+			// 换掉再交给它；之后的 err 已经是脱敏后的文本，外面不用再包一层。
+			// 多 Key 渠道 channel.Key 是整串，实际下发的只有 SetupContextForSelectedChannel
+			// 选中的那一把，脱敏得用上下文里那把。
+			httpResp.Body = redactResponseBody(httpResp.Body, selectedCredentialSecrets(c, channel))
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -541,25 +556,31 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
 
-	quota, tieredResult := settleTestQuota(info, priceData, usage)
-	tok := time.Now()
-	milliseconds := tok.Sub(tik).Milliseconds()
-	consumedTime := float64(milliseconds) / 1000.0
-	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
-	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
-		ChannelId:        channel.Id,
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		ModelName:        info.OriginModelName,
-		TokenName:        "Model test",
-		Quota:            quota,
-		Content:          []*common.Message{common.NewMessage("Model test")},
-		UseTimeSeconds:   int(consumedTime),
-		IsStream:         info.IsStream,
-		Group:            info.UsingGroup,
-		Other:            other,
-	})
-	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	// [FORK] 预览态不结算、不写消费日志：Id == 0 会把这些记录挂到 channel 0 上。
+	if !preview {
+		quota, tieredResult := settleTestQuota(info, priceData, usage)
+		tok := time.Now()
+		milliseconds := tok.Sub(tik).Milliseconds()
+		consumedTime := float64(milliseconds) / 1000.0
+		other := buildTestLogOther(c, info, priceData, usage, tieredResult)
+		model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+			ChannelId:        channel.Id,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ModelName:        info.OriginModelName,
+			TokenName:        "Model test",
+			Quota:            quota,
+			Content:          []*common.Message{common.NewMessage("Model test")},
+			UseTimeSeconds:   int(consumedTime),
+			IsStream:         info.IsStream,
+			Group:            info.UsingGroup,
+			Other:            other,
+		})
+	}
+	// [FORK] 成功响应体同样可能回显它收到的凭据（base_url 误配到回显服务或调试网关），
+	// 这条日志是那次 body 唯一落盘的地方，写之前按本次下发的 Key 脱敏。
+	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id,
+		redactCredentialText(string(respBody), selectedCredentialSecrets(c, channel))))
 	return testResult{
 		context:     c,
 		localErr:    nil,
@@ -919,10 +940,15 @@ func TestChannel(c *gin.Context) {
 		requestCtx = c.Request.Context()
 	}
 	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	// [FORK] 这个接口只需要 ChannelOperate 权限，而 testChannel 会把上游回显的凭据带进
+	// localErr / newAPIError（例如 200 响应体里就是「invalid api key: sk-xxx」），回
+	// 给前端等于绕开查看渠道密钥所需 ChannelSensitiveWrite。脱敏集合用本次实际下发的
+	// 那把 Key，多 Key 渠道同一条口径。
+	secrets := selectedCredentialSecrets(result.context, channel)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
-			"message": result.localErr.Error(),
+			"message": redactCredentialError(result.localErr, secrets).Error(),
 			"time":    0.0,
 		}
 		if result.newAPIError != nil {
@@ -938,7 +964,7 @@ func TestChannel(c *gin.Context) {
 	if result.newAPIError != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success":    false,
-			"message":    result.newAPIError.Error(),
+			"message":    redactCredentialError(result.newAPIError, secrets).Error(),
 			"time":       consumedTime,
 			"error_code": result.newAPIError.GetErrorCode(),
 		})

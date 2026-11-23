@@ -302,6 +302,48 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `invalidateUserCache`：那会连缓存里的 `Quota` 一起丢掉，而批量更新模式下数据库余额还没跟上
   缓存，重建时会读出偏高的余额。
 
+### 八、新建渠道按凭据测试连通性
+
+上游只有 `GET /api/channel/test/:id`，必须先落库拿到 id 才能测。管理端「新建渠道」弹窗在保存前
+就要逐模型测连通性，于是加一个 `POST /api/channel/test`：
+
+- `controller/channel_test_fork.go` —— 用请求体里的 `type/base_url/key/model/endpoint_type?/stream?` 内存构造
+  `model.Channel`（`Id = 0`），复用现有 `testChannel()`。与 `POST /api/channel/fetch_models`
+  同一套「不落库预览」思路。多行秘钥只取第一把（`credentialKeyFor`，与 `fetch_models` 共用同一实现）；
+  key 允许为空，因为「自建算力」渠道走内网网关、上游不校验秘钥。`endpoint_type` / `stream` 与
+  `GET /test/:id` 同口径透传（新建弹窗要测非 chat 端点或流式）；未知的 `endpoint_type` 落回
+  `testChannel()` 默认分支（chat 端点 + OpenAI 格式），与老接口行为一致。
+- `controller/channel-test.go` 五处 `// [FORK]` —— `testChannel()` 开头算一次 `preview := channel.Id == 0`，
+  据此跳过定价校验（网关 `model_ratio` 与平台成本表是两套数据，不跳过会让未配价模型全部测试失败）、
+  结算/消费日志（否则记到 channel 0），并在调 `RelayErrorHandler` 前把上游响应体里的明文凭据
+  （含 Codex 的 OAuth token）替换成 `[REDACTED]`；`TestChannel` 的两个错误分支再对回给前端的
+  message 做一次同样的脱敏——这个接口只需要 `ChannelOperate`，上游回显 Key 等于绕开
+  `ChannelSensitiveWrite` 读到密钥。
+- 错误 message 过 `redactCredentialError`，脱敏集合由 `credentialSecrets()` 给出（秘钥本身 +
+  Codex 的 `access_token`/`id_token`/`refresh_token`），多 Key 渠道取上下文里本次实际下发的那把。
+  文本规则在 `redactCredentialText()` 里（原文 + QueryEscape + PathEscape 三种形式），
+  `redactCredentialError()` 只多一层「没替换到东西时原样返回原 error」——渠道测试要保留
+  `*common.Message` 的 `message_key`（前端靠它翻译），上游的 `sanitizeFetchModelsError()`
+  （`fetch_models` / 渠道余额）没这个需要，所以还是 `errors.New` 重包。
+
+  **上游那份 `sanitizeFetchModelsError()` 保持原样，fork 不改它**（它所在的
+  `controller/channel_upstream_update.go` 是上游高频改动的文件，为了一个无行为变化的
+  重构去碰它不值得）。代价是同一套替换规则存在两份等价实现：动了其中一份的语义要同步另一份。
+- `router/channel-router.go` 注册 `POST /test`，权限用 `authz.ChannelSensitiveWrite`（与 `POST /fetch_models` 一致）：
+  两者都是「带鉴权头打管理员临时输入的 base_url 并回显上游错误」，对只有 `ChannelOperate` 的管理员
+  等于一个有回显的内网探测能力。
+
+**已知缺口：依赖渠道 settings 的类型测不到。** 构造出来的临时渠道只有 `type/base_url/key`，
+`validateChannel()` 要求它们补齐 settings / `Other`，所以 `TaskPlugin`（缺 `task_plugin_key`）与
+`VertexAI`（缺部署区域）在预览态会直接 400。`POST /fetch_models` 用
+`applyTaskPluginModelPreview` / `buildAdvancedCustomModelPreviewChannel` 补齐了其中一部分；本接口
+**没有**跟着补——保存后走 `GET /api/channel/test/:id` 能测，新建弹窗对这些类型不能测。
+需要时再按同样的思路补，别指望它现在能覆盖全部渠道类型。
+
+400 的 message key `type and model are required` 已登记进 7 个前端语言包（与 `Invalid parameters` 同口径）。
+
+`testChannel()` 签名未变，既有两个调用点（`TestChannel` 与 `testChannelForHealthCheck`）零改动。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -347,6 +389,11 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
+| `router/channel-router.go` | 权限路由表插入 `POST /test`（1 处 `[FORK]`，用 `ChannelSensitiveWrite`） | 低，单行 |
+| `router/channel_router_test.go` | 同上路由的权限断言 | 低 |
+| `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志、错误日志脱敏，`TestChannel` 回前端前脱敏（5 处 `[FORK]`） | 中，逐模型测试热路径 |
+| `controller/channel.go` | `FetchModels` 的取 key 逻辑改为调 `credentialKeyFor`（1 处 `[FORK]`） | 低，单行 |
+| `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态用例（跳过定价/消费日志、日志脱敏） | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
 | `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
@@ -391,6 +438,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
 | `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |
 | `service/security_verification_batch_password_fork.go` | proof context 定义、id 集合校验（≤100、升序、不许重复） |
+| `controller/channel_test_fork.go` | `POST /api/channel/test` handler：按凭据构造临时渠道、复用 `testChannel()`、错误脱敏 |
+| `controller/channel_test_fork_test.go` | handler 级用例：入参 400、空秘钥放行、上游失败不回 HTTP 错、密钥不回显、多行 key 口径、`endpoint_type`/`stream` 透传 |
 | `controller/user_batch_password_reset_fork_test.go` | controller 包测试（含锁内二次授权与整批回滚） |
 
 （另有 3 个上游测试文件被改签名或补迁移。）上游若在这些路径放了同名文件，
