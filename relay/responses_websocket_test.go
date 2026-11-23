@@ -812,13 +812,19 @@ func TestRestoreConnectionContextPreservesChannelKeyForFingerprint(t *testing.T)
 
 // 上面那条用例直接构造 lockedContext，测不到「建立连接时把哪些键收进 lockedContext」。
 // 白名单漏掉 ChannelKey 时它依然绿。这条直接断言白名单本身。
-func TestLockedContextKeysIncludesChannelKey(t *testing.T) {
-	var found bool
-	for _, key := range lockedContextKeys {
-		if key == constant.ContextKeyChannelKey {
-			found = true
-			break
+func TestLockedContextKeysIncludesChannelSnapshotKeys(t *testing.T) {
+	// 两列都是写日志时从上下文抄的快照：白名单漏掉哪个，重连后的日志就少哪个。
+	for key, reason := range map[constant.ContextKey]string{
+		constant.ContextKeyChannelKey: "重连后的日志算不出密钥指纹",
+		constant.ContextKeyChannelTag: "重连后写出的日志丢掉供应商快照",
+	} {
+		var found bool
+		for _, locked := range lockedContextKeys {
+			if locked == key {
+				found = true
+				break
+			}
 		}
+		assert.True(t, found, "lockedContextKeys 必须含 %s，否则%s", key, reason)
 	}
-	assert.True(t, found, "lockedContextKeys 必须含 ContextKeyChannelKey，否则重连后的日志算不出指纹")
 }

@@ -288,7 +288,15 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `quota_data` 的存量行是 NULL 而不是空串，拼接/展示时按「未知」处理。老日志按旧列名（`users`
   反查）展示的旧逻辑不改也不补——两套数据共存时，新行显示快照，老行显示当前值/空。
 
-**已知缺口**：只对新建行生效，存量不回填、不做修复脚本（与渠道秘钥指纹同一形态）。
+**已知缺口**：
+
+- 只对新建行生效，存量不回填、不做修复脚本（与渠道秘钥指纹同一形态）。
+- **部门改名不会立刻刷新成员缓存**：`UpdateDepartment` 只改 `department` 表，`user:<id>` 里的
+  `DepartmentName` 要等缓存过期（`SYNC_FREQUENCY`，默认 60s）才重建，所以这段时间内新产生的
+  日志/用量仍写旧名，`quota_data` 会把旧名/新名拆成两行。当前业务没有部门改名操作，故未加
+  「按部门批量刷成员缓存」的代码。若以后要启用改名，在改名成功后按 `department_id` 取成员 id
+  逐个 `PublishUserAuthCache`——不要用 `invalidateUserCache`：那会连缓存里的 `Quota` 一起丢掉，
+  而批量更新模式下数据库余额还没跟上缓存，重建时会读出偏高的余额。
 
 ## 数据库
 
@@ -318,8 +326,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 - 但**老 ClickHouse 日志库升级不补列**：`CREATE TABLE IF NOT EXISTS` 在已存在的表上是空操作，
   且本 fork 未实现 `ALTER TABLE logs ADD COLUMN`。若将来真的要启用 ClickHouse，必须先补这一步，
   否则老库升级后每条日志写入都会以 `NO_SUCH_COLUMN_IN_TABLE` 失败。
-- 不启用 ClickHouse 时，日志表随主库走 PG，由 goose 迁移（`migrations/postgres/`）与
-  `AutoMigrate`（`migrateDB()` 的 `&Log{}`）两条幂等路径建列/补列，不受上述限制影响。
+- 不启用 ClickHouse 时，日志表随主库走 PG，由 `migrateDB()` 的 `AutoMigrate`（含 `&Log{}`）
+  在建表/启动时建列、补列，不受上述限制影响。
 
 ## 改了哪些文件
 
@@ -349,7 +357,6 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/usedata.go` | `QuotaData` 加 `display_name` / `department` 并入聚合键；`quotaDataKeyParts()` 成为 10 列键的唯一定义 | 中，聚合键写错只错数据、不报错 |
 | `model/user_cache.go` | `baseUserWithDepartment` 成为「用户 → 带部门名的 `UserBase`」的唯一实现，三个缓存路径共用 | 中 |
 | `model/user_auth_cache.go` | 内联 Lua 多写两列（ARGV 下标必须与 `UserBase` 字段顺序对齐）；`userCacheSchemaVersion` 升 3 | **最高**，漏写一列就永远读回空串 |
-| `model/user_cache_test.go` | 缓存往返、`updateUserCache`、冷启动返回值的回归 | 低 |
 | `model/redemption.go` | 兑换时抄一份兑换人用户名/显示名 | 低 |
 | `constant/context_key.go` | 新增 `ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName` | 低 |
 | `middleware/auth.go` | 鉴权通过后把身份写进上下文 | 低 |
@@ -374,6 +381,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
 | `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
 | `model/log_identity_snapshot_fork_test.go` | 身份快照的写入/读取侧回归（上下文、后台路径、删除后列表） |
+| `model/user_cache_fork_test.go` | 缓存往返、`updateUserCache`、冷启动返回值、Redis 关闭时不查部门 |
+| `model/usedata_fork_test.go` | `quota_data` 按身份快照分桶、同键累加的回归 |
 | `common/random_password_fork.go` | 8 位随机账号密码：三类字符必现、Fisher–Yates 打散位置、`crypto/rand` 无偏 |
 | `model/user_batch_password_fork.go` | `LockUserForBatchPasswordResetWithTx`（Unscoped 行锁，软删行也要锁得到） |
 | `controller/user_batch_password_reset_fork.go` | 批量重置 handler + 事务体 `resetBatchPasswordsInTx`（锁内二次授权在那里） |

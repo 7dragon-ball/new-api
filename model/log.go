@@ -171,13 +171,18 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 	}
 }
 
+// formatUserLog 抹掉普通用户不该看到的字段：渠道名 / 供应商 / 使用方都是管理侧口径。
+// 用户日志列表与用户导出共用它，两条读取路径的口径才不会分叉。
+func formatUserLog(log *Log) {
+	log.ChannelName = ""
+	log.ChannelTag = ""
+	log.TokenOwner = ""
+	log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+}
+
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
-		// 渠道名 / 供应商 / 使用方都是管理侧口径，普通用户自己的日志里不带回。
-		logs[i].ChannelName = ""
-		logs[i].ChannelTag = ""
-		logs[i].TokenOwner = ""
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
+		formatUserLog(logs[i])
 	}
 	assignDisplayLogIds(logs, startIdx)
 }
@@ -767,8 +772,7 @@ func StreamUserLogs(ctx context.Context, userId int, filter LogFilter, fn func(*
 	return streamLogs(tx, "logs.id desc", func(log *Log) error {
 		count++
 		log.Id = count
-		log.ChannelName = ""
-		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+		formatUserLog(log)
 		return fn(log)
 	})
 }

@@ -99,9 +99,10 @@ type responsesWSCallState struct {
 //
 // ContextKeyChannelKey 必须在其中：重连后写日志要靠它算密钥指纹
 // （service.AppendChannelKeyFingerprint），漏掉会让重连后的日志静默丢掉指纹。
+// 渠道名与供应商名同理：写日志时只从上下文抄快照，漏掉就是这几列在重连后的请求里为空。
 // 提成包级变量是为了让测试能直接断言这一点——嵌在建立连接的流程里测不到。
 var lockedContextKeys = []appconstant.ContextKey{
-	appconstant.ContextKeyChannelId, appconstant.ContextKeyChannelName, appconstant.ContextKeyChannelType,
+	appconstant.ContextKeyChannelId, appconstant.ContextKeyChannelName, appconstant.ContextKeyChannelTag, appconstant.ContextKeyChannelType,
 	appconstant.ContextKeyChannelCreateTime, appconstant.ContextKeyChannelSetting, appconstant.ContextKeyChannelOtherSetting,
 	appconstant.ContextKeyChannelParamOverride, appconstant.ContextKeyChannelHeaderOverride, appconstant.ContextKeyChannelOrganization,
 	appconstant.ContextKeyChannelAutoBan, appconstant.ContextKeyChannelModelMapping, appconstant.ContextKeyChannelStatusCodeMapping,

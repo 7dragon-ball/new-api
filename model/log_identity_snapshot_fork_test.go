@@ -146,6 +146,39 @@ func TestReadPathsKeepChannelSnapshotAfterChannelDeleted(t *testing.T) {
 	assert.Equal(t, []string{"已删渠道"}, streamed, "导出流同样不能用空串盖掉行内快照")
 }
 
+// 用户导出与用户列表是同一条用户可见读取路径：管理侧口径的渠道名 / 供应商 / 使用方
+// 在两边都必须被抹掉，否则导出的 JSON 行比列表多带两个字段。
+func TestStreamUserLogsStripsAdminOnlySnapshotFields(t *testing.T) {
+	require.NoError(t, LOG_DB.AutoMigrate(&Log{}))
+	clear := func() {
+		_ = LOG_DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Log{}).Error
+	}
+	clear()
+	t.Cleanup(clear)
+
+	require.NoError(t, LOG_DB.Create(&Log{
+		UserId:      616161,
+		ChannelId:   987654,
+		ChannelName: "已删渠道",
+		ChannelTag:  "OpenAI",
+		TokenOwner:  "算法组",
+		Type:        LogTypeConsume,
+		CreatedAt:   common.GetTimestamp(),
+		Other:       common.MapToJsonStr(map[string]any{"model_price": 1.5, "admin_info": map[string]any{"reject_reason": "policy"}}),
+	}).Error)
+
+	var streamed []Log
+	require.NoError(t, StreamUserLogs(context.Background(), 616161, LogFilter{Type: LogTypeConsume}, func(log *Log) error {
+		streamed = append(streamed, *log)
+		return nil
+	}))
+	require.Len(t, streamed, 1)
+	assert.Empty(t, streamed[0].ChannelName)
+	assert.Empty(t, streamed[0].ChannelTag, "普通用户的导出不能带渠道供应商")
+	assert.Empty(t, streamed[0].TokenOwner, "普通用户的导出不能带秘钥使用方")
+	assert.NotContains(t, streamed[0].Other, "admin_info")
+}
+
 // 上下文里的身份属于「当前登录者」：管理员代他人写日志时不能照抄，否则等于把操作者的
 // 部门记在别人名下。
 func TestRecordLogWithAdminInfoRejectsForeignIdentity(t *testing.T) {
