@@ -375,3 +375,95 @@ func TestUpdateAbilitiesKeepsPerModelPriority(t *testing.T) {
 	require.NotNil(t, kept)
 	assert.Equal(t, int64(5), *kept)
 }
+
+// [FORK] 已知边界回归：`PUT /api/channel/` 带 priority（`Channel.Update`）只写
+// `channels.priority`，已有 abilities 行沿用编辑前的值，所以选路不变。内置控制台的
+// 优先级 spinner / 编辑抽屉走的就是这条路径。要真正改一条供应关系的优先级，用
+// `PUT /api/channel/ability/priority`。见 fork/README.md「九」的已知取舍。
+func TestChannelUpdateDoesNotRewriteRelationPriority(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	const modelName = "update-priority-model"
+	weight := uint(1)
+	newChannel := func(name string, priority int64) *Channel {
+		channel := &Channel{
+			Name:     name,
+			Key:      "test-only",
+			Models:   modelName,
+			Group:    "default",
+			Status:   common.ChannelStatusEnabled,
+			Priority: &priority,
+			Weight:   &weight,
+		}
+		require.NoError(t, channel.Insert())
+		return channel
+	}
+	low, high := newChannel("update-low", 3), newChannel("update-high", 5)
+	pick := func(retry int) map[int]bool {
+		got := make(map[int]bool)
+		for range 200 {
+			channel, err := GetRandomSatisfiedChannel("default", modelName, retry, nil)
+			require.NoError(t, err)
+			require.NotNil(t, channel)
+			got[channel.Id] = true
+		}
+		return got
+	}
+
+	InitChannelCache()
+	assert.Equal(t, map[int]bool{high.Id: true}, pick(0))
+	assert.Equal(t, map[int]bool{low.Id: true}, pick(1))
+
+	edited, err := GetChannelById(low.Id, true)
+	require.NoError(t, err)
+	raised := int64(10)
+	edited.Priority = &raised
+	require.NoError(t, edited.Update())
+	assert.Equal(t, int64(10), edited.GetPriority(), "channels.priority 按请求写入")
+
+	var ability Ability
+	require.NoError(t, DB.Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, low.Id).
+		First(&ability).Error)
+	require.NotNil(t, ability.Priority)
+	assert.Equal(t, int64(3), *ability.Priority, "abilities.priority 沿用编辑前的值")
+
+	InitChannelCache()
+	assert.Equal(t, map[int]bool{high.Id: true}, pick(0), "改渠道级 priority 不影响选路（已知边界）")
+	assert.Equal(t, map[int]bool{low.Id: true}, pick(1), "改渠道级 priority 不影响选路（已知边界）")
+}
+
+// [FORK] 已知边界回归：改 channels.group 会重置该渠道所有单条 priority。
+// UpdateAbilities 按「group|model」保留旧行，group 一变 key 不再匹配，行按
+// channels.priority 重建，只存在 abilities 里、已设好的单条值随之丢失。
+// 见 fork/README.md「九」的已知取舍：本产品只建单 group 渠道，也不改 group。
+func TestChannelGroupChangeResetsRelationPriority(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	const modelName = "group-change-model"
+	channelPriority, weight := int64(3), uint(1)
+	channel := &Channel{
+		Name:     "group-change",
+		Key:      "test-only",
+		Models:   modelName,
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: &channelPriority,
+		Weight:   &weight,
+	}
+	require.NoError(t, channel.Insert())
+	raised := DB.Model(&Ability{}).
+		Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, channel.Id).
+		Update("priority", int64(5))
+	require.NoError(t, raised.Error)
+	require.EqualValues(t, 1, raised.RowsAffected)
+
+	edited, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	edited.Group = "vip"
+	require.NoError(t, edited.Update())
+
+	var abilities []Ability
+	require.NoError(t, DB.Where("channel_id = ?", channel.Id).Order(commonGroupCol).Find(&abilities).Error)
+	require.Len(t, abilities, 1, "旧 group 的行随重建消失")
+	assert.Equal(t, "vip", abilities[0].Group)
+	require.NotNil(t, abilities[0].Priority)
+	assert.Equal(t, channelPriority, *abilities[0].Priority, "单条优先级被重置成 channels.priority")
+}

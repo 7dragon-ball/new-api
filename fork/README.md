@@ -380,21 +380,31 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `SELECT ... FOR UPDATE` 渠道行，锁序与 `AddAbility` / `DeleteAbility` 统一为「channel 行 → abilities 行」。
   SQLite 不支持该语法（`lockForUpdate` 跳过），靠它的单写者模型兜底。
 - **已知取舍（既定边界，不是待修 bug）：保留是无条件的，所以「改渠道级 priority」不生效。**
-  上述还原不看 priority 值，只要该 `(group, model)` 行存在就沿用它的旧值。于是只有一种情况下选路
-  看不到渠道优先级的改动：**渠道建好之后**再改 `channels.priority`。触发它的入口是
-  `Channel.Update()`（`PUT /api/channel/` 带 `priority`，内置控制台的优先级 spinner / 编辑抽屉）
-  与 `EditChannelByTag`（tag 编辑带 `priority`）。
-  - **本产品不走这两条路径**：不使用内置 `web/` 控制台，也从不在建渠道后改渠道级 priority。
-    优先级一律通过 `PUT /api/channel/ability/priority` 按「模型 × 渠道」单条设置，那条路径只写
-    `abilities`、不经过 `UpdateAbilities`，因此不受影响。
-  - 若将来启用内置控制台、或允许在建渠道后改渠道级 priority，就必须让 `UpdateAbilities` 能区分
-    「沿袭自 `channels.priority` 的值」与「模型上架页单独设过的值」：做法是调用方传入编辑前的
-    `channels.priority`，只有与之不同的行才视为单条覆盖保留，等于旧值的行按新 `channel.Priority`
-    重算。代码注释（`model/ability.go` 的 `[FORK]` 段落）同此口径，审查时以此为据。
-  - 「`PUT /api/channel/` 带 priority 返回成功但选路不变，属于对管理 API 契约的静默变更」
-    同样按此边界处理：不补回归测试去固定一个产品不使用的行为，也不改成拒绝 priority。前提一旦
-    变化（启用控制台、BFF 或脚本开始改渠道级 priority），按上一条补「沿袭值 vs 单条覆盖」的区分
-    逻辑并补 `Channel.Update` 的回归测试，而不是保留现在的静默行为。
+  上述还原不看 priority 值，只要该 `(group, model)` 行存在就沿用它的旧值。于是**渠道建好之后**
+  再改 `channels.priority`，选路看不到这次改动（`channels.priority` 只剩三个用途：新行的初值、
+  缺 abilities 行时的回退、`FixAbility` 重建的依据）。触发入口：
+  - `Channel.Update()`（`PUT /api/channel/` 带 `priority`，内置控制台的优先级 spinner / 编辑抽屉）；
+  - `EditChannelByTag` **且同时带 `models`/`group`**（会走重建）。只带 `priority`/`weight` 时走
+    `UpdateAbilityByTag`，直接写 `abilities.priority`，不受此限。
+
+  **`web/` 仍随二进制发布**（镜像照常构建并提供 `web/` 的静态资源），所以「本产品不使用内置
+  控制台」只是使用约定，不是技术隔离：用控制台改渠道级 priority 会返回 200 而选路不变，这是对
+  管理 API 契约的静默变更。本产品的优先级一律走 `PUT /api/channel/ability/priority` 按「模型 ×
+  渠道」单条设置，那条路径只写 `abilities`、不经过 `UpdateAbilities`，因此不受影响；现状由
+  `TestChannelUpdateDoesNotRewriteRelationPriority`（`model/channel_priority_cache_fork_test.go`）
+  固定为已知边界，而不是靠「没人会走这条路」的假设。
+  - 要真正修掉它，就必须让 `UpdateAbilities` 能区分「沿袭自 `channels.priority` 的值」与「模型
+    上架页单独设过的值」：调用方传入编辑前的 `channels.priority`，只有与之不同的行才视为单条
+    覆盖保留，等于旧值的行按新 `channel.Priority` 重算。代码注释（`model/ability.go` 的
+    `[FORK]` 段落）同此口径，审查时以此为据。
+
+- **已知边界：改 `channels.group` 会重置该渠道所有单条 priority。** 保留键是 `group|model`，
+  group 一变旧键不再匹配，重建出来的行全部按 `channels.priority` 落值；单条设置只有 `abilities`
+  这一处，丢了无法恢复。它是正常编辑接口（`PUT /api/channel/`）就能触发的静默数据丢失，登记为
+  既定边界的前提是本产品只建单 group 渠道、BFF 固定写 `default`、从不改 group。现状由
+  `TestChannelGroupChangeResetsRelationPriority` 固定。若将来要支持改 group，做法是让保留键在
+  新旧 group 集合有交集时退化为 `model`（新 group 下同名的行沿用该 model 的 priority），无交集时
+  才按 `channels.priority` 重建。
 
 - **`FixAbility`（`POST /api/channel/fix`）不保留逐条 priority。** 它与 `UpdateAbilities` 相反：
   `TRUNCATE` 后按 `channels` 用 `AddAbilities` 重建，每行 priority 取 `channels.priority`（渠道无该值时

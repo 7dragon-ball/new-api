@@ -310,14 +310,21 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 	// 也就是说，只在「渠道建好之后再改渠道级 priority」时，选路才看不到这次改动：
 	//   - 走 Channel.Update()（PUT /api/channel/ 带 priority，内置控制台的优先级
 	//     spinner / 编辑抽屉）；
-	//   - 走 EditChannelByTag（tag 编辑带 priority）。
-	// 本产品不使用内置 `web/` 控制台，也从不改渠道级 priority：优先级只通过
-	// PUT /api/channel/ability/priority 按「模型 × 渠道」单条设置，那条路径不经过本函数。
-	// 因此上述改动路径在实际部署中不会被触发，这里不为此引入「沿袭值 vs 单条覆盖」的
-	// 区分逻辑（那需要调用方传入编辑前的渠道 priority，并让每行承担一次额外的字段比对）。
+	//   - 走 EditChannelByTag，且同时带 models/group 才会重建；只带 priority/weight 时
+	//     走 UpdateAbilityByTag，会直接改 abilities.priority，不受此限。
 	//
-	// 如果将来启用内置控制台或允许改渠道级 priority，必须让这里能分辨两类来源，见
-	// fork/README.md「七、供应关系优先级」的取舍说明。
+	// 自带 `web/` 控制台仍随二进制发布、可达，所以「本产品不用它」只是使用约定，不是技术
+	// 隔离：用它改渠道级 priority 会返回 200 而选路不变（管理 API 契约的静默变更）。现状由
+	// TestChannelUpdateDoesNotRewriteRelationPriority 固定，要修就得让这里能分辨
+	// 「沿袭值 vs 单条覆盖」——需要调用方传入编辑前的渠道 priority，并让每行承担一次额外
+	// 的字段比对。本产品的优先级一律走 PUT /api/channel/ability/priority 按「模型 × 渠道」
+	// 单条设置，那条路径不经过本函数。
+	//
+	// 另一条已知边界：保留键是 group|model，所以**改 channels.group 会重置该渠道所有单条
+	// priority**（旧键不再匹配，行按 channels.priority 重建），那部分数据只存在 abilities 里、
+	// 无法恢复。现状由 TestChannelGroupChangeResetsRelationPriority 固定。
+	//
+	// 要修上面两条，必须让这里能分辨两类来源，见 fork/README.md「九、供应关系优先级」。
 	var existingAbilities []Ability
 	err := tx.Select(commonGroupCol+", model, priority").
 		Where("channel_id = ?", channel.Id).Find(&existingAbilities).Error
