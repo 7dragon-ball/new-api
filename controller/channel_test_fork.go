@@ -1,10 +1,11 @@
 package controller
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -144,31 +145,44 @@ func credentialSecrets(channelType int, key string) []string {
 // redactResponseBody 把上游响应体里的凭据替换掉再回填。
 //
 // RelayErrorHandler 在「body 是 JSON 但取不到 error message」时会直接把原始 body 写进
-// 日志，在它外面事后脱敏来不及，所以得先替换再交给它。
+// 日志，在它外面事后脱敏来不及，所以得先替换再交给它。读失败也不 fail-open：
+// 拿到的那段 raw 同样可能是含凭据的原文。
 func redactResponseBody(body io.ReadCloser, secrets []string) io.ReadCloser {
-	raw, readErr := io.ReadAll(body)
+	raw, _ := io.ReadAll(body)
 	_ = body.Close()
-	if readErr != nil {
-		return io.NopCloser(bytes.NewReader(raw))
-	}
 	return io.NopCloser(strings.NewReader(redactCredentialText(string(raw), secrets)))
 }
 
-// redactCredentialText 替换文本里的凭据原文。
+// redactCredentialText 替换文本里的凭据：原文、URL 编码形式（上游回显查询串时是编码
+// 后的），与响应 message 那条路径同一口径。
 func redactCredentialText(text string, secrets []string) string {
 	for _, secret := range secrets {
-		if secret = strings.TrimSpace(secret); secret != "" {
-			text = strings.ReplaceAll(text, secret, redactedCredential)
+		secret = strings.TrimSpace(secret)
+		if secret == "" {
+			continue
+		}
+		for _, form := range []string{secret, url.QueryEscape(secret), url.PathEscape(secret)} {
+			text = strings.ReplaceAll(text, form, redactedCredential)
 		}
 	}
 	return text
 }
 
-// redactCredentialError 逐个凭据走一遍 sanitizeFetchModelsError（盖住 URL 编码形式与
-// url.Error 解包），用于回给前端的 message。
+// redactCredentialError 脱敏错误文本；没有替换到任何东西时原样返回，保留
+// *common.Message 的 message_key（前端靠它选语言包），真替换过才丢类型。
 func redactCredentialError(err error, secrets []string) error {
-	for _, secret := range secrets {
-		err = sanitizeFetchModelsError(err, secret)
+	if err == nil {
+		return nil
 	}
-	return err
+	// url.Error 带着完整请求 URL（查询串里可能有 key），不回给前端。
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
+	text := err.Error()
+	redacted := redactCredentialText(text, secrets)
+	if redacted == text {
+		return err
+	}
+	return errors.New(redacted)
 }

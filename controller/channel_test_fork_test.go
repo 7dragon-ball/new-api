@@ -102,6 +102,18 @@ func TestTestChannelByCredentialsRejectsBadInputBeforeUpstream(t *testing.T) {
 	}
 }
 
+// validateChannel 的错误是 common.NewMessage：前端靠 message_key 选语言包，脱敏不
+// 能把没被替换过的错误拍平成普通 error（VertexAI 缺部署区域是可直接复现的一条）。
+func TestTestChannelByCredentialsKeepsMessageKeyOnValidationError(t *testing.T) {
+	previewTestEnv(t)
+
+	body := `{"type":41,"base_url":"http://127.0.0.1:1","key":"sk-a","model":"m"}`
+	recorder, parsed := callTestByCredentials(t, body)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Equal(t, "Deployment region cannot be empty", parsed["message_key"])
+}
+
 // 「自建算力」渠道的秘钥可以留空（内网网关不校验），预览测试不能把它挡在 400。
 func TestTestChannelByCredentialsAllowsEmptyKey(t *testing.T) {
 	previewTestEnv(t)

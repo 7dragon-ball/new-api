@@ -3,7 +3,9 @@ package controller
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -535,23 +537,25 @@ func TestPreviewTestChannelWritesNoConsumeLog(t *testing.T) {
 }
 
 // 上游错误体会被 RelayErrorHandler 原样拼进 err，而预览态的 key 来自请求体。
-// 两种错误体都要盖：
+// 三种错误体都要盖：
 //   - 带 error message：err 里的正文由调用方脱敏；
 //   - JSON 但取不到 message：RelayErrorHandler 内部会把原始 body 直接写进
-//     gin.DefaultErrorWriter，脱敏必须发生在它内部，事后包一层盖不住。
+//     gin.DefaultErrorWriter，脱敏必须发生在它内部，事后包一层盖不住；
+//   - key 以 URL 编码形式回显（上游把查询串原样抄回来）：日志与 message 口径得一致。
 //
 // 所以这里直接捕获 gin.DefaultErrorWriter 断言落盘日志。
 func TestPreviewTestChannelRedactsKeyInErrorLog(t *testing.T) {
-	for _, upstreamBody := range []string{
-		`{"error":{"message":"invalid api key: sk-log-secret"}}`,
-		`{"echo":"sk-log-secret"}`,
+	for _, tc := range []struct{ name, key, upstreamBody string }{
+		{"带 error message", "sk-log-secret", `{"error":{"message":"invalid api key: sk-log-secret"}}`},
+		{"取不到 error message", "sk-log-secret", `{"echo":"sk-log-secret"}`},
+		{"key 以 URL 编码形式回显", "sk-log/secret", `{"echo":"sk-log%2Fsecret"}`},
 	} {
-		t.Run(upstreamBody, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			previewTestEnv(t)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(upstreamBody))
+				_, _ = w.Write([]byte(tc.upstreamBody))
 			}))
 			defer upstream.Close()
 
@@ -561,17 +565,35 @@ func TestPreviewTestChannelRedactsKeyInErrorLog(t *testing.T) {
 			t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
 
 			base := upstream.URL
-			ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: "sk-log-secret", BaseURL: &base}
+			ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: tc.key, BaseURL: &base}
 			result := testChannel(t.Context(), ch, 7, "m", "", false)
 
 			require.NotNil(t, result.localErr, "上游 401 必须失败")
 			require.Contains(t, logged.String(), "channel test bad response", "本用例只对 SysError 那条日志有效")
 			assert.Contains(t, logged.String(), "[REDACTED]")
-			assert.NotContains(t, logged.String(), "sk-log-secret", "容器日志里不得出现明文密钥")
-			assert.NotContains(t, result.localErr.Error(), "sk-log-secret")
+			assert.NotContains(t, logged.String(), tc.key, "容器日志里不得出现明文密钥")
+			assert.NotContains(t, result.localErr.Error(), tc.key)
 		})
 	}
 }
+
+// 响应体读到一半失败时不能 fail-open：拿到的那段 raw 同样可能是含凭据的原文。
+func TestRedactResponseBodyRedactsPartialBodyOnReadError(t *testing.T) {
+	body := redactResponseBody(&failingReadCloser{data: "token=sk-partial"}, []string{"sk-partial"})
+
+	dumped, err := io.ReadAll(body)
+	require.NoError(t, err)
+	assert.Equal(t, "token=[REDACTED]", string(dumped))
+}
+
+type failingReadCloser struct{ data string }
+
+func (f *failingReadCloser) Read(p []byte) (int, error) {
+	n := copy(p, f.data)
+	return n, errors.New("connection reset")
+}
+
+func (f *failingReadCloser) Close() error { return nil }
 
 // 多 Key 渠道 channel.Key 是整串（换行分隔或 Vertex 的 JSON 数组），实际下发的只是
 // SetupContextForSelectedChannel 选中的那一把。已保存渠道同样会被脱敏，所以要用上下
