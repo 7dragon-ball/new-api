@@ -382,14 +382,20 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
     `PUT /api/channel/ability/priority` 单条改，或跑 `FixAbility` 重建。
 - **改渠道级 priority 真的改道**，不再「返回 200 而选路不变」。保留不能是无条件的，否则
   `Channel.Update()`（`PUT /api/channel/` 带 `priority`，内置控制台的优先级 spinner / 编辑抽屉，
-  `web/` 随二进制发布、可达）与 `EditChannelByTag`（同时带 `models`/`group` 时）就只是改了
-  `channels.priority`、不影响选路。做法是最小侵入：`Channel` 上加非持久化的
+  `web/` 随二进制发布、可达）与 `EditChannelByTag`（带 `priority` / `models` / `group` 任一，
+  三者都走重建；只有 `tag` / `weight` 才发整表 `UPDATE`）就只是改了 `channels.priority`、
+  不影响选路。做法是最小侵入：`Channel` 上加非持久化的
   `PreviousPriority *int64`（`gorm:"-"`），两个调用方在写 `channels` 行**之前**把旧值填进去
   （tag 编辑按 id 逐条读，因为一条 tag 下有多个渠道、各自的旧值不同），`UpdateAbilities` 里
   priority 等于旧值的行算「沿袭渠道级」、按新 `channel.Priority` 重算，其余行算「单条覆盖」、
-  原样保留。没填（nil，其余调用点）表示调用方没动渠道级 priority，一切沿用。三条回归测试都在
+  原样保留。没填（nil，其余调用点）表示调用方没动渠道级 priority，一切沿用。四条回归测试都在
   `model/channel_priority_cache_fork_test.go`：`TestChannelUpdateAppliesChannelPriorityToInheritedRows`、
-  `TestEditChannelByTagAppliesChannelPriorityToInheritedRows`、`TestChannelGroupChangeKeepsPerModelPriority`。
+  `TestEditChannelByTagAppliesChannelPriorityToInheritedRows`、
+  `TestEditChannelByTagPriorityOnlyKeepsOverrides`、`TestChannelGroupChangeKeepsPerModelPriority`。
+  - **tag 编辑只带 `priority` 也走重建**（`shouldReCreateAbilities`）：否则 `UpdateAbilityByTag`
+    一句 `UPDATE abilities SET priority` 会把这个 tag 下所有单条覆盖一起改掉（同一接口多带一个
+    `models` 字段结果相反），且不走 `UpdateAbilities` 的「channel 行 → abilities 行」锁协议，与
+    并发重建交错时写入会被删除/覆盖。代价是 tag 下渠道全部重建一次（`DELETE` + `INSERT`）。
   - 已知边界：**单条覆盖恰好等于渠道级值的行无法与「沿袭值」区分**，按沿袭处理——下次改渠道级
     priority 时会被一起带走。要保住这种行，就把渠道级 priority 改成别的值，或改用单条接口。
 - **重建与单条优先级写入互斥**。`UpdateAbilities` 是「读旧 priority → 删 → 插」的读改写，
@@ -438,8 +444,7 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   两条路径的响应都只回请求里那一行，不返回实际受影响的 group，调用方无法从结果判断影响范围。
   **本产品只建单 group 渠道**（BFF 也固定写 `default`，见本节末的已知边界），所以不为此改成
   group 级模型清单，也不在接口里拒绝多 group 渠道。若将来允许建多 group 渠道，必须二选一：改成
-  group 级模型清单，或在这两个接口里显式拒绝 group 数 > 1 的渠道（400），并补一条 `default,vip`
-  渠道的回归测试，断言只影响请求的 group。
+  group 级模型清单，或在这两个接口里显式拒绝 group 数 > 1 的渠道（400），并补一条 `default,vip` 渠道的回归测试，断言只影响请求的 group。
 
 **已知边界**：BFF 的写接口固定落 `default` 组；查询表本身不做 group 过滤，但部署里若存在多 group
 渠道，单条优先级目前只对 `default` 组生效。
@@ -494,7 +499,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/channel_cache.go` | 新增 `priorityLookupCache` 的构建与发布、`GetRandomSatisfiedChannel` 的优先级改读 `abilities.priority`（5 处 `[FORK]`） | **高**，逐请求热路径 |
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
 | `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 abilities 行的 priority，重建时按 `group|model`（换 group 时退化到 `model`）还原，并用 `Channel.PreviousPriority` 让改渠道级 priority 生效（见「九」，3 处 `[FORK]`） | 中，8 个调用点的高频路径 |
-| `model/channel.go` | `Channel` 加非持久化字段 `PreviousPriority`，`Update()` / `EditChannelByTag` 在写 `channels` 行前把旧 priority 填进去（3 处 `[FORK]`） | 中，渠道编辑主路径 |
+| `model/channel.go` | `Channel` 加非持久化字段 `PreviousPriority`，`Update()` / `EditChannelByTag` 在写 `channels` 行前把旧 priority 填进去，tag 编辑带 priority 时改走重建（4 处 `[FORK]`） | 中，渠道编辑主路径 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
 | `router/channel-router.go` | 权限路由表插入两条：`PUT /ability/priority`（`ChannelWrite`）与 `POST /test`（`ChannelSensitiveWrite`，1 处 `[FORK]`） | 低，单行 |
@@ -561,7 +566,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/channel_test_fork.go` | `POST /api/channel/test` handler：按凭据构造临时渠道、复用 `testChannel()`、错误脱敏 |
 | `controller/channel_test_fork_test.go` | handler 级用例：入参 400、空秘钥放行、上游失败不回 HTTP 错、密钥不回显、多行 key 口径、`endpoint_type`/`stream` 透传 |
 | `controller/user_batch_password_reset_fork_test.go` | controller 包测试（含锁内二次授权与整批回滚） |
-| `model/channel_priority_cache_fork_test.go` | 选路基线、查询表、逐渠道回退、缓存开关一致性、`UpdateAbilities` 保留优先级、改渠道级 priority / tag 编辑 / 换 group 三条回归 |
+| `model/channel_priority_cache_fork_test.go` | 选路基线、查询表、逐渠道回退、缓存开关一致性、`UpdateAbilities` 保留优先级、改渠道级 priority / tag 编辑（含只带 priority）/ 换 group 四条回归 |
 | `model/channel_priority_fork_test.go` | `UpdateAbilityPriority` 只改目标行、范围校验、缓存版本推进 |
 | `controller/channel_priority_fork_test.go` | 端点用例（含缺省 group、错误码、写后立即生效） |
 
@@ -585,7 +590,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 |---|---|
 | `model/user.go` | 17 |
 | `controller/user.go` | 16 |
-| `model/channel_priority_cache_fork_test.go` | 10 |
+| `model/channel_priority_cache_fork_test.go` | 11 |
 | `model/channel_ability_fork.go` | 7 |
 | `service/security_verification.go` | 7 |
 | `controller/channel-test.go` | 6 |
@@ -601,7 +606,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `router/api-router.go` | 4 |
 | `constant/context_key.go` | 3 |
 | `model/channel_priority_fork.go` | 3 |
-| `model/channel.go` | 3 |
+| `model/channel.go` | 4 |
 | `router/channel-router.go` | 3 |
 | `middleware/auth.go` | 2 |
 | `controller/channel_priority_fork.go` | 2 |

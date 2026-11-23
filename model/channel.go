@@ -1041,6 +1041,11 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	}
 	if priority != nil {
 		updateData.Priority = priority
+		// [FORK] 渠道级 priority 也走重建：abilities 行有「沿袭渠道级」与「单条覆盖」两种
+		// 来源，只发一句 UPDATE abilities SET priority 会把单条覆盖一起改掉（同一接口多带一个
+		// models 字段结果就不同），而且这条 UPDATE 不走 UpdateAbilities 的「channel 行 →
+		// abilities 行」锁协议，与并发重建交错时写入会被删除/覆盖。
+		shouldReCreateAbilities = true
 	}
 	if weight != nil {
 		updateData.Weight = weight
@@ -1085,7 +1090,8 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 			}
 		}
 	} else {
-		err := UpdateAbilityByTag(tag, newTag, priority, weight)
+		// priority 非空时已走上面的重建分支，这里只剩 tag / weight 的整表更新。
+		err := UpdateAbilityByTag(tag, newTag, nil, weight)
 		if err != nil {
 			return err
 		}

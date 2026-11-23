@@ -530,3 +530,58 @@ func TestChannelGroupChangeKeepsPerModelPriority(t *testing.T) {
 	require.NotNil(t, kept["group-plain-model"])
 	assert.Equal(t, int64(3), *kept["group-plain-model"], "没设过覆盖的行仍用渠道级值")
 }
+
+// [FORK] tag 批量编辑只带 priority（不带 models/group）也要保留单条 priority：这条路径
+// 曾经走 `UPDATE abilities SET priority` 把该 tag 下所有行的覆盖一起改掉，且不走
+// UpdateAbilities 的渠道行锁。
+func TestEditChannelByTagPriorityOnlyKeepsOverrides(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	const shared, overridden = "tagonly-shared", "tagonly-overridden"
+	tag := lo.ToPtr("fork-tag-priority")
+	weight := uint(1)
+	owner := &Channel{
+		Name:     "tag-priority-a",
+		Key:      "test-only",
+		Models:   shared + "," + overridden,
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   &weight,
+		Tag:      tag,
+	}
+	require.NoError(t, owner.Insert())
+	sibling := &Channel{
+		Name:     "tag-priority-b",
+		Key:      "test-only",
+		Models:   shared,
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   &weight,
+		Tag:      tag,
+	}
+	require.NoError(t, sibling.Insert())
+	raised := DB.Model(&Ability{}).
+		Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", overridden, owner.Id).
+		Update("priority", int64(7))
+	require.NoError(t, raised.Error)
+	require.EqualValues(t, 1, raised.RowsAffected)
+
+	require.NoError(t, EditChannelByTag("fork-tag-priority", nil, nil, nil, nil, lo.ToPtr(int64(10)), nil, nil, nil))
+
+	priorityOf := func(modelName string, channelId int) *int64 {
+		var ability Ability
+		require.NoError(t, DB.Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, channelId).
+			First(&ability).Error)
+		return ability.Priority
+	}
+	inherited := priorityOf(shared, owner.Id)
+	require.NotNil(t, inherited)
+	assert.Equal(t, int64(10), *inherited, "沿袭渠道级的行跟着新值走")
+	siblingInherited := priorityOf(shared, sibling.Id)
+	require.NotNil(t, siblingInherited)
+	assert.Equal(t, int64(10), *siblingInherited, "同 tag 的其它渠道同样生效")
+	overrideKept := priorityOf(overridden, owner.Id)
+	require.NotNil(t, overrideKept)
+	assert.Equal(t, int64(7), *overrideKept, "单条覆盖不被 tag 批量改 priority 清掉")
+}
