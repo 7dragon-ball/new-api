@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+const redactedCredential = "[REDACTED]"
 
 // [FORK] POST /api/channel/test —— 按凭据测试渠道连通性（新建渠道尚无 id 时用）。
 //
@@ -37,6 +41,7 @@ func TestChannelByCredentials(c *gin.Context) {
 	// key 允许为空：「自建算力」走内网网关，上游不校验秘钥（保存路径也不检查，
 	// 见 validateChannel 的 isAdd=false 分支）。
 	key := credentialKeyFor(req.Type, req.Key)
+	secrets := credentialSecrets(req.Type, key)
 	modelName := strings.TrimSpace(req.Model)
 	if req.Type <= 0 || modelName == "" {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("type and model are required"))
@@ -58,7 +63,7 @@ func TestChannelByCredentials(c *gin.Context) {
 	//     （缺部署区域）等类型会在这里返回 400，测不到连通性。save 之后走
 	//     `GET /api/channel/test/:id` 能测，新建弹窗不能。
 	if err := validateChannel(channel, false); err != nil {
-		common.ApiErrorStatus(c, http.StatusBadRequest, sanitizeFetchModelsError(err, key))
+		common.ApiErrorStatus(c, http.StatusBadRequest, redactCredentialError(err, secrets))
 		return
 	}
 
@@ -79,9 +84,9 @@ func TestChannelByCredentials(c *gin.Context) {
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
-			// 上游错误体可能回显它收到的 Authorization；sanitizeFetchModelsError 会把
-			// 明文 key 及其 URL 编码形式替换成 [REDACTED]。
-			"message": sanitizeFetchModelsError(result.localErr, key).Error(),
+			// 上游错误体可能回显它收到的 Authorization；redactCredentialError 会把
+			// 凭据原文及其 URL 编码形式替换成 [REDACTED]。
+			"message": redactCredentialError(result.localErr, secrets).Error(),
 			"time":    0.0,
 		}
 		if result.newAPIError != nil {
@@ -93,7 +98,7 @@ func TestChannelByCredentials(c *gin.Context) {
 	if result.newAPIError != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success":    false,
-			"message":    sanitizeFetchModelsError(result.newAPIError, key).Error(),
+			"message":    redactCredentialError(result.newAPIError, secrets).Error(),
 			"time":       consumedTime,
 			"error_code": result.newAPIError.GetErrorCode(),
 		})
@@ -113,4 +118,57 @@ func credentialKeyFor(channelType int, raw string) string {
 		key = strings.Split(key, "\n")[0]
 	}
 	return key
+}
+
+// credentialSecrets 返回本次渠道测试要脱敏的凭据串：秘钥本身，Codex 再加 OAuth 的
+// access_token / id_token / refresh_token。
+//
+// Codex 发给上游的 Authorization 只是 access_token（relay/channel/codex），它是整段
+// JSON 秘钥的子串，只替换秘钥原文匹配不到。
+func credentialSecrets(channelType int, key string) []string {
+	secrets := []string{key}
+	if channelType != constant.ChannelTypeCodex {
+		return secrets
+	}
+	var oauthKey struct {
+		AccessToken  string `json:"access_token"`
+		IDToken      string `json:"id_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := common.Unmarshal([]byte(strings.TrimSpace(key)), &oauthKey); err != nil {
+		return secrets
+	}
+	return append(secrets, oauthKey.AccessToken, oauthKey.IDToken, oauthKey.RefreshToken)
+}
+
+// redactResponseBody 把上游响应体里的凭据替换掉再回填。
+//
+// RelayErrorHandler 在「body 是 JSON 但取不到 error message」时会直接把原始 body 写进
+// 日志，在它外面事后脱敏来不及，所以得先替换再交给它。
+func redactResponseBody(body io.ReadCloser, secrets []string) io.ReadCloser {
+	raw, readErr := io.ReadAll(body)
+	_ = body.Close()
+	if readErr != nil {
+		return io.NopCloser(bytes.NewReader(raw))
+	}
+	return io.NopCloser(strings.NewReader(redactCredentialText(string(raw), secrets)))
+}
+
+// redactCredentialText 替换文本里的凭据原文。
+func redactCredentialText(text string, secrets []string) string {
+	for _, secret := range secrets {
+		if secret = strings.TrimSpace(secret); secret != "" {
+			text = strings.ReplaceAll(text, secret, redactedCredential)
+		}
+	}
+	return text
+}
+
+// redactCredentialError 逐个凭据走一遍 sanitizeFetchModelsError（盖住 URL 编码形式与
+// url.Error 解包），用于回给前端的 message。
+func redactCredentialError(err error, secrets []string) error {
+	for _, secret := range secrets {
+		err = sanitizeFetchModelsError(err, secret)
+	}
+	return err
 }

@@ -534,31 +534,43 @@ func TestPreviewTestChannelWritesNoConsumeLog(t *testing.T) {
 	assert.Zero(t, count, "预览态不得写任何消费日志")
 }
 
-// 上游 401 的错误体会被 RelayErrorHandler 原样拼进 err，而预览态的 key 来自请求体。
-// 响应侧已脱敏；testChannel 的 SysError 会把 err 打进容器日志，同样必须脱敏。
-// 这里直接捕获 gin.DefaultErrorWriter：只测 sanitize 本身抓不到调用点回退。
+// 上游错误体会被 RelayErrorHandler 原样拼进 err，而预览态的 key 来自请求体。
+// 两种错误体都要盖：
+//   - 带 error message：err 里的正文由调用方脱敏；
+//   - JSON 但取不到 message：RelayErrorHandler 内部会把原始 body 直接写进
+//     gin.DefaultErrorWriter，脱敏必须发生在它内部，事后包一层盖不住。
+//
+// 所以这里直接捕获 gin.DefaultErrorWriter 断言落盘日志。
 func TestPreviewTestChannelRedactsKeyInErrorLog(t *testing.T) {
-	previewTestEnv(t)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"message":"invalid api key: sk-log-secret"}}`))
-	}))
-	defer upstream.Close()
+	for _, upstreamBody := range []string{
+		`{"error":{"message":"invalid api key: sk-log-secret"}}`,
+		`{"echo":"sk-log-secret"}`,
+	} {
+		t.Run(upstreamBody, func(t *testing.T) {
+			previewTestEnv(t)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(upstreamBody))
+			}))
+			defer upstream.Close()
 
-	var logged bytes.Buffer
-	previousWriter := gin.DefaultErrorWriter
-	gin.DefaultErrorWriter = &logged
-	t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
+			var logged bytes.Buffer
+			previousWriter := gin.DefaultErrorWriter
+			gin.DefaultErrorWriter = &logged
+			t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
 
-	base := upstream.URL
-	ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: "sk-log-secret", BaseURL: &base}
-	result := testChannel(t.Context(), ch, 7, "m", "", false)
+			base := upstream.URL
+			ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: "sk-log-secret", BaseURL: &base}
+			result := testChannel(t.Context(), ch, 7, "m", "", false)
 
-	require.NotNil(t, result.localErr, "上游 401 必须失败")
-	require.Contains(t, logged.String(), "channel test bad response", "本用例只对 SysError 那条日志有效")
-	assert.Contains(t, logged.String(), "[REDACTED]")
-	assert.NotContains(t, logged.String(), "sk-log-secret", "容器日志里不得出现明文密钥")
+			require.NotNil(t, result.localErr, "上游 401 必须失败")
+			require.Contains(t, logged.String(), "channel test bad response", "本用例只对 SysError 那条日志有效")
+			assert.Contains(t, logged.String(), "[REDACTED]")
+			assert.NotContains(t, logged.String(), "sk-log-secret", "容器日志里不得出现明文密钥")
+			assert.NotContains(t, result.localErr.Error(), "sk-log-secret")
+		})
+	}
 }
 
 // pricedModel 给模型配一个 ratio，让测试能越过定价校验走到发请求与结算那一步。

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -169,6 +170,52 @@ func TestTestChannelByCredentialsUpstreamFailureIsNotHTTPError(t *testing.T) {
 			assert.NotContains(t, recorder.Body.String(), "sk-secret-value", "响应里不得回显密钥")
 		})
 	}
+}
+
+// Codex 发给上游的 Authorization 只是秘钥 JSON 里的 access_token，它是整段秘钥的
+// 子串：只替换秘钥原文匹配不到。上游回显 Authorization（或直接回显长期凭据）时，
+// 响应 message 与 bad response 日志都不得出现 token。
+func TestTestChannelByCredentialsRedactsCodexTokens(t *testing.T) {
+	previewTestEnv(t)
+	const (
+		accessToken  = "at-secret-access-token"
+		refreshToken = "rt-secret-refresh-token"
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad auth: ` + r.Header.Get("Authorization") + ` refresh: ` + refreshToken + `"}}`))
+	}))
+	defer upstream.Close()
+
+	var logged bytes.Buffer
+	previousWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &logged
+	t.Cleanup(func() { gin.DefaultErrorWriter = previousWriter })
+
+	key, err := common.Marshal(map[string]string{
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+		"account_id":    "acct-1",
+	})
+	require.NoError(t, err)
+	rows, err := common.Marshal(map[string]any{
+		"type":     constant.ChannelTypeCodex,
+		"base_url": upstream.URL,
+		"key":      string(key),
+		"model":    "gpt-5-codex",
+	})
+	require.NoError(t, err)
+
+	recorder, parsed := callTestByCredentials(t, string(rows))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, false, parsed["success"])
+	assert.Contains(t, recorder.Body.String(), "[REDACTED]")
+	assert.NotContains(t, recorder.Body.String(), accessToken, "响应 message 不得回显 access_token")
+	assert.NotContains(t, recorder.Body.String(), refreshToken, "响应 message 不得回显 refresh_token")
+	assert.NotContains(t, logged.String(), accessToken, "日志不得出现 access_token")
+	assert.NotContains(t, logged.String(), refreshToken, "日志不得出现 refresh_token")
 }
 
 // 前导空行很常见（textarea 里粘贴）。fetch_models 是先整体 trim 再切第一把，

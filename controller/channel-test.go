@@ -498,14 +498,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
+			// [FORK] 上游错误体可能回显它收到的凭据。RelayErrorHandler 自己会把
+			// 「取不到 error message」的原始 body 打进日志，所以先把 body 里的凭据
+			// 换掉再交给它；之后的 err 已经是脱敏后的文本，外面不用再包一层。
+			httpResp.Body = redactResponseBody(httpResp.Body, credentialSecrets(channel.Type, channel.Key))
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
-			// [FORK] 预览态的 key 来自请求体（任意管理员可提交），上游错误体可能回显它；
-			// 落 syslog 前按与响应体相同的口径脱敏，否则容器日志里会出现明文密钥。
-			// err 的静态类型是 *types.NewAPIError，这里要的是 error。
-			var logErr error = err
-			if preview {
-				logErr = sanitizeFetchModelsError(logErr, channel.Key)
-			}
 			common.SysError(common.LogText(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
 				channel.Id,
@@ -514,7 +511,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				testModel,
 				endpointType,
 				httpResp.StatusCode,
-				logErr,
+				err,
 			))
 			return testResult{
 				context:     c,
