@@ -294,6 +294,17 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
     `channels.priority`，只有与之不同的行才视为单条覆盖保留，等于旧值的行按新 `channel.Priority`
     重算。代码注释（`model/ability.go` 的 `[FORK]` 段落）同此口径，审查时以此为据。
 
+- **`FixAbility`（`POST /api/channel/fix`）不保留逐条 priority。** 它与 `UpdateAbilities` 相反：
+  `TRUNCATE` 后按 `channels` 用 `AddAbilities` 重建，每行 priority 取 `channels.priority`（渠道无该值时
+  落 0），所以单独设过的逐条优先级会被重置，而它只存在 `abilities` 这一处、重置后无法恢复，选路
+  结果随之整体改变且没有提示。这是既定边界而非待修，前提是本产品**不使用**自带控制台的「修复渠道
+  一致性」按钮，BFF 也不调用该接口；仓库内唯一的自动调用是 `main.go` 启动时 `InitChannelCache`
+  panic 后的一次重试（`main.go:98`），那种情况本来就要重建表与缓存。`FixAbility` 的语义是「以
+  `channels` 为权威的兜底修复」，保留逐条覆盖会让「修复」不再修复被改坏的渠道级值，所以没有像
+  `UpdateAbilities` 那样加 `[FORK]` 保留逻辑。若将来真要使用该入口，按「清空前快照
+  `(group, model, channel_id) → priority`，重建后逐条回写」或「清空后对现存渠道改调 `UpdateAbilities`，
+  只把 `AddAbilities` 用于真正的新渠道」补齐即可。
+
 **增删单条供应关系**（`POST|DELETE /api/channel/ability`，`model/channel_ability_fork.go` 与
 `controller/channel_ability_fork.go`）：
 
