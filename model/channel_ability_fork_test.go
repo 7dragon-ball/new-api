@@ -69,6 +69,26 @@ func TestAddAbilityWritesModelMapping(t *testing.T) {
 	assert.Equal(t, "upstream-a", mapping["platform-model"])
 }
 
+// [FORK] 回归：model_mapping 存成 JSON null 时，新增关系不能 panic（"null" 解析成 nil map）。
+func TestAddAbilityWithNullModelMapping(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	channel := &Channel{
+		Name: "ability-null-map", Key: "k", Models: "m1", Group: "default",
+		Status: common.ChannelStatusEnabled, ModelMapping: common.GetPointer("null"),
+	}
+	require.NoError(t, DB.Create(channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	require.NoError(t, AddAbility("m2", channel.Id, "default", "upstream-m2", 1))
+
+	stored, err := GetChannelById(channel.Id, false)
+	require.NoError(t, err)
+	assert.Contains(t, stored.GetModels(), "m2")
+	var mapping map[string]string
+	require.NoError(t, common.UnmarshalJsonStr(stored.GetModelMapping(), &mapping))
+	assert.Equal(t, "upstream-m2", mapping["m2"])
+}
+
 func TestAddAbilityKeepsExistingMappingWhenNoUpstreamGiven(t *testing.T) {
 	useScheduledChannelDatabase(t)
 	channel := &Channel{

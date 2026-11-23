@@ -155,6 +155,10 @@ func applyAbilityChannelModel(tx *gorm.DB, channel *Channel, modelName, upstream
 			return ErrAbilityMappingInvalid
 		}
 	}
+	// JSON 字面量 null 也解析成功（"null" → nil map），后面写映射会 panic。
+	if mapping == nil {
+		mapping = map[string]string{}
+	}
 
 	models := channel.GetModels()
 	mappingChanged := false

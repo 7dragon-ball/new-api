@@ -285,10 +285,27 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 		}()
 	}
 
-	// [FORK] 保留已有的单条优先级：DELETE 之前先按 (group, model) 记下当前值，
-	// 重建时还原。否则管理员在模型上架页调好的优先级会被「改渠道名/权重/模型列表」
-	// 这类日常运维动作清回 channel.Priority。nil 原样传回（GORM 对 default:0 的
-	// nil 指针落 0，与选路「nil 视作 0」一致）。
+	// [FORK] 重建时整行保留该渠道已有 abilities 的 priority（按 group|model 匹配）。
+	//
+	// 为什么无条件保留：abilities.priority 是本 fork 的选路依据，而它可能来自模型上架页
+	// 的单条设置（PUT /api/channel/ability/priority，只写 abilities、不写 channels）。
+	// 若重建时按 channels.priority 重算，管理员设过的单条优先级会被「改渠道名 / 权重 /
+	// 模型列表 / 批量打标签 / 上游模型同步」任一日常动作清空。所以这里只看「行是否存在」，
+	// 存在就沿用该行的 priority（含 nil）。
+	//
+	// 已知取舍——本产品的既定边界，不是待修的 bug：
+	// 因为沿用是无条件的，**改 channels.priority 后重建不会更新这些行的 priority**。
+	// 也就是说，只在「渠道建好之后再改渠道级 priority」时，选路才看不到这次改动：
+	//   - 走 Channel.Update()（PUT /api/channel/ 带 priority，内置控制台的优先级
+	//     spinner / 编辑抽屉）；
+	//   - 走 EditChannelByTag（tag 编辑带 priority）。
+	// 本产品不使用内置 `web/` 控制台，也从不改渠道级 priority：优先级只通过
+	// PUT /api/channel/ability/priority 按「模型 × 渠道」单条设置，那条路径不经过本函数。
+	// 因此上述改动路径在实际部署中不会被触发，这里不为此引入「沿袭值 vs 单条覆盖」的
+	// 区分逻辑（那需要调用方传入编辑前的渠道 priority，并让每行承担一次额外的字段比对）。
+	//
+	// 如果将来启用内置控制台或允许改渠道级 priority，必须让这里能分辨两类来源，见
+	// fork/README.md「七、供应关系优先级」的取舍说明。
 	var existingAbilities []Ability
 	err := tx.Select(commonGroupCol+", model, priority").
 		Where("channel_id = ?", channel.Id).Find(&existingAbilities).Error
@@ -300,6 +317,7 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 	}
 	keptPriorities := make(map[string]*int64, len(existingAbilities))
 	for _, existing := range existingAbilities {
+		// nil 也原样传回：GORM 对带 default:0 的 nil 指针落 0，与选路「nil 视作 0」一致。
 		keptPriorities[existing.Group+"|"+existing.Model] = existing.Priority
 	}
 
@@ -324,7 +342,7 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 				continue
 			}
 			abilitySet[key] = struct{}{}
-			// [FORK] 该 (group, model) 已有 abilities 行时沿用它的优先级（含 nil）。
+			// [FORK] 已有行沿用它的优先级（含 nil），新行用渠道优先级。见上面的取舍说明。
 			priority := channel.Priority
 			if kept, ok := keptPriorities[key]; ok {
 				priority = kept

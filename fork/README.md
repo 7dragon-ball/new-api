@@ -276,11 +276,23 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   改 `channels.priority`，并把该渠道**所有** abilities 行一起改成新值，用于调整渠道之间的整体顺序；
   `PUT /api/channel/ability/priority` 是**单条**设置，只动一个模型 × 一个渠道。想只调某个模型的优先级
   就只能用后者，用重排会把同渠道其它模型一起改掉。两者语义不同，都保留。
-- **`UpdateAbilities` 已改为保留 priority**（`model/ability.go`，6 个调用点）。它原本先 `DELETE` 该渠道
-  全部 abilities 行再按 `channel.Priority` 重建，意味着管理员设好的单条优先级会被「改渠道名 / 权重 /
-  模型列表 / 批量打标签 / 上游模型同步」任一动作清零。现在 `DELETE` 前按 `(group, model)` 记下现有
-  priority，重建时还原；`enabled` / `weight` / `tag` 仍按当前渠道状态重建——它们本来就该跟着渠道走。
-  模型列表里删掉的模型不会残留在 `kept` 里，重建后该行消失，维持原语义。
+- **`UpdateAbilities` 已改为保留单条 priority**（`model/ability.go`，8 个调用点）。它原本先 `DELETE`
+  该渠道全部 abilities 行再按 `channel.Priority` 重建，意味着管理员设好的单条优先级会被「改渠道名 /
+  权重 / 模型列表 / 批量打标签 / 上游模型同步」任一动作清零。现在 `DELETE` 前按 `(group, model)`
+  记下现有 priority，重建时还原；`enabled` / `weight` / `tag` 仍按当前渠道状态重建——它们本来就该
+  跟着渠道走。模型列表里删掉的模型不会残留在 `kept` 里，重建后该行消失，维持原语义。
+- **已知取舍（既定边界，不是待修 bug）：保留是无条件的，所以「改渠道级 priority」不生效。**
+  上述还原不看 priority 值，只要该 `(group, model)` 行存在就沿用它的旧值。于是只有一种情况下选路
+  看不到渠道优先级的改动：**渠道建好之后**再改 `channels.priority`。触发它的入口是
+  `Channel.Update()`（`PUT /api/channel/` 带 `priority`，内置控制台的优先级 spinner / 编辑抽屉）
+  与 `EditChannelByTag`（tag 编辑带 `priority`）。
+  - **本产品不走这两条路径**：不使用内置 `web/` 控制台，也从不在建渠道后改渠道级 priority。
+    优先级一律通过 `PUT /api/channel/ability/priority` 按「模型 × 渠道」单条设置，那条路径只写
+    `abilities`、不经过 `UpdateAbilities`，因此不受影响。
+  - 若将来启用内置控制台、或允许在建渠道后改渠道级 priority，就必须让 `UpdateAbilities` 能区分
+    「沿袭自 `channels.priority` 的值」与「模型上架页单独设过的值」：做法是调用方传入编辑前的
+    `channels.priority`，只有与之不同的行才视为单条覆盖保留，等于旧值的行按新 `channel.Priority`
+    重算。代码注释（`model/ability.go` 的 `[FORK]` 段落）同此口径，审查时以此为据。
 
 **增删单条供应关系**（`POST|DELETE /api/channel/ability`，`model/channel_ability_fork.go` 与
 `controller/channel_ability_fork.go`）：
@@ -337,7 +349,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
 | `model/channel_cache.go` | 新增 `priorityLookupCache` 的构建与发布、`GetRandomSatisfiedChannel` 的优先级改读 `abilities.priority`（5 处 `[FORK]`） | **高**，逐请求热路径 |
 | `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
-| `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 `(group, model) → priority`，重建时还原（2 处 `[FORK]`） | 中，6 个调用点的高频路径 |
+| `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 `(group, model) → priority`，重建时无条件沿用（改渠道级 priority 不生效，见「七」的取舍说明，2 处 `[FORK]`） | 中，8 个调用点的高频路径 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
 | `router/channel-router.go` | 权限路由表插入 `PUT /ability/priority`（1 处 `[FORK]`） | 低，单行 |

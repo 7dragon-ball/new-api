@@ -917,7 +917,10 @@ export const STATIC_I18N_KEYS = [
   'Channel priorities changed. Refresh and try again.',
   'Invalid channel priority move',
   'Channel priority is outside the sortable range',
-  // Supply relation priority API errors.
+  // Supply relation API errors.
   'Priority must be between 1 and 999',
   'The supply relation does not exist',
+  'The supply relation already exists',
+  'The channel does not provide this group',
+  'The channel model mapping is not valid JSON',
 ] as const
