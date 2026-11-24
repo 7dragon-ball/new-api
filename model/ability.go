@@ -267,6 +267,16 @@ func (channel *Channel) DeleteAbilities() error {
 	return DB.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
 }
 
+// priorityValue 把可空的 priority 归一成选路时使用的数值（nil 视作 0）。
+// 只用于「abilities 行是否沿袭渠道级 priority」的比较，不能替代 equalPriority：
+// channel_priority.go 的 undo 需要区分 NULL 与 0。
+func priorityValue(priority *int64) int64 {
+	if priority == nil {
+		return 0
+	}
+	return *priority
+}
+
 // UpdateAbilities updates abilities of this channel.
 // Make sure the channel is completed before calling this function.
 func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
@@ -285,8 +295,68 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 		}()
 	}
 
+	// [FORK] 重建是「读旧 priority → 删 → 插」的读改写，先锁住渠道行把它与单条优先级
+	// 写入串行化：UpdateAbilityPriority 走同一把锁，否则两者交错时重建会用读到的旧值
+	// 覆盖掉这次写入，或在行被删掉的那一瞬间让写入影响 0 行、误报 404。锁序统一为
+	// 「channel 行 → abilities 行」，与 AddAbility / DeleteAbility 一致。渠道正在被删除时
+	// 锁不到行，此时照常重建（渠道删除会连带删掉 abilities，不是本函数的职责）。
+	if err := lockForUpdate(tx).Select("id").Where("id = ?", channel.Id).Find(&Channel{}).Error; err != nil {
+		if isNewTx {
+			tx.Rollback()
+		}
+		return err
+	}
+
+	// [FORK] 重建时保留该渠道已有 abilities 的 priority。
+	//
+	// 为什么保留：abilities.priority 是本 fork 的选路依据，而它可能来自模型上架页的单条
+	// 设置（PUT /api/channel/ability/priority，只写 abilities、不写 channels）。若重建时
+	// 一律按 channels.priority 重算，管理员设过的单条优先级会被「改渠道名 / 权重 / 模型
+	// 列表 / 批量打标签 / 上游模型同步」任一日常动作清空。
+	//
+	// 为什么不是无条件保留：改渠道级 priority（PUT /api/channel/ 带 priority，内置控制台
+	// 的优先级 spinner / 编辑抽屉；且同样随二进制发布、可达）必须真的改道，否则就是返回
+	// 200 而选路不变的静默契约变更。所以调用方把编辑前的 channels.priority
+	// 填进 channel.PreviousPriority：与之相等的行是「沿袭渠道级」，跟着新值走；与之不同的是
+	// 单条覆盖，原样保留。单条覆盖恰好等于渠道级值的情况无法区分，按沿袭处理（下次改
+	// 渠道级 priority 时会被带走）。没填（nil）表示调用方没动渠道级 priority，一切沿用。
+	//
+	// group 变化（default → vip）时 group|model 键失配，保留键退化为 model：同名的行沿用
+	// 该 model 的 priority（多个旧 group 给出不同值时取较大者，既不压低已有优先级，结果也
+	// 确定）。不用「新旧 group 有无交集」做条件：本产品只建单 group 渠道，一换组就必然无交集，
+	// 那等于换一个说法保留静默丢失。代价是换了 priority 量级不同的 group 时旧值会被带过去，
+	// 要回渠道级值用 PUT /api/channel/ability/priority 单条改，或跑 FixAbility 重建。
+	var existingAbilities []Ability
+	err := tx.Select(commonGroupCol+", model, priority").
+		Where("channel_id = ?", channel.Id).Find(&existingAbilities).Error
+	if err != nil {
+		if isNewTx {
+			tx.Rollback()
+		}
+		return err
+	}
+	keptByRelation := make(map[string]*int64, len(existingAbilities))
+	keptByModel := make(map[string]*int64, len(existingAbilities))
+	for _, existing := range existingAbilities {
+		// nil 也原样传回：GORM 对带 default:0 的 nil 指针落 0，与选路「nil 视作 0」一致。
+		keptByRelation[existing.Group+"|"+existing.Model] = existing.Priority
+		// 同一 model 在多个旧 group 下给出不同值时取较大者：结果确定，且不压低已有优先级。
+		value := int64(0)
+		if existing.Priority != nil {
+			value = *existing.Priority
+		}
+		kept, ok := keptByModel[existing.Model]
+		keptValue := int64(0)
+		if kept != nil {
+			keptValue = *kept
+		}
+		if !ok || value > keptValue {
+			keptByModel[existing.Model] = existing.Priority
+		}
+	}
+
 	// First delete all abilities of this channel
-	err := tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
+	err = tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
 	if err != nil {
 		if isNewTx {
 			tx.Rollback()
@@ -299,6 +369,7 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 	groups_ := strings.Split(channel.Group, ",")
 	abilitySet := make(map[string]struct{})
 	abilities := make([]Ability, 0, len(models_))
+	previousPriority := channel.PreviousPriority
 	for _, model := range models_ {
 		for _, group := range groups_ {
 			key := group + "|" + model
@@ -306,12 +377,28 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 				continue
 			}
 			abilitySet[key] = struct{}{}
+			// [FORK] 已有行沿用它的优先级（含 nil），新行用渠道优先级。见上面说明。
+			priority := channel.Priority
+			kept, ok := keptByRelation[key]
+			if !ok {
+				kept, ok = keptByModel[model]
+			}
+			if ok {
+				priority = kept
+				// 等于编辑前的渠道级值 = 沿袭行，跟随新值；其余是单条覆盖，保留。
+				// 比较前两边都归一成数值：abilities.priority 可能是 SQL NULL（旧数据、手工写入），
+				// channels.priority 也可能是 NULL，两者在选路上都按 0 参与。直接比指针会把
+				// 「NULL 沿袭行」误判成单条覆盖，改渠道级 priority 时它不跟随。
+				if previousPriority != nil && priorityValue(kept) == *previousPriority {
+					priority = channel.Priority
+				}
+			}
 			ability := Ability{
 				Group:     group,
 				Model:     model,
 				ChannelId: channel.Id,
 				Enabled:   channel.Status == common.ChannelStatusEnabled,
-				Priority:  channel.Priority,
+				Priority:  priority,
 				Weight:    uint(channel.GetWeight()),
 				Tag:       channel.Tag,
 			}

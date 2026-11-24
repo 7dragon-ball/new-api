@@ -62,6 +62,10 @@ type Channel struct {
 
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
+	// [FORK] 本次编辑**之前** channels.priority 的值（NULL 归一为 0），只用于让
+	// UpdateAbilities 区分「沿袭渠道级」与「单条覆盖」的 abilities 行。nil 表示调用方没动
+	// 渠道级 priority，重建时一切沿用。调用方必须在写 channels 行之前读好旧值再填进来。
+	PreviousPriority *int64 `json:"-" gorm:"-"`
 	// BalanceDetail is the last balance query in channel responses; see
 	// GetBalanceDetail.
 	BalanceDetail *ChannelBalanceDetail `json:"balance_detail,omitempty" gorm:"-"`
@@ -620,12 +624,17 @@ func (channel *Channel) Insert() error {
 // UpdateChannelLocked, so an edit never writes back a key a refresh replaced
 // after the edit read it.
 func (channel *Channel) Update() error {
+	// [FORK] 重建 abilities 要区分「沿袭渠道级 priority 的行」与「单条覆盖的行」，判断依据
+	// 是编辑前的 channels.priority，而下面会先把新值写进同一列，所以先读一次旧行。
+	stored, err := GetChannelById(channel.Id, true)
+	if err != nil {
+		return err
+	}
+	previousPriority := stored.GetPriority()
+	channel.PreviousPriority = &previousPriority
 	// If this is a multi-key channel, recalculate MultiKeySize based on the stored key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
-		var keyStr string
-		if existing, err := GetChannelById(channel.Id, true); err == nil {
-			keyStr = existing.Key
-		}
+		keyStr := stored.Key
 		// Parse the key list (supports newline separation or JSON array)
 		keys := []string{}
 		if keyStr != "" {
@@ -653,15 +662,13 @@ func (channel *Channel) Update() error {
 			}
 		}
 	}
-	var err error
 	err = DB.Model(channel).Omit("key").Updates(channel).Error
 	if err != nil {
 		return err
 	}
 	defer BumpSyncTopic(SyncTopicChannels)
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	return channel.UpdateAbilities(nil)
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
@@ -1034,6 +1041,11 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	}
 	if priority != nil {
 		updateData.Priority = priority
+		// [FORK] 渠道级 priority 也走重建：abilities 行有「沿袭渠道级」与「单条覆盖」两种
+		// 来源，只发一句 UPDATE abilities SET priority 会把单条覆盖一起改掉（同一接口多带一个
+		// models 字段结果就不同），而且这条 UPDATE 不走 UpdateAbilities 的「channel 行 →
+		// abilities 行」锁协议，与并发重建交错时写入会被删除/覆盖。
+		shouldReCreateAbilities = true
 	}
 	if weight != nil {
 		updateData.Weight = weight
@@ -1045,6 +1057,20 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
+	// [FORK] 重建 abilities 要区分「沿袭渠道级 priority 的行」与「单条覆盖的行」，判断依据
+	// 是编辑前的 channels.priority。按 tag 的批量更新会一次改掉多条渠道、各自的旧值不同，
+	// 所以先按 id 把旧值读出来。
+	var previousPriorities map[int]int64
+	if priority != nil {
+		existing, err := GetChannelsByTag(tag, false, false)
+		if err != nil {
+			return err
+		}
+		previousPriorities = make(map[int]int64, len(existing))
+		for _, channel := range existing {
+			previousPriorities[channel.Id] = channel.GetPriority()
+		}
+	}
 	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
 	if err != nil {
 		return err
@@ -1052,16 +1078,28 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	defer BumpSyncTopic(SyncTopicChannels)
 	if shouldReCreateAbilities {
 		channels, err := GetChannelsByTag(updatedTag, false, false)
-		if err == nil {
-			for _, channel := range channels {
-				err = channel.UpdateAbilities(nil)
-				if err != nil {
-					common.SysLog(common.LogText("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
+		if err != nil {
+			return err
+		}
+		// [FORK] 上面那条 UPDATE 已经改掉了 channels.priority，重建失败必须让调用方拿到错误，
+		// 否则接口报成功而选路仍走旧优先级。继续重建其余渠道，只返回第一个错误。
+		var rebuildErr error
+		for _, channel := range channels {
+			if previousPriority, ok := previousPriorities[channel.Id]; ok {
+				channel.PreviousPriority = &previousPriority
+			}
+			err = channel.UpdateAbilities(nil)
+			if err != nil {
+				common.SysLog(common.LogText("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
+				if rebuildErr == nil {
+					rebuildErr = fmt.Errorf("rebuild abilities for channel %d: %w", channel.Id, err)
 				}
 			}
 		}
+		return rebuildErr
 	} else {
-		err := UpdateAbilityByTag(tag, newTag, priority, weight)
+		// priority 非空时已走上面的重建分支，这里只剩 tag / weight 的整表更新。
+		err := UpdateAbilityByTag(tag, newTag, nil, weight)
 		if err != nil {
 			return err
 		}
