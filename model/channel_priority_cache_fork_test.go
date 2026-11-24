@@ -449,6 +449,42 @@ func TestChannelUpdateAppliesChannelPriorityToInheritedRows(t *testing.T) {
 	assert.Equal(t, map[int]bool{neighbour.Id: true}, pick(1))
 }
 
+// [FORK] abilities.priority 为 SQL NULL 的行在选路上等价于 0（旧数据、手工写入都可能留下）。
+// 改渠道级 priority 时必须把它认成「沿袭行」跟着新值走，而不是当成单条覆盖留在 NULL，
+// 否则就是接口报成功、选路不变。
+func TestChannelUpdatePropagatesPriorityToNullAbilityRows(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	const modelName = "null-priority"
+	weight := uint(1)
+	channel := &Channel{
+		Name:     "null-priority",
+		Key:      "test-only",
+		Models:   modelName,
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   &weight,
+	}
+	require.NoError(t, channel.Insert())
+
+	abilitiesTable := DB.NamingStrategy.TableName("abilities")
+	channelsTable := DB.NamingStrategy.TableName("channels")
+	require.NoError(t, DB.Exec(fmt.Sprintf("UPDATE %s SET priority = NULL WHERE channel_id = ?", abilitiesTable), channel.Id).Error)
+	require.NoError(t, DB.Exec(fmt.Sprintf("UPDATE %s SET priority = NULL WHERE id = ?", channelsTable), channel.Id).Error)
+
+	edited, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	require.Nil(t, edited.Priority, "前置条件：channels.priority 是 SQL NULL")
+	edited.Priority = lo.ToPtr(int64(10))
+	require.NoError(t, edited.Update())
+
+	var ability Ability
+	require.NoError(t, DB.Where(commonGroupCol+" = ? and model = ? and channel_id = ?", "default", modelName, channel.Id).
+		First(&ability).Error)
+	require.NotNil(t, ability.Priority)
+	assert.Equal(t, int64(10), *ability.Priority, "NULL 沿袭行跟着新的渠道级 priority 走")
+}
+
 // [FORK] tag 编辑同时带 models/group 时会重建 abilities，priority 也要按编辑前的渠道级值
 // 判断沿袭与覆盖（`EditChannelByTag` 先按 id 读旧值，因为一条 tag 下有多个渠道）。
 func TestEditChannelByTagAppliesChannelPriorityToInheritedRows(t *testing.T) {
@@ -584,4 +620,34 @@ func TestEditChannelByTagPriorityOnlyKeepsOverrides(t *testing.T) {
 	overrideKept := priorityOf(overridden, owner.Id)
 	require.NotNil(t, overrideKept)
 	assert.Equal(t, int64(7), *overrideKept, "单条覆盖不被 tag 批量改 priority 清掉")
+}
+
+// [FORK] tag 批量改 priority 时若某个渠道的 abilities 重建失败，接口必须拿到错误：
+// channels.priority 已经在那条 UPDATE 里改掉了，报成功会让调用方以为选路也跟着变了。
+func TestEditChannelByTagReportsAbilityRebuildFailure(t *testing.T) {
+	useScheduledChannelDatabase(t)
+	weight := uint(1)
+	channel := &Channel{
+		Name:     "tag-fail",
+		Key:      "test-only",
+		Models:   "tag-fail-model",
+		Group:    "default",
+		Status:   common.ChannelStatusEnabled,
+		Priority: lo.ToPtr(int64(3)),
+		Weight:   &weight,
+		Tag:      lo.ToPtr("fork-tag-fail"),
+	}
+	require.NoError(t, channel.Insert())
+
+	callbackName := "test:edit_channel_by_tag_ability_failure"
+	abilitiesTable := DB.NamingStrategy.TableName("abilities")
+	require.NoError(t, DB.Callback().Delete().Before("gorm:delete").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == abilitiesTable {
+			tx.AddError(errors.New("forced abilities rebuild failure"))
+		}
+	}))
+	t.Cleanup(func() { _ = DB.Callback().Delete().Remove(callbackName) })
+
+	err := EditChannelByTag("fork-tag-fail", nil, nil, nil, nil, lo.ToPtr(int64(10)), nil, nil, nil)
+	require.ErrorContains(t, err, "forced abilities rebuild failure")
 }

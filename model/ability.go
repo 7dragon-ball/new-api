@@ -267,6 +267,16 @@ func (channel *Channel) DeleteAbilities() error {
 	return DB.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
 }
 
+// priorityValue 把可空的 priority 归一成选路时使用的数值（nil 视作 0）。
+// 只用于「abilities 行是否沿袭渠道级 priority」的比较，不能替代 equalPriority：
+// channel_priority.go 的 undo 需要区分 NULL 与 0。
+func priorityValue(priority *int64) int64 {
+	if priority == nil {
+		return 0
+	}
+	return *priority
+}
+
 // UpdateAbilities updates abilities of this channel.
 // Make sure the channel is completed before calling this function.
 func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
@@ -376,7 +386,10 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 			if ok {
 				priority = kept
 				// 等于编辑前的渠道级值 = 沿袭行，跟随新值；其余是单条覆盖，保留。
-				if previousPriority != nil && equalPriority(kept, previousPriority) {
+				// 比较前两边都归一成数值：abilities.priority 可能是 SQL NULL（旧数据、手工写入），
+				// channels.priority 也可能是 NULL，两者在选路上都按 0 参与。直接比指针会把
+				// 「NULL 沿袭行」误判成单条覆盖，改渠道级 priority 时它不跟随。
+				if previousPriority != nil && priorityValue(kept) == *previousPriority {
 					priority = channel.Priority
 				}
 			}

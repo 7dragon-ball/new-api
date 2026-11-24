@@ -1078,17 +1078,25 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	defer BumpSyncTopic(SyncTopicChannels)
 	if shouldReCreateAbilities {
 		channels, err := GetChannelsByTag(updatedTag, false, false)
-		if err == nil {
-			for _, channel := range channels {
-				if previousPriority, ok := previousPriorities[channel.Id]; ok {
-					channel.PreviousPriority = &previousPriority
-				}
-				err = channel.UpdateAbilities(nil)
-				if err != nil {
-					common.SysLog(common.LogText("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
+		if err != nil {
+			return err
+		}
+		// [FORK] 上面那条 UPDATE 已经改掉了 channels.priority，重建失败必须让调用方拿到错误，
+		// 否则接口报成功而选路仍走旧优先级。继续重建其余渠道，只返回第一个错误。
+		var rebuildErr error
+		for _, channel := range channels {
+			if previousPriority, ok := previousPriorities[channel.Id]; ok {
+				channel.PreviousPriority = &previousPriority
+			}
+			err = channel.UpdateAbilities(nil)
+			if err != nil {
+				common.SysLog(common.LogText("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
+				if rebuildErr == nil {
+					rebuildErr = fmt.Errorf("rebuild abilities for channel %d: %w", channel.Id, err)
 				}
 			}
 		}
+		return rebuildErr
 	} else {
 		// priority 非空时已走上面的重建分支，这里只剩 tag / weight 的整表更新。
 		err := UpdateAbilityByTag(tag, newTag, nil, weight)
