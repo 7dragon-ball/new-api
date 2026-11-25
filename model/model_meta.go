@@ -189,14 +189,15 @@ func GetConfiguredModelChannels() (map[string][]int, error) {
 
 // SearchModelsWithChannels augments metadata with concrete configured names.
 // Synthetic rows never persist and never affect the public pricing catalog.
-func SearchModelsWithChannels(keyword, vendor, status, syncOfficial string, offset, limit int) ([]*Model, int64, error) {
-	records, _, err := SearchModels(keyword, vendor, status, syncOfficial, 0, -1)
+func SearchModelsWithChannels(keyword, vendor, status, syncOfficial, tag string, offset, limit int) ([]*Model, int64, error) {
+	records, _, err := SearchModels(keyword, vendor, status, syncOfficial, tag, 0, -1)
 	if err != nil {
 		return nil, 0, err
 	}
 	_, filterStatus := parseModelStatusFilter(status)
 	_, filterSync := parseModelSyncFilter(syncOfficial)
-	if !filterStatus && !filterSync && (vendor == "" || vendor == "0") {
+	// [FORK] 合成行没有 tags，带标签筛选时必须排除。
+	if !filterStatus && !filterSync && (vendor == "" || vendor == "0") && tag == "" {
 		configured, err := GetConfiguredModelChannels()
 		if err != nil {
 			return nil, 0, err
@@ -406,7 +407,7 @@ func GetVendorModelCounts() (map[int64]int64, error) {
 }
 
 func GetAllModels(offset int, limit int) ([]*Model, error) {
-	models, _, err := SearchModels("", "", "", "", offset, limit)
+	models, _, err := SearchModels("", "", "", "", "", offset, limit)
 	return models, err
 }
 
@@ -483,12 +484,18 @@ func GetPreferredModelOwnerChannelTypes(modelNames []string, groups []string) (m
 	return result, nil
 }
 
-func SearchModels(keyword string, vendor string, status string, syncOfficial string, offset int, limit int) ([]*Model, int64, error) {
+func SearchModels(keyword string, vendor string, status string, syncOfficial string, tag string, offset int, limit int) ([]*Model, int64, error) {
 	var models []*Model
 	db := DB.Model(&Model{})
 	if keyword != "" {
 		like := "%" + keyword + "%"
 		db = db.Where("model_name LIKE ? OR description LIKE ? OR tags LIKE ?", like, like, like)
+	}
+	// [FORK] 标签单独一格：上游只有一个 keyword，且它是 model_name / description / tags
+	// 三列 OR，按标签筛会误中模型名与描述。列表页的「标签」筛选要的是「只匹配标签」，
+	// 所以单开一个参数。tags 是逗号分隔字符串，这里与 keyword 对 tags 的匹配同为子串匹配。
+	if tag != "" {
+		db = db.Where("tags LIKE ?", "%"+tag+"%")
 	}
 	if vendor != "" {
 		if vid, err := strconv.Atoi(vendor); err == nil {

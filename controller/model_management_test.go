@@ -775,6 +775,41 @@ export function parseTaskResult() { return {}; }
 
 			})
 
+			t.Run("tag_filtering", func(t *testing.T) {
+				tagged := model.Model{ModelName: "tag-vision", Tags: "vision,旗舰", Status: 1}
+				described := model.Model{ModelName: "tag-described", Description: "supports vision tasks", Status: 1}
+				for _, item := range []*model.Model{&tagged, &described} {
+					require.NoError(t, item.Insert())
+				}
+				channel := model.Channel{Name: "Tag active", Type: 1, Key: "fixture", Group: "default", Status: common.ChannelStatusEnabled,
+					Models: "tag-vision,tag-channel-only"}
+				require.NoError(t, channel.Insert())
+				t.Cleanup(func() {
+					require.NoError(t, db.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
+					require.NoError(t, db.Where("id = ?", channel.Id).Delete(&model.Channel{}).Error)
+					require.NoError(t, db.Unscoped().Where("model_name LIKE ?", "tag-%").Delete(&model.Model{}).Error)
+					model.RefreshPricing()
+				})
+				type tagResponse struct {
+					Success bool
+					Data    struct {
+						Items []model.Model
+						Total int
+					}
+				}
+				var response tagResponse
+				modelManagementRequest(t, SearchModelsMeta, "GET", "/api/models/search?tag=vision&include_channel_models=true&page_size=100", nil, &response)
+				require.True(t, response.Success)
+				names := make([]string, 0)
+				for _, item := range response.Data.Items {
+					names = append(names, item.ModelName)
+				}
+				// 只匹配 tags 列：description 里同样含 vision 的 tag-described 不命中。
+				// 也没有合成行：tag-channel-only 没有元数据更没有 tags。
+				assert.Equal(t, []string{"tag-vision"}, names)
+				assert.Equal(t, 1, response.Data.Total)
+			})
+
 			t.Run("pricing_saves_zero_switches_modes_and_rejects_stale_batches", func(t *testing.T) {
 				before, err := model.GetModelPricingSnapshot([]string{"matrix-priced", "matrix-other"})
 				require.NoError(t, err)
