@@ -465,7 +465,8 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   上游原本只在完全不带筛选时才追加，导致「未上架」这一页整批为空，而这正是该页最主要的
   操作对象。
 
-**已知边界**：`tag` 是子串匹配，不做逗号边界匹配；`tags LIKE` 在 PG 上大小写敏感。
+**已知边界**：`tag` 是子串匹配，不做逗号边界匹配。大小写不敏感（`LOWER(tags) LIKE ?`，
+与标签字典接口同一口径）。
 
 **文件**：`model/model_meta.go`、`controller/model_meta.go`（上游文件，`[FORK]` 标记）、
 `controller/model_management_test.go`（`tag_filtering` 与 `status=disabled` 用例）。
@@ -477,15 +478,19 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 
 **做法**（`GET /api/models/tags?keyword=&limit=`，`model/model_tag_fork.go` +
 `controller/model_tag_fork.go`）：`models.tags` 是 `varchar(255)` 逗号串，没有独立标签表，
-所以把列拉回来在内存里拆：按小写去重（保留首次出现的原样大小写）、`sort.Strings`（码点序，
-不是拼音序）、默认上限 50 条。带 `keyword` 时先让 DB 按子串粗筛整格，再在内存按「单个标签
-含该词」收窄——否则 `vision,旗舰` 这种整格命中会让不相关的标签冒出来。权限 `model:read`。
+所以把列拉回来在内存里拆：按小写去重（按 `id` 序保留首次出现的原样大小写，因此哪种拼写
+可复现）、`sort.Strings`（码点序，不是拼音序）、默认上限 50 条。带 `keyword` 时先让 DB 按子串
+粗筛整格，再在内存按「单个标签含该词」收窄——否则 `vision,旗舰` 这种整格命中会让不相关的
+标签冒出来。权限 `model:read`。
 
-**已知边界**：粗筛那句是 SQL `LIKE`，PG 上手打大小写跟库里不一致时拿不到候选；从下拉里
-点选（返回的是库里的原样大小写）不受影响。
+**大小写口径**：`SearchModels` 的 tag 筛选与这里的粗筛都用 `LOWER(tags) LIKE ?`（传入值
+`ToLower`），所以 PG 上也大小写不敏感。字典按小写去重只留一种拼写，而筛选不区分大小写，
+同一标签同时存在 `Vision` / `vision` 时点选任一拼写都能筛到全部变体。手打大小写和库里不一致
+同样能拿到候选。
 
 **文件**：`model/model_tag_fork.go`、`controller/model_tag_fork.go`、
-`controller/model_tag_fork_test.go`；路由注册在 `router/api-router.go` 与
+`controller/model_tag_fork_test.go`（含 SQLite/MySQL/PG 三库用例，后两库需 `TEST_MYSQL_DSN` /
+`TEST_POSTGRES_DSN`）；路由注册在 `router/api-router.go` 与
 `middleware/access_token_routes.go`（两处都是单行 `[FORK]`）。
 
 ## 数据库
