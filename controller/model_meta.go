@@ -19,6 +19,7 @@ func GetAllModelsMeta(c *gin.Context) {
 
 // SearchModelsMeta 搜索模型列表
 func SearchModelsMeta(c *gin.Context) {
+	// [FORK] 列表页「标签」筛选：上游只有一个 keyword，按标签筛会误中模型名与描述
 	listModelsMeta(c, c.Query("keyword"), c.Query("vendor"), c.Query("tag"))
 }
 
@@ -46,6 +47,7 @@ func listModelsMeta(c *gin.Context, keyword, vendor, tag string) {
 	if c.Query("include_channel_models") == "true" {
 		search = model.SearchModelsWithChannels
 	}
+	// [FORK] tag 只由 SearchModelsMeta 带进来，GetAllModelsMeta 恒传空串（不带标签筛）
 	modelsMeta, total, err := search(keyword, vendor, c.Query("status"), c.Query("sync_official"), tag, offset, limit)
 	if err != nil {
 		common.ApiError(c, err)

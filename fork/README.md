@@ -449,6 +449,45 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 **已知边界**：BFF 的写接口固定落 `default` 组；查询表本身不做 group 过滤，但部署里若存在多 group
 渠道，单条优先级目前只对 `default` 组生效。
 
+### 十、模型标签筛选（`c20679b0c` + `7a45e2f54`）
+
+**背景**：模型列表页要从「标签」筛模型。上游 `/api/models/search` 只有一个 `keyword`，它把
+`model_name` / `description` / `tags` 三列 OR 起来模糊匹配——按标签筛会连模型名、描述里
+碰巧出现该词的行一起返回。
+
+**做法**：
+
+- **搜索加一格 `tag`**（`model/model_meta.go` 的 `SearchModels` / `SearchModelsWithChannels`、
+  `controller/model_meta.go`）：只匹配 `tags` 一列，**子串匹配**，与 keyword 对 tags 的口径一致
+  （取舍见「已知限制」）。`GET /api/models/`（`GetAllModelsMeta`）不带这个筛选，恒传空串。
+- **合成行（`id=0`，「渠道里有、还没建元数据」）的两个口径**：带 `tag` 时不追加（合成行没有
+  tags）；`status=disabled`（列表页的「未上架」）时**追加**——合成行的 `status` 零值就是 0，
+  上游原本只在完全不带筛选时才追加，导致「未上架」这一页整批为空，而这正是该页最主要的
+  操作对象。
+
+**已知边界**：`tag` 是子串匹配，不做逗号边界匹配；`tags LIKE` 在 PG 上大小写敏感。
+
+**文件**：`model/model_meta.go`、`controller/model_meta.go`（上游文件，`[FORK]` 标记）、
+`controller/model_management_test.go`（`tag_filtering` 与 `status=disabled` 用例）。
+
+### 十一、模型标签字典接口（`7cd06ea44`）
+
+**背景**：列表页改成服务端分页后，筛选框的标签候选只能从当页 20 条模型的 `tags` 里现算。
+命中超过 20 条时，只在第 21 条之后出现的标签就看不到建议了（手打仍能筛到，只是没提示）。
+
+**做法**（`GET /api/models/tags?keyword=&limit=`，`model/model_tag_fork.go` +
+`controller/model_tag_fork.go`）：`models.tags` 是 `varchar(255)` 逗号串，没有独立标签表，
+所以把列拉回来在内存里拆：按小写去重（保留首次出现的原样大小写）、`sort.Strings`（码点序，
+不是拼音序）、默认上限 50 条。带 `keyword` 时先让 DB 按子串粗筛整格，再在内存按「单个标签
+含该词」收窄——否则 `vision,旗舰` 这种整格命中会让不相关的标签冒出来。权限 `model:read`。
+
+**已知边界**：粗筛那句是 SQL `LIKE`，PG 上手打大小写跟库里不一致时拿不到候选；从下拉里
+点选（返回的是库里的原样大小写）不受影响。
+
+**文件**：`model/model_tag_fork.go`、`controller/model_tag_fork.go`、
+`controller/model_tag_fork_test.go`；路由注册在 `router/api-router.go` 与
+`middleware/access_token_routes.go`（两处都是单行 `[FORK]`）。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -482,12 +521,12 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 95 个文件（50 个上游文件被改、45 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +8870/−194，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+共 102 个文件（54 个上游文件被改、48 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +9686/−219，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。50 个被改文件里有 9 个是 `web/`、4 个不是功能
+> 那不是定制，不计入上面的文件数。54 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
@@ -497,7 +536,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，前四组定制都改它 |
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
 | `model/channel_cache.go` | 新增 `priorityLookupCache` 的构建与发布、`GetRandomSatisfiedChannel` 的优先级改读 `abilities.priority`（5 处 `[FORK]`） | **高**，逐请求热路径 |
-| `router/api-router.go` | 四处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password` | 中，定制都插在同一文件 |
+| `router/api-router.go` | 五处插路由：`/api/department/`、`PUT /api/user/:id/department`、`GET /api/data/departments`、`POST /api/user/batch/reset_password`、`GET /api/models/tags` | 中，定制都插在同一文件 |
 | `model/ability.go` | `UpdateAbilities` 在 `DELETE` 前记下现有 abilities 行的 priority，重建时按 `group|model`（换 group 时退化到 `model`）还原，并用 `Channel.PreviousPriority` 让改渠道级 priority 生效（见「九」，3 处 `[FORK]`） | 中，8 个调用点的高频路径 |
 | `model/channel.go` | `Channel` 加非持久化字段 `PreviousPriority`，`Update()` / `EditChannelByTag` 在写 `channels` 行前把旧 priority 填进去，tag 编辑带 priority 时改走重建（4 处 `[FORK]`） | 中，渠道编辑主路径 |
 | `controller/audit.go` | 审计 action 英文模板 map 加 5 项 | 低 |
@@ -508,7 +547,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/channel.go` | `FetchModels` 的取 key 逻辑改为调 `credentialKeyFor`（1 处 `[FORK]`） | 低，单行 |
 | `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态用例（跳过定价/消费日志、日志脱敏） | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
-| `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write` | 低 |
+| `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write`、`GET /api/models/tags` → `model:read` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
 | `model/task_cas_test.go` | 测试的 `AutoMigrate` 同样加 `&Department{}` | 低 |
 | `model/user_pagination_test.go` | `SearchUsers` 签名变化，补两个参数 | 低 |
@@ -522,6 +561,9 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_cache.go` | `baseUserWithDepartment` 成为「用户 → 带部门名的 `UserBase`」的唯一实现，三个缓存路径共用 | 中 |
 | `model/user_auth_cache.go` | 内联 Lua 多写两列（ARGV 下标必须与 `UserBase` 字段顺序对齐）；`userCacheSchemaVersion` 升 3 | **最高**，漏写一列就永远读回空串 |
 | `model/redemption.go` | 兑换时抄一份兑换人用户名/显示名 | 低 |
+| `model/model_meta.go` | `SearchModels` / `SearchModelsWithChannels` 加 `tag` 参数（只匹配 `tags` 列、子串）；合成行带 `tag` 时不追加、`status=disabled` 时追加（2 处 `[FORK]`） | 中，模型列表主查询 |
+| `controller/model_meta.go` | `listModelsMeta` 多一个 `tag` 透传，`GetAllModelsMeta` 恒传空串（2 处 `[FORK]`） | 低 |
+| `controller/model_management_test.go` | `tag_filtering` 用例；`status=disabled` 保留合成行的断言 | 低 |
 | `constant/context_key.go` | 新增 `ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName` | 低 |
 | `middleware/auth.go` | 鉴权通过后把身份写进上下文 | 低 |
 | `middleware/distributor.go` | 分发后把渠道名/供应商写进上下文 | 低 |
@@ -569,6 +611,9 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/channel_priority_cache_fork_test.go` | 选路基线、查询表、逐渠道回退、缓存开关一致性、`UpdateAbilities` 保留优先级、改渠道级 priority / tag 编辑（含只带 priority）/ 换 group 四条回归 |
 | `model/channel_priority_fork_test.go` | `UpdateAbilityPriority` 只改目标行、范围校验、缓存版本推进 |
 | `controller/channel_priority_fork_test.go` | 端点用例（含缺省 group、错误码、写后立即生效） |
+| `model/model_tag_fork.go` | `ListModelTags`：拉 `tags` 列拆开去重（小写比较、保留原样大小写）、码点序、默认上限 50 |
+| `controller/model_tag_fork.go` | `GET /api/models/tags` handler |
+| `controller/model_tag_fork_test.go` | 去重排序、`keyword` 按单个标签收窄（不是整格）、`limit` 与缺省 |
 
 （另有 12 个上游文件被改签名、补迁移或补测试，已并入上表。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
@@ -584,39 +629,44 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 162 处、54 个文件：
+当前共 190 处、60 个文件：
 
 | 文件 | 处数 |
 |---|---|
 | `model/user.go` | 17 |
 | `controller/user.go` | 16 |
-| `model/channel_priority_cache_fork_test.go` | 11 |
-| `model/channel_ability_fork.go` | 7 |
+| `model/channel_priority_cache_fork_test.go` | 13 |
+| `model/channel_ability_fork.go` | 9 |
+| `model/channel_ability_fork_test.go` | 7 |
 | `service/security_verification.go` | 7 |
 | `controller/channel-test.go` | 6 |
 | `controller/department_fork.go` | 6 |
-| `model/user_last_called_fork_test.go` | 6 |
 | `model/department_fork.go` | 6 |
+| `model/user_last_called_fork_test.go` | 6 |
+| `model/channel.go` | 5 |
 | `model/channel_cache.go` | 5 |
-| `model/usedata.go` | 5 |
 | `model/channel_priority_cache_fork.go` | 5 |
+| `model/usedata.go` | 5 |
+| `router/api-router.go` | 5 |
 | `controller/channel_ability_fork.go` | 4 |
+| `model/channel_priority_fork.go` | 4 |
 | `model/log.go` | 4 |
-| `model/channel_ability_fork_test.go` | 4 |
-| `router/api-router.go` | 4 |
 | `constant/context_key.go` | 3 |
-| `model/channel_priority_fork.go` | 3 |
-| `model/channel.go` | 4 |
+| `model/ability.go` | 3 |
 | `router/channel-router.go` | 3 |
-| `middleware/auth.go` | 2 |
-| `controller/channel_priority_fork.go` | 2 |
 | `controller/audit.go` | 2 |
-| `controller/channel_priority_fork_test.go` | 2 |
 | `controller/channel_ability_fork_test.go` | 2 |
+| `controller/channel_priority_fork.go` | 2 |
+| `controller/channel_priority_fork_test.go` | 2 |
+| `controller/model_meta.go` | 2 |
+| `middleware/access_token_routes.go` | 2 |
+| `middleware/auth.go` | 2 |
+| `model/channel_priority_fork_test.go` | 2 |
 | `model/department_fork_test.go` | 2 |
+| `model/model_meta.go` | 2 |
 | `model/user_auth_cache.go` | 2 |
 | `service/security_verification_fork.go` | 2 |
-| `middleware/distributor.go`、`middleware/access_token_routes.go`、`migrations/embed.go`、`controller/user_management_fork.go`、`controller/department_usage_fork.go`、`controller/user_unified_update_fork_test.go`、`controller/channel.go`、`controller/security_enrollment_test.go`、`controller/channel_test_fork.go`、`controller/user_batch_password_reset_fork.go`、`common/random_password_fork.go`、`model/user_batch_password_fork.go`、`model/channel_priority_fork_test.go`、`model/redemption.go`、`model/user_department_fork_test.go`、`model/goose_fork.go`、`model/user_cache.go`、`model/user_phone_fork.go`、`model/main.go`、`service/log_info_generate.go`、`service/task_billing.go`、`service/channel_key_fingerprint_fork.go`、`service/security_verification_batch_password_fork.go`、`service/access_token_scope.go`、`service/violation_fee.go`、`relay/responses_websocket.go` | 各 1 |
+| `common/random_password_fork.go`、`controller/channel.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/model_tag_fork_test.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/distributor.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
@@ -790,6 +840,12 @@ docker build \
   从 `channels.models` 摘掉模型名、清掉对应映射并重建 abilities；行不存在 → 404。
   两者权限均为 `ChannelWrite`，写后立即刷新路由缓存。
 
+- `GET /api/models/search` 多了 `tag` 参数：只按 `tags` 列筛（子串匹配，`%`/`_` 未转义），
+  与 `keyword` 互不替代，可同时用。同时带 `tag` 时不返回合成行（`include_channel_models=true`
+  下）；`status=disabled` 时返回合成行（列表页「未上架」），见「定制清单 · 十」。权限 `model:read`。
+- `GET /api/models/tags?keyword=&limit=`：标签字典，返回去重后按码点排序的标签全集，`limit`
+  缺省 50，`keyword` 按「单个标签含该词」收窄（不是整格匹配）。权限 `model:read`，
+  见「定制清单 · 十一」。
 - 日志行（`GET /api/log/`、`/api/log/export`）多了快照字段 `display_name`、`department`、
   `channel_name`、`channel_tag`、`token_owner`。**筛选参数没变**：`LogFilter` 没有按显示名/渠道名
   筛选的能力，这些列只用于展示。
@@ -836,6 +892,7 @@ docker build \
 | 部门用量聚合仍按当前归属算 | `GET /api/data/departments` 用 `users.department_id` 实时聚合（且 `deleted_at IS NULL`），用户转部门后历史用量跟着走，删掉的用户不计入。`quota_data.department` 快照已写入但尚未被该接口使用。 |
 | `CountEnabledRootUsers` 生产代码里没有调用点 | 守卫走的是加锁路径。该函数留给排查与测试用。 |
 | 新建用户的默认侧边栏配置不含 admin 区，事后 `grant_root` 不重算 | 只影响上游自带控制台；本 fork 的 `web/` 改动只有 i18n 与类型，没动侧边栏逻辑。 |
+| 模型标签筛是子串匹配、且 PG 上区分大小写 | `tag=视觉` 会连 `视觉理解` 一起筛出来；`tag=%` 等价于「`tags` 非空」（`%`/`_` 未转义）。改成逗号边界匹配又要处理库里 `a, b` 这类带空格的写入，代价大于收益；候选下拉（`GET /api/models/tags`）给的是精确标签，点选不会误中，手打才会。 |
 | 极端情况下仍可能被人工操作清空 root（手工 SQL、迁移脚本） | 事故兜底：把可信账号 `UPDATE users SET role=100, status=1`，或删除 setups 记录后重启走初始化。**仅事故时人工执行，不可当控制手段。** |
 
 ## 许可证与合规
