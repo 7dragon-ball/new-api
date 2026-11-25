@@ -194,10 +194,17 @@ func SearchModelsWithChannels(keyword, vendor, status, syncOfficial, tag string,
 	if err != nil {
 		return nil, 0, err
 	}
-	_, filterStatus := parseModelStatusFilter(status)
+	statusValue, filterStatus := parseModelStatusFilter(status)
 	_, filterSync := parseModelSyncFilter(syncOfficial)
-	// [FORK] 合成行没有 tags，带标签筛选时必须排除。
-	if !filterStatus && !filterSync && (vendor == "" || vendor == "0") && tag == "" {
+	// [FORK] 合成行（id=0，「渠道里有、还没建元数据」）的 status 零值是 0，在列表页上落在
+	// 「未上架」里。上游原本只在「完全不带筛选」时才加它们，但 status=disabled 问的正是
+	// 「未上架的」，丢掉合成行会让这个页面最主要的操作对象整批消失。所以 disabled 也算。
+	// 带 tag 时必须排除：合成行没有 tags。
+	includeSynthetic := !filterSync &&
+		(vendor == "" || vendor == "0") &&
+		(!filterStatus || statusValue == 0) &&
+		tag == ""
+	if includeSynthetic {
 		configured, err := GetConfiguredModelChannels()
 		if err != nil {
 			return nil, 0, err

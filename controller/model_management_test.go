@@ -719,6 +719,8 @@ export function parseTaskResult() { return {}; }
 					{"&p=2&page_size=2", 6, []string{"listing-exact", "listing-disabled"}},
 					{"&p=9&page_size=2", 6, []string{}},
 					{"&status=enabled", 3, []string{"listing-rule-", "listing-catalog", "listing-exact"}},
+					// 「未上架」筛的正是合成行（status 零值），不能因为带了 status 就丢掉它们
+					{"&status=disabled", 3, []string{"listing-disabled", "listing-new", "listing-rule-child"}},
 					{"&sync_official=no", 2, []string{"listing-rule-", "listing-catalog"}},
 					{"&vendor=0", 6, []string{"listing-rule-", "listing-catalog", "listing-exact", "listing-disabled", "listing-new", "listing-rule-child"}},
 					{"&vendor=999", 0, []string{}},
