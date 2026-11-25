@@ -14,15 +14,16 @@ import (
 
 // GetAllModelsMeta 获取模型列表（分页）
 func GetAllModelsMeta(c *gin.Context) {
-	listModelsMeta(c, "", "")
+	listModelsMeta(c, "", "", "")
 }
 
 // SearchModelsMeta 搜索模型列表
 func SearchModelsMeta(c *gin.Context) {
-	listModelsMeta(c, c.Query("keyword"), c.Query("vendor"))
+	// [FORK] 列表页「标签」筛选：上游只有一个 keyword，按标签筛会误中模型名与描述
+	listModelsMeta(c, c.Query("keyword"), c.Query("vendor"), c.Query("tag"))
 }
 
-func listModelsMeta(c *gin.Context, keyword, vendor string) {
+func listModelsMeta(c *gin.Context, keyword, vendor, tag string) {
 	squareState := model.ModelSquareState(c.Query("square_state"))
 	switch squareState {
 	case "", model.ModelSquareVisible, model.ModelSquareUnavailable, model.ModelSquareHidden, model.ModelSquarePartial:
@@ -46,7 +47,8 @@ func listModelsMeta(c *gin.Context, keyword, vendor string) {
 	if c.Query("include_channel_models") == "true" {
 		search = model.SearchModelsWithChannels
 	}
-	modelsMeta, total, err := search(keyword, vendor, c.Query("status"), c.Query("sync_official"), offset, limit)
+	// [FORK] tag 只由 SearchModelsMeta 带进来，GetAllModelsMeta 恒传空串（不带标签筛）
+	modelsMeta, total, err := search(keyword, vendor, c.Query("status"), c.Query("sync_official"), tag, offset, limit)
 	if err != nil {
 		common.ApiError(c, err)
 		return

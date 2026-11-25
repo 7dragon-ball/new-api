@@ -433,6 +433,8 @@ func SetApiRouter(router *gin.Engine) {
 			modelsRoute.GET("/missing", controller.GetMissingModels)
 			modelsRoute.GET("/", controller.GetAllModelsMeta)
 			modelsRoute.GET("/search", controller.SearchModelsMeta)
+			// [FORK] 标签字典：列表页「标签」筛选框的下拉候选
+			modelsRoute.GET("/tags", controller.ListModelTagsFork)
 			modelsRoute.GET("/:id", controller.GetModelMeta)
 			modelsRoute.POST("/", controller.CreateModelMeta)
 			modelsRoute.PUT("/", controller.UpdateModelMeta)

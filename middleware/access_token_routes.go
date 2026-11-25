@@ -293,6 +293,8 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/models/missing":               accessTokenScopeRule("model:read"),
 	"GET /api/models/":                      accessTokenScopeRule("model:read"),
 	"GET /api/models/search":                accessTokenScopeRule("model:read"),
+	// [FORK] 标签字典：列表页「标签」筛选框的候选
+	"GET /api/models/tags":   				 accessTokenScopeRule("model:read"),
 	"GET /api/models/:id":                   accessTokenScopeRule("model:read"),
 	"POST /api/models/":                     accessTokenScopeRule("model:write"),
 	"PUT /api/models/":                      accessTokenScopeRule("model:write"),
