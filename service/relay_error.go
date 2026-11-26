@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -93,6 +94,13 @@ func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, 
 	}
 	other.SetPublic("error_type", err.GetErrorType())
 	other.SetPublic("error_code", err.GetErrorCode())
+	// [FORK] 使用日志记录调用状态码；归一到二开码后另存上游原始码，避免丢失 provider 原因。
+	// 二开：401/429 会按状态码把 error_code 归一到 upstream_* 二开码；这里额外保留上游自带
+	// 的错误码，避免丢失 provider 的具体原因（如 invalid_api_key / insufficient_quota）。
+	// GetUpstreamErrorCode 仅在错误来自上游响应体时非空，new-api 内部哨兵不会混入。
+	if upstreamCode := err.GetUpstreamErrorCode(); upstreamCode != "" && upstreamCode != err.GetErrorCode() {
+		other.SetAdmin("upstream_error_code", upstreamCode)
+	}
 	other.SetPublic("status_code", err.StatusCode)
 	AppendRelayLogAdminInfo(c, relayInfo, other)
 	appendRequestPluginRecord(relayInfo, other)
@@ -103,5 +111,46 @@ func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, 
 		startTime = time.Now()
 	}
 	useTimeSeconds := int(time.Since(startTime).Seconds())
-	model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(common.UpstreamAddresses(c)...), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+	// [FORK] 使用日志 content 必须与读者语言无关：错误对象可携带落库专用固定英文文案
+	// （如定价失败的文案是按读者语言渲染的），有则用它作为 content；只换落库副本，
+	// 原错误对象不变，响应仍是读者语言。
+	contentErr := err
+	if fixedMessage := err.GetLogMessage(); fixedMessage != "" {
+		snapshot := *err
+		snapshot.Err = errors.New(fixedMessage)
+		contentErr = &snapshot
+	}
+	model.RecordErrorLog(c, userId, channelId, modelName, tokenName, contentErr.MaskSensitiveErrorWithStatusCode(common.UpstreamAddresses(c)...), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+}
+
+// [FORK] 预扣费/额度不足这类错误带抑制标记会被跳过落库，强制落库让使用日志能看见该类失败态。
+// ForceRecordRelayErrorLog 落库即使错误对象显式带了 types.ErrOptionWithNoRecordErrorLog。
+// 二开：预扣费/额度不足这类错误会带该抑制标记，被 RecordRelayErrorLog 主动跳过，导致使用
+// 日志看不到这类失败态；这里清除抑制标记后落库，保留其
+// error_type/RelayError/error_code/status_code 等全部信息（仍受 constant.ErrorLogEnabled 开关控制）。
+//
+// 落库 content 必须是固定英文：额度类失败的文案由 billing 层用 i18n.T(c, ...) 按读者语言生成，
+// 直接落库会让同一种失败在不同语言请求下写出不同 content，使用日志无法检索与聚合（中间件路径
+// 已用 abortWithI18nMessage 消除同类问题）。这里只换掉交给落库的副本的文案，原错误对象不变，
+// 响应仍是读者语言。定价类失败（ErrorCodeModelPriceError）的文案在生成处就自带了固定英文
+// （types.ErrOptionWithLogMessage），由 RecordRelayErrorLog 统一替换，不在本函数的 switch 内。
+func ForceRecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
+	if err == nil {
+		return
+	}
+	err.SetRecordErrorLog(true)
+	fixedMessage := ""
+	switch err.GetErrorCode() {
+	case types.ErrorCodeInsufficientUserQuota:
+		fixedMessage = "Insufficient user quota"
+	case types.ErrorCodePreConsumeTokenQuotaFailed:
+		fixedMessage = "Not enough quota to pre-consume for this request"
+	}
+	logErr := err
+	if fixedMessage != "" {
+		logOnly := *err
+		logOnly.Err = errors.New(fixedMessage)
+		logErr = &logOnly
+	}
+	RecordRelayErrorLog(c, channelId, logErr, relayInfo)
 }

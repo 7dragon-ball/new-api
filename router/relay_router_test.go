@@ -139,9 +139,10 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 				assert.Equal(t, fmt.Sprintf("plugin google for user %d", user.Id), recorder.Body.String())
 				return
 			}
-			// The relay looks for a Gemini channel serving the model; there is none.
+			// The relay looks for a Gemini channel serving the model; there is none,
+			// and the model is absent from the platform model catalog.
 			assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-			assert.Contains(t, recorder.Body.String(), `"code":"model_not_found"`)
+			assert.Contains(t, recorder.Body.String(), `"code":"model_not_listed"`)
 		})
 	}
 }
@@ -164,7 +165,9 @@ func setupRelayRouterTestDB(t *testing.T) {
 	require.NoError(t, os.Setenv("SQL_DSN", "local"))
 	require.NoError(t, model.InitDB())
 	model.LOG_DB = model.DB
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}))
+	// The model catalog table must exist for failure paths that read it: an empty
+	// catalog means "model not listed", a missing table would be a lookup error.
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.Model{}))
 
 	t.Cleanup(func() {
 		if sqlDB, err := model.DB.DB(); err == nil {

@@ -74,6 +74,48 @@ func (mi *Model) MatchesName(name string) bool {
 	}
 }
 
+// [FORK] 选路失败要区分「模型未上架」与「无可用渠道」。
+// IsModelListed reports whether modelName resolves to an enabled entry in the
+// platform model catalog, using the same precedence as the public catalog
+// (resolveModelMetadata: exact, then prefix, suffix, contains). Soft-deleted
+// rows are excluded by the Model soft-delete scope. Because the winning rule
+// decides, a retired exact entry shadows a broader enabled rule, matching what
+// the catalog shows. Channel selection calls it at failure time to tell "model
+// not listed" from "no available channel" for the recorded error code; it runs
+// only on the error path. A lookup failure is returned instead of being folded
+// into "not listed", so a database fault is not reported as a user
+// configuration problem.
+//
+// The whole candidate set is deliberately read without a LIMIT: precedence is
+// resolved in Go, and the first row matching a pattern wins, so truncating the
+// result would change the listing verdict. The read is bounded by the
+// admin-curated catalog size and happens only after authentication, on a
+// failure that already records a usage-log row, so it is not the dominant cost
+// of that request.
+func IsModelListed(modelName string) (bool, error) {
+	if modelName == "" || DB == nil {
+		return false, nil
+	}
+	var records []Model
+	// The exact entry must win even when disabled, so keep disabled rows and
+	// resolve precedence in memory instead of filtering by status here.
+	// Prefix/suffix/contains matching is done in Go rather than SQL because the
+	// LIKE/escape syntax differs across SQLite/MySQL/PostgreSQL; this runs only on
+	// the channel-selection failure path, so loading the non-exact rows is acceptable.
+	// Order("id") only makes the duplicate-name tie-break reproducible (the pricing
+	// catalog reads rows unordered), so a given model always resolves the same way.
+	if err := DB.Model(&Model{}).
+		Select("model_name", "name_rule", "status").
+		Where("model_name = ? OR name_rule <> ?", modelName, NameRuleExact).
+		// [FORK] 同一 NameRule 命中多行时按 id 取稳定的一行，避免上架判定随查询顺序抖动。
+		Order("id").
+		Find(&records).Error; err != nil {
+		return false, err
+	}
+	policy := resolveModelMetadata(records, []string{modelName})[modelName]
+	return policy != nil && policy.Status == 1, nil
+}
+
 // resolveModelMetadata preserves catalog precedence: exact, prefix, suffix,
 // then contains. The first matching record within a rule type wins.
 func resolveModelMetadata(records []Model, names []string) map[string]*Model {

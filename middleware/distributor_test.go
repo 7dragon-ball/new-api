@@ -338,7 +338,7 @@ func TestDistributeHidesTaskPluginDetailsButLogsDiagnostics(t *testing.T) {
 				require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 				requestID := recorder.Header().Get(common.RequestIdKey)
 				require.NotEmpty(t, requestID)
-				assert.JSONEq(t, fmt.Sprintf(`{"error":{"message":%q,"type":"new_api_error","code":"model_not_found"}}`,
+				assert.JSONEq(t, fmt.Sprintf(`{"error":{"message":%q,"type":"new_api_error","code":"model_not_listed"}}`,
 					locale.message+" (request id: "+requestID+")"), recorder.Body.String())
 				assert.NotContains(t, recorder.Body.String(), "disable or override")
 				for _, key := range keys {
@@ -359,7 +359,7 @@ func TestNoAvailableChannelMessageWithoutPlugin(t *testing.T) {
 	plain, _ := gin.CreateTestContext(nil)
 	plain.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	plain.Request.Header.Set("Accept-Language", "en")
-	generic := noAvailableChannelMessage(plain, "default", "gpt-4o")
+	generic, _ := noAvailableChannelMessage(plain, "default", "gpt-4o")
 	assert.NotContains(t, generic, "task plugin")
 	assert.Contains(t, generic, "gpt-4o")
 }

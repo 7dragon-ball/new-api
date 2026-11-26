@@ -25,12 +25,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// [FORK] 使用日志 content 必须与读者语言无关：i18n.T 生成的是读者语言文案，直接落库会让同一种失败
+// 在不同语言请求下写出不同 content（中间件路径已用 abortWithI18nMessage 消除同类问题）。这里把读者语言
+// 文案留在 Err（响应仍按读者语言返回），同时把同一 key 的固定英文文案作为落库文案带上，供
+// service.RecordRelayErrorLog 写使用日志。返回 *types.NewAPIError 是为了让上层用 types.NewError
+// 包装时（errors.As 会保留深层错误）不丢这份文案。
+func localizedPriceError(c *gin.Context, key string, params map[string]any) error {
+	return types.NewError(
+		errors.New(i18n.T(c, key, params)),
+		types.ErrorCodeModelPriceError,
+		types.ErrOptionWithLogMessage(i18n.Translate(i18n.LangEn, key, params)),
+	)
+}
+
 func modelPriceNotConfiguredError(c *gin.Context, modelName string, userId int) error {
 	key := i18n.MsgRelayModelPriceNotConfigured
 	if model.IsAdmin(userId) {
 		key = i18n.MsgRelayModelPriceNotConfiguredAdmin
 	}
-	return errors.New(i18n.T(c, key, map[string]any{"Model": modelName}))
+	return localizedPriceError(c, key, map[string]any{"Model": modelName})
 }
 
 // HandleGroupRatio checks for "auto_group" in the context and updates the group ratio and relayInfo.UsingGroup if present
@@ -349,7 +362,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	exprHash := billingexpr.ExprHashString(exprStr)
 	usedVars := billingexpr.UsedVarsByHash(exprStr, exprHash)
 	if usedVars["u"] {
-		return hosttypes.PriceData{}, errors.New(i18n.T(c, i18n.MsgRelayTaskUsagePriceUnsupported, map[string]any{"Model": billingModelName}))
+		return hosttypes.PriceData{}, localizedPriceError(c, i18n.MsgRelayTaskUsagePriceUnsupported, map[string]any{"Model": billingModelName})
 	}
 	fixedPricing := billingexpr.UsesFixedPricingByHash(exprStr, exprHash)
 	value, _ := c.Get(jsplugin.ContextKeyRelayEndpoint)
@@ -369,7 +382,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 			// Task expressions return USD; ordinary expressions return USD *
 			// 1M. Even a constant without u() cannot safely serve both contracts.
 			if taskBillingModel == billingModelName {
-				return hosttypes.PriceData{}, errors.New(i18n.T(c, i18n.MsgRelaySharedTaskPriceNeedsOverride, map[string]any{"Model": billingModelName, "Plugin": pluginKey}))
+				return hosttypes.PriceData{}, localizedPriceError(c, i18n.MsgRelaySharedTaskPriceNeedsOverride, map[string]any{"Model": billingModelName, "Plugin": pluginKey})
 			}
 		}
 	}
