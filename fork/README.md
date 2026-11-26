@@ -616,6 +616,60 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `/sqlite`、`/postgres` PASS）。与上面「数据库」一节的「MySQL 不在运行范围」一致。
 - `relaykit` / `tokenkit` 独立构建：各自 `GOWORK=off go build ./...` 通过。
 
+### 十三、自动停用只放行秘钥类 `channel:*` 错误
+
+**上游行为**：`ShouldDisableChannel` 里 `if types.IsChannelError(err) { return true }` 一刀切——
+所有 `channel:` 前缀的错误都无条件停用渠道，连状态码、关键词、`skipRetry` 都不看。
+
+**问题**：这一个分支混了两类性质完全不同的错误：
+
+| 错误码 | 真实含义 | 停用后能否自愈 |
+|---|---|---|
+| `channel:invalid_key` | 秘钥失效 | 换钥即可 |
+| `channel:no_available_key` | 所有秘钥都已停用 | 补钥 / 启用即可 |
+| `channel:param_override_invalid` | 渠道「参数覆盖」表达式写错 | **不能**，得人改配置 |
+| `channel:header_override_invalid` | 自定义 header 配置错 | **不能** |
+| `channel:model_mapped_error` | 模型映射配置错 | **不能** |
+| `channel:aws_client_error` | AWS 适配器内部错误 | **不能** |
+| `channel:response_time_exceeded` | 批量测试超时 | **不能**（但这个码不经过 `ShouldDisableChannel`，见下） |
+
+其中后四个与「秘钥是否失效」无关，却同样会把渠道停掉，而且停掉不会自愈。
+
+**需求**：产品口径是「只有秘钥类原因可以自动停用」，所以只放行前两个。
+
+**做法**（`service/channel.go`，`// [FORK]` 标记）：把 `IsChannelError` 分支的值从 `true`
+改成 `isKeyRelatedChannelError(err)`，该函数只对 `channel:invalid_key` 与
+`channel:no_available_key` 返回真。**这一分支直接给出结论，配置类错误不会再往下走**——
+若让它 fall-through 到状态码 / 关键词判据，`param_override` 的 `return_error` 只要把
+`status_code` 写成 401、或文案里带上额度类词汇，就会绕过白名单重新被停用。
+请求本身仍然带着上游原文失败，只是渠道不进停用状态，错误不会被吞掉。
+
+**测试**：`service/channel_disable_fork_test.go`（新增文件按 fork 约定带 `_fork_test` 后缀）。
+覆盖四组：秘钥两类仍停用、配置五类不再停用、**不带 `skipRetry` 的配置类错误在 401 状态码与
+额度类文案下也不停用**（这条是 fall-through 的回归守卫，实测把它改回 fall-through 会变红）、
+以及 401 / 429 / 关键词 / nil / 总开关关闭这些非 `channel:*` 路径的行为不变。
+
+**`response_time_exceeded` 与这份白名单无关**：该错误码只由 `controller/channel-test.go` 的
+`testChannelForHealthCheck` 构造，而那里是在 `ShouldDisableChannel` 调用**之后**才把
+`shouldBanChannel` 直接置 `true`（超时判据独立于错误码判据）。所以它在不在白名单里都不影响
+超时停用，`ChannelDisableThreshold` 配成什么都不改变本节结论，也不需要「恢复超时判据时加回
+白名单」。
+
+**代价（有意接受）**：配置类渠道不再被停用，等于**失去了上游那次「一刀切停用」附带的隔离**。
+`service/relay_error.go` 的 `DecideRelayRetry` 仍把 `channel:*` 一律视为可重试，于是配置错的
+渠道会留在选路池里：每个路由到它的请求都失败一次再重试到别处，只在错误日志里可见，没有停用、
+通知或失败计数兜底。这是「渠道不能因为配置错误被停掉」这条口径的代价，发现途径是错误日志监控。
+若要补兜底，方向是在 `ProcessChannelError` 里对配置类错误走审计 / 通知，而不是退回停用。
+
+**两个留在白名单里的「非秘钥」来源（有意，不改错误码）**：
+`relay/channel/volcengine/tts.go` 的 ApiKey 格式解析失败、
+`relay/channel/providerplugin/adaptor.go` 的「凭据属于别的插件」，两者都打
+`channel:invalid_key`。它们同样是「不换凭据就永久不可用」，停用正是想要的隔离，所以维持现状。
+
+**AWS 渠道换钥失效不会自动停用（既有行为，非本节引入）**：`channel:aws_client_error` 只在
+`newAwsClient`（密钥段数 / 格式）失败时产生；AWS 凭据真正的过期或签名错误发生在 invoke 期，
+走状态码判据，而 403 不在默认停用码段内。排障时不要把它当成本节的 bug。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -649,14 +703,14 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 114 个文件（64 个上游文件被改、50 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +10302/−229，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+共 118 个文件（67 个上游文件被改、51 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +10673/−262，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
 （定稿修复把分支新增的 `service/relay_error_fallback.go` 并回 `service/relay_error.go` 并删除，
 故新增数比本分支初版少 1。）
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。64 个被改文件里有 9 个是 `web/`、4 个不是功能
+> 那不是定制，不计入上面的文件数。67 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
@@ -675,6 +729,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `router/channel_router_test.go` | 同上两条路由的权限断言 | 低 |
 | `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志、错误日志脱敏，`TestChannel` 回前端前脱敏（5 处 `[FORK]`） | 中，逐模型测试热路径 |
 | `controller/channel.go` | `FetchModels` 的取 key 逻辑改为调 `credentialKeyFor`（1 处 `[FORK]`） | 低，单行 |
+| `service/channel.go` | `ShouldDisableChannel` 的 `channel:*` 分支改为只放行秘钥两类，配置类错误直接判否、不再落到状态码 / 关键词判据（2 处 `[FORK]`，见「十三」） | 中，自动停用的唯一判据 |
 | `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态用例（跳过定价/消费日志、日志脱敏） | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
 | `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write`、`GET /api/models/tags` → `model:read` | 低 |
@@ -729,6 +784,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/department_fork_test.go`、`model/user_department_fork_test.go`、`model/user_last_called_fork_test.go`、`model/user_multi_root_fork_test.go`、`model/user_search_filter_fork_test.go`、`model/user_phone_fork_test.go` | model 包测试 |
 | `service/channel_key_fingerprint_fork.go` | 上游密钥指纹计算与写入 admin_info |
 | `service/channel_key_fingerprint_fork_test.go` | 指纹向量表（与 BFF 侧共用）、写入路径测试 |
+| `service/channel_disable_fork_test.go` | 自动停用白名单：秘钥两类仍停用、配置五类不停用、不带 `skipRetry` 时 401 / 额度文案也不停用（fall-through 守卫）、非 `channel:*` 路径不变 |
 | `service/security_verification_fork.go` | `admin.user.manage` 的 proof 校验规则 |
 | `model/log_identity_snapshot_fork_test.go` | 身份快照的写入/读取侧回归（上下文、后台路径、删除后列表） |
 | `model/user_cache_fork_test.go` | 缓存往返、`updateUserCache`、冷启动返回值、Redis 关闭时不查部门 |
@@ -769,7 +825,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 208 处、66 个文件（含本分支新增的 17 处，见「十二」）：
+当前共 217 处、69 个文件：
 
 | 文件 | 处数 |
 |---|---|
@@ -792,7 +848,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `model/channel_priority_fork.go` | 4 |
 | `model/log.go` | 4 |
 | `model/model_meta.go` | 4 |
-| `relaykit/types/error.go` | 4 |
+| `relaykit/types/error.go` | 7 |
 | `constant/context_key.go` | 3 |
 | `middleware/distributor.go` | 3 |
 | `model/ability.go` | 3 |
@@ -810,10 +866,11 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `model/channel_priority_fork_test.go` | 2 |
 | `model/department_fork_test.go` | 2 |
 | `model/user_auth_cache.go` | 2 |
-| `service/channel_select.go` | 2 |
-| `service/relay_error.go` | 2 |
+| `service/channel.go` | 2 |
+| `service/channel_select.go` | 3 |
+| `service/relay_error.go` | 3 |
 | `service/security_verification_fork.go` | 2 |
-| `common/random_password_fork.go`、`controller/channel.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `common/random_password_fork.go`、`controller/channel.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/helper/price.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_disable_fork_test.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
