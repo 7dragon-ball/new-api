@@ -406,7 +406,13 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 // management log tooltip reads from the recorded error code. The catalog read
 // only happens on this error path.
 func modelFailureCode(modelName string) types.ErrorCode {
-	if model.IsModelListed(modelName) {
+	listed, err := model.IsModelListed(modelName)
+	if err != nil {
+		// 目录查询失败时不能断言「模型未上架」，否则会把数据库故障当成用户配置问题。
+		common.SysError("model catalog lookup failed for " + modelName + ": " + err.Error())
+		return types.ErrorCodeNoAvailableChannel
+	}
+	if listed {
 		return types.ErrorCodeNoAvailableChannel
 	}
 	return types.ErrorCodeModelNotListed

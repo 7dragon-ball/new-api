@@ -93,6 +93,11 @@ func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, 
 	}
 	other.SetPublic("error_type", err.GetErrorType())
 	other.SetPublic("error_code", err.GetErrorCode())
+	// 二开：401/429 会按状态码把 error_code 归一到 upstream_* 二开码；这里额外保留上游自带
+	// 的错误码，避免丢失 provider 的具体原因（如 invalid_api_key / insufficient_quota）。
+	if upstreamCode := err.GetUpstreamErrorCode(); upstreamCode != "" && upstreamCode != err.GetErrorCode() {
+		other.SetAdmin("upstream_error_code", upstreamCode)
+	}
 	other.SetPublic("status_code", err.StatusCode)
 	AppendRelayLogAdminInfo(c, relayInfo, other)
 	appendRequestPluginRecord(relayInfo, other)

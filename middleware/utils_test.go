@@ -74,9 +74,15 @@ func TestAbortWithOpenAiMessageRecordsRelayErrorLog(t *testing.T) {
 	assert.Equal(t, string(types.ErrorCodeAccessDenied), storedOther["error_code"])
 	assert.Equal(t, float64(http.StatusForbidden), storedOther["status_code"])
 
+	errorLogCount := func() int64 {
+		_, total, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
+		require.NoError(t, err)
+		return total
+	}
+
 	// A caller that supplies no error code gets one derived from the status, so the
 	// usage log never carries an empty error_code.
-	for caseIndex, tc := range []struct {
+	for _, tc := range []struct {
 		statusCode int
 		wantCode   types.ErrorCode
 	}{
@@ -84,6 +90,7 @@ func TestAbortWithOpenAiMessageRecordsRelayErrorLog(t *testing.T) {
 		{http.StatusForbidden, types.ErrorCodeAccessDenied},
 		{http.StatusBadRequest, types.ErrorCodeInvalidRequest},
 	} {
+		before := errorLogCount()
 		ctx, _ = newAbortContext()
 		abortWithOpenAiMessage(ctx, tc.statusCode, "aborted without an explicit code")
 		derivedLogs, derivedTotal, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
@@ -93,22 +100,35 @@ func TestAbortWithOpenAiMessageRecordsRelayErrorLog(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, string(tc.wantCode), derivedOther["error_code"])
 		assert.Equal(t, float64(tc.statusCode), derivedOther["status_code"])
-		assert.Equal(t, int64(2+caseIndex), derivedTotal, "each derived-code abort adds exactly one error log")
+		assert.Equal(t, before+1, derivedTotal, "each derived-code abort adds exactly one error log")
 	}
 
 	// Local model rate limiting (429) is high-frequency noise and must not be recorded.
+	before := errorLogCount()
 	ctx, recorder = newAbortContext()
 	abortWithOpenAiMessage(ctx, http.StatusTooManyRequests, "rate limit reached")
 	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
-	_, total, err = model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
-	require.NoError(t, err)
-	assert.Equal(t, int64(4), total, "a locally rate-limited abort must not be recorded")
+	assert.Equal(t, before, errorLogCount(), "a locally rate-limited abort must not be recorded")
+
+	// An unauthenticated abort (no user id) has no owner to attribute the log to, so
+	// invalid-key scanners must not be able to amplify the usage log.
+	before = errorLogCount()
+	recorder = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	abortWithOpenAiMessage(ctx, http.StatusUnauthorized, "invalid api key")
+	assert.Equal(t, before, errorLogCount(), "an unauthenticated abort must not be recorded")
+
+	// Server-side failures (5xx) derive no user-visible code and must not be recorded.
+	before = errorLogCount()
+	ctx, _ = newAbortContext()
+	abortWithOpenAiMessage(ctx, http.StatusInternalServerError, "rate limit check failed")
+	assert.Equal(t, before, errorLogCount(), "a 5xx abort must not be recorded")
 
 	// The recorded error log is governed by the ErrorLogEnabled switch.
 	constant.ErrorLogEnabled = false
+	before = errorLogCount()
 	ctx, _ = newAbortContext()
 	abortWithOpenAiMessage(ctx, http.StatusForbidden, "the token cannot use this model", types.ErrorCodeAccessDenied)
-	_, total, err = model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
-	require.NoError(t, err)
-	assert.Equal(t, int64(4), total, "an aborted request must not be recorded while error logs are disabled")
+	assert.Equal(t, before, errorLogCount(), "an aborted request must not be recorded while error logs are disabled")
 }

@@ -190,3 +190,18 @@ func TestRelayErrorHandlerAssignsUpstreamErrorCodes(t *testing.T) {
 		})
 	}
 }
+
+func TestRelayErrorHandlerPreservesUpstreamErrorCodeOnOverride(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}`)),
+	}
+
+	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+
+	require.NotNil(t, newAPIError)
+	// The normalized code drives the call-status display...
+	assert.Equal(t, types.ErrorCodeUpstreamUnauthorized, newAPIError.GetErrorCode())
+	// ...while the provider's own code stays reachable for diagnosis instead of being lost.
+	assert.Equal(t, types.ErrorCode("invalid_api_key"), newAPIError.GetUpstreamErrorCode())
+}

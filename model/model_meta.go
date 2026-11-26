@@ -74,34 +74,31 @@ func (mi *Model) MatchesName(name string) bool {
 	}
 }
 
-// IsModelListed reports whether modelName is present in the platform model
-// catalog with an enabled status (status = 1). Soft-deleted rows are excluded
-// by the Model soft-delete scope. A row matches through its NameRule (exact,
-// prefix, suffix, or contains), so a model covered by a listed rule counts as
-// listed. Channel selection calls it at failure time to tell "model not listed"
-// from "no available channel" for the recorded error code; it runs only on the
-// error path.
-func IsModelListed(modelName string) bool {
+// IsModelListed reports whether modelName resolves to an enabled entry in the
+// platform model catalog, using the same precedence as the public catalog
+// (resolveModelMetadata: exact, then prefix, suffix, contains). Soft-deleted
+// rows are excluded by the Model soft-delete scope. Because the winning rule
+// decides, a retired exact entry shadows a broader enabled rule, matching what
+// the catalog shows. Channel selection calls it at failure time to tell "model
+// not listed" from "no available channel" for the recorded error code; it runs
+// only on the error path. A lookup failure is returned instead of being folded
+// into "not listed", so a database fault is not reported as a user
+// configuration problem.
+func IsModelListed(modelName string) (bool, error) {
 	if modelName == "" || DB == nil {
-		return false
+		return false, nil
 	}
 	var records []Model
-	// Fetch every enabled row that could match: the exact name, or any row with a
-	// non-exact rule evaluated by MatchesName afterwards. MatchesName only needs
-	// model_name and name_rule, so fetch just those columns.
+	// The exact entry must win even when disabled, so keep disabled rows and
+	// resolve precedence in memory instead of filtering by status here.
 	if err := DB.Model(&Model{}).
-		Select("model_name", "name_rule").
-		Where("status = ?", 1).
+		Select("model_name", "name_rule", "status").
 		Where("model_name = ? OR name_rule <> ?", modelName, NameRuleExact).
 		Find(&records).Error; err != nil {
-		return false
+		return false, err
 	}
-	for i := range records {
-		if records[i].MatchesName(modelName) {
-			return true
-		}
-	}
-	return false
+	policy := resolveModelMetadata(records, []string{modelName})[modelName]
+	return policy != nil && policy.Status == 1, nil
 }
 
 // resolveModelMetadata preserves catalog precedence: exact, prefix, suffix,

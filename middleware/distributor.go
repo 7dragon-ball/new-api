@@ -50,8 +50,9 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, invalidRequestStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		// 二开：前置校验失败分支都发生在其后 original_model 写入（成功路径）之前，
-		// 提前写入模型名，让这些失败错误日志也能带上模型；成功路径稍后会用同值覆盖，无副作用。
+		// 二开：original_model 原本只在成功选路后写入。这里提前写入，让其后的前置校验失败
+		// 错误日志也能带上模型名。注意其前的 getModelRequest 失败分支（上一处 return）拿不到
+		// 模型名。成功路径稍后会用同值覆盖，无副作用。
 		if modelRequest.Model != "" {
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelRequest.Model)
 		}

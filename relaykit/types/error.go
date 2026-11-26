@@ -68,10 +68,9 @@ const (
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
 	// 二开：中间件 abortWithOpenAiMessage 在调用方未指定错误码时按 HTTP 状态码推导的默认码
-	// （401→invalid_token、403→access_denied、429→rate_limit_exceeded、其余 4xx→invalid_request），
-	// 避免使用日志里 error_code 为空。
-	ErrorCodeInvalidToken      ErrorCode = "invalid_token"
-	ErrorCodeRateLimitExceeded ErrorCode = "rate_limit_exceeded"
+	// （401→invalid_token、403→access_denied、其余 4xx→invalid_request），避免使用日志里
+	// error_code 为空。429 与 5xx 不落库，故没有默认码。
+	ErrorCodeInvalidToken ErrorCode = "invalid_token"
 
 	// request error
 	ErrorCodeBadRequestBody ErrorCode = "bad_request_body"
@@ -83,7 +82,6 @@ const (
 	ErrorCodeBadResponseBody        ErrorCode = "bad_response_body"
 	ErrorCodeEmptyResponse          ErrorCode = "empty_response"
 	ErrorCodeAwsInvokeError         ErrorCode = "aws_invoke_error"
-	ErrorCodeModelNotFound          ErrorCode = "model_not_found"
 	// 二开：把「模型未上架」与「有模型但无可用渠道」分开记，供使用日志的调用状态提示区分。
 	ErrorCodeModelNotListed     ErrorCode = "model_not_listed"
 	ErrorCodeNoAvailableChannel ErrorCode = "no_available_channel"
@@ -129,6 +127,26 @@ func (e *NewAPIError) GetErrorCode() ErrorCode {
 		return ""
 	}
 	return e.errorCode
+}
+
+// GetUpstreamErrorCode returns the error code carried in the upstream provider's
+// response error object (e.g. invalid_api_key, insufficient_quota). SetErrorCode
+// normalizes the recorded code while leaving the relay error untouched, so the
+// provider's own reason stays reachable; the recorder adds it to the log next to
+// the normalized code. Empty when the error did not come from an upstream body.
+func (e *NewAPIError) GetUpstreamErrorCode() ErrorCode {
+	if e == nil {
+		return ""
+	}
+	openAIError, ok := e.RelayError.(OpenAIError)
+	if !ok {
+		return ""
+	}
+	code, ok := openAIError.Code.(string)
+	if !ok {
+		return ""
+	}
+	return ErrorCode(code)
 }
 
 // SetErrorCode 覆盖错误码；仅供上游错误归类的二开逻辑使用（如按状态码落专属码）。
