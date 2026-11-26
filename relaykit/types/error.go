@@ -79,7 +79,16 @@ const (
 	ErrorCodeEmptyResponse          ErrorCode = "empty_response"
 	ErrorCodeAwsInvokeError         ErrorCode = "aws_invoke_error"
 	ErrorCodeModelNotFound          ErrorCode = "model_not_found"
-	ErrorCodePromptBlocked          ErrorCode = "prompt_blocked"
+	// 二开：把「模型未上架」与「有模型但无可用渠道」分开记，供使用日志的调用状态提示区分。
+	ErrorCodeModelNotListed     ErrorCode = "model_not_listed"
+	ErrorCodeNoAvailableChannel ErrorCode = "no_available_channel"
+	ErrorCodePromptBlocked      ErrorCode = "prompt_blocked"
+	// 二开：上游按 HTTP 状态码返回的专属错误码，供使用日志的调用状态提示区分。
+	//   - channel:upstream_unauthorized：上游 401 拒绝使用方密钥
+	//   - upstream_rate_limited：上游 429 限速/风控（不带 channel: 前缀，避免被判为
+	//     渠道错误而触发 ShouldDisableChannel 误禁用渠道）
+	ErrorCodeChannelUpstreamUnauthorized ErrorCode = "channel:upstream_unauthorized"
+	ErrorCodeUpstreamRateLimited         ErrorCode = "upstream_rate_limited"
 
 	// sql error
 	ErrorCodeQueryDataError  ErrorCode = "query_data_error"
@@ -114,6 +123,14 @@ func (e *NewAPIError) GetErrorCode() ErrorCode {
 		return ""
 	}
 	return e.errorCode
+}
+
+// SetErrorCode 覆盖错误码；仅供上游错误归类的二开逻辑使用（如按状态码落专属码）。
+func (e *NewAPIError) SetErrorCode(code ErrorCode) {
+	if e == nil {
+		return
+	}
+	e.errorCode = code
 }
 
 func (e *NewAPIError) GetErrorType() ErrorType {

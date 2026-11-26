@@ -84,7 +84,24 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 	return claudeErr
 }
 
-func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
+// RelayErrorHandler 解析上游错误响应，并在其基础上按上游状态码覆盖为二开专属错误码，
+// 供使用日志的「调用状态」提示区分「用户密钥不可用」(401) 与「上游限速/风控」(429)。
+// 只覆盖 error_code，不改 StatusCode，因此既有的重试/禁用判定不受影响。
+func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) *types.NewAPIError {
+	newApiErr := relayErrorHandlerRaw(ctx, resp, showBodyWhenFail)
+	if newApiErr == nil || resp == nil {
+		return newApiErr
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		newApiErr.SetErrorCode(types.ErrorCodeChannelUpstreamUnauthorized)
+	case http.StatusTooManyRequests:
+		newApiErr.SetErrorCode(types.ErrorCodeUpstreamRateLimited)
+	}
+	return newApiErr
+}
+
+func relayErrorHandlerRaw(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
 	responseBody, err := io.ReadAll(resp.Body)

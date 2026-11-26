@@ -380,25 +380,36 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				showGroup = fmt.Sprintf("auto(%s)", selectGroup)
 			}
 			return nil, selectGroup, &ChannelSelectError{
-				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorGetChannelFailed,
+				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeGetChannelFailed, MessageID: i18n.MsgDistributorGetChannelFailed,
 				Params: map[string]any{"Group": showGroup, "Model": modelName, "Error": err.Error()},
 			}
 		}
 		if channel == nil {
 			return nil, selectGroup, &ChannelSelectError{
-				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
+				StatusCode: http.StatusServiceUnavailable, Code: modelFailureCode(modelName), MessageID: i18n.MsgDistributorNoAvailableChannel,
 				Params: map[string]any{"Group": usingGroup, "Model": modelName}, NoAvailableChannel: true,
 			}
 		}
 	}
 	if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
 		return nil, selectGroup, &ChannelSelectError{
-			StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
+			StatusCode: http.StatusServiceUnavailable, Code: modelFailureCode(modelName), MessageID: i18n.MsgDistributorNoAvailableChannel,
 			Params:     map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelName},
 			FilterKind: kind, Channel: channel, NoAvailableChannel: true,
 		}
 	}
 	return channel, selectGroup, nil
+}
+
+// modelFailureCode splits the "no channel for this model" outcome into
+// "model not listed" and "listed but no available channel", which the
+// management log tooltip reads from the recorded error code. The catalog read
+// only happens on this error path.
+func modelFailureCode(modelName string) types.ErrorCode {
+	if model.IsModelListed(modelName) {
+		return types.ErrorCodeNoAvailableChannel
+	}
+	return types.ErrorCodeModelNotListed
 }
 
 // Origin-task pins report a fixed code so task polling can tell a retired

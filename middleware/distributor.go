@@ -50,6 +50,11 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, invalidRequestStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		// 二开：前置校验失败分支都发生在其后 original_model 写入（成功路径）之前，
+		// 提前写入模型名，让这些失败错误日志也能带上模型；成功路径稍后会用同值覆盖，无副作用。
+		if modelRequest.Model != "" {
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelRequest.Model)
+		}
 		_, pinned, _ := constraints.ResolvedPin()
 		if !pinned {
 			// Select a channel for the user
