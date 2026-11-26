@@ -38,7 +38,35 @@ func abortWithOpenAiMessage(c *gin.Context, statusCode int, message string, code
 	// 二开：前置校验/鉴权失败（模型未上架、无可用渠道、无模型权限、密钥不可用等）此前
 	// 只回响应不落库，使用日志看不到失败态，故补记一条错误日志。此时尚无 relayInfo，
 	// 传 nil（RecordRelayErrorLog 的各元信息填充已对 nil 做保护）。
-	service.RecordRelayErrorLog(c, 0, types.NewErrorWithStatusCode(errors.New(message), types.ErrorCode(codeStr), statusCode), nil)
+	// 429 在本项目中只来自本地模型限流（middleware/model-rate-limit.go），高频且无诊断
+	// 价值，跳过落库以免使用日志被刷屏。
+	if statusCode == http.StatusTooManyRequests {
+		return
+	}
+	// 调用方未指定错误码时按状态码推导，避免使用日志里 error_code 为空。
+	logCode := codeStr
+	if logCode == "" {
+		logCode = string(defaultErrorCodeForStatus(statusCode))
+	}
+	service.RecordRelayErrorLog(c, 0, types.NewErrorWithStatusCode(errors.New(message), types.ErrorCode(logCode), statusCode), nil)
+}
+
+// defaultErrorCodeForStatus maps an HTTP status to the error code recorded when
+// the caller supplied none, so usage logs carry a meaningful status instead of an
+// empty error_code. Non-4xx statuses (server errors) keep an empty code.
+func defaultErrorCodeForStatus(statusCode int) types.ErrorCode {
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return types.ErrorCodeInvalidToken
+	case http.StatusForbidden:
+		return types.ErrorCodeAccessDenied
+	case http.StatusTooManyRequests:
+		return types.ErrorCodeRateLimitExceeded
+	}
+	if statusCode >= 400 && statusCode < 500 {
+		return types.ErrorCodeInvalidRequest
+	}
+	return ""
 }
 
 // invalidRequestStatus is the status of a request whose body could not be

@@ -67,6 +67,11 @@ const (
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
+	// 二开：中间件 abortWithOpenAiMessage 在调用方未指定错误码时按 HTTP 状态码推导的默认码
+	// （401→invalid_token、403→access_denied、429→rate_limit_exceeded、其余 4xx→invalid_request），
+	// 避免使用日志里 error_code 为空。
+	ErrorCodeInvalidToken      ErrorCode = "invalid_token"
+	ErrorCodeRateLimitExceeded ErrorCode = "rate_limit_exceeded"
 
 	// request error
 	ErrorCodeBadRequestBody ErrorCode = "bad_request_body"
@@ -132,6 +137,15 @@ func (e *NewAPIError) SetErrorCode(code ErrorCode) {
 		return
 	}
 	e.errorCode = code
+}
+
+// SetRecordErrorLog 覆盖「是否落库错误日志」标记；仅供二开在需要强制落库时清除
+// ErrOptionWithNoRecordErrorLog 设置的抑制标记。
+func (e *NewAPIError) SetRecordErrorLog(record bool) {
+	if e == nil {
+		return
+	}
+	e.recordErrorLog = kitutil.GetPointer(record)
 }
 
 func (e *NewAPIError) GetErrorType() ErrorType {

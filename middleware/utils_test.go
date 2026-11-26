@@ -74,11 +74,41 @@ func TestAbortWithOpenAiMessageRecordsRelayErrorLog(t *testing.T) {
 	assert.Equal(t, string(types.ErrorCodeAccessDenied), storedOther["error_code"])
 	assert.Equal(t, float64(http.StatusForbidden), storedOther["status_code"])
 
+	// A caller that supplies no error code gets one derived from the status, so the
+	// usage log never carries an empty error_code.
+	for caseIndex, tc := range []struct {
+		statusCode int
+		wantCode   types.ErrorCode
+	}{
+		{http.StatusUnauthorized, types.ErrorCodeInvalidToken},
+		{http.StatusForbidden, types.ErrorCodeAccessDenied},
+		{http.StatusBadRequest, types.ErrorCodeInvalidRequest},
+	} {
+		ctx, _ = newAbortContext()
+		abortWithOpenAiMessage(ctx, tc.statusCode, "aborted without an explicit code")
+		derivedLogs, derivedTotal, err := model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
+		require.NoError(t, err)
+		require.NotEmpty(t, derivedLogs)
+		derivedOther, err := common.StrToMap(derivedLogs[0].Other)
+		require.NoError(t, err)
+		assert.Equal(t, string(tc.wantCode), derivedOther["error_code"])
+		assert.Equal(t, float64(tc.statusCode), derivedOther["status_code"])
+		assert.Equal(t, int64(2+caseIndex), derivedTotal, "each derived-code abort adds exactly one error log")
+	}
+
+	// Local model rate limiting (429) is high-frequency noise and must not be recorded.
+	ctx, recorder = newAbortContext()
+	abortWithOpenAiMessage(ctx, http.StatusTooManyRequests, "rate limit reached")
+	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
+	_, total, err = model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), total, "a locally rate-limited abort must not be recorded")
+
 	// The recorded error log is governed by the ErrorLogEnabled switch.
 	constant.ErrorLogEnabled = false
 	ctx, _ = newAbortContext()
 	abortWithOpenAiMessage(ctx, http.StatusForbidden, "the token cannot use this model", types.ErrorCodeAccessDenied)
 	_, total, err = model.GetUserLogs(7, model.LogFilter{Type: model.LogTypeError}, 0, 10)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), total, "an aborted request must not be recorded while error logs are disabled")
+	assert.Equal(t, int64(4), total, "an aborted request must not be recorded while error logs are disabled")
 }

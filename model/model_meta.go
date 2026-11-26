@@ -87,8 +87,10 @@ func IsModelListed(modelName string) bool {
 	}
 	var records []Model
 	// Fetch every enabled row that could match: the exact name, or any row with a
-	// non-exact rule evaluated by MatchesName afterwards.
+	// non-exact rule evaluated by MatchesName afterwards. MatchesName only needs
+	// model_name and name_rule, so fetch just those columns.
 	if err := DB.Model(&Model{}).
+		Select("model_name", "name_rule").
 		Where("status = ?", 1).
 		Where("model_name = ? OR name_rule <> ?", modelName, NameRuleExact).
 		Find(&records).Error; err != nil {
