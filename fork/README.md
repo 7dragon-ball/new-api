@@ -526,6 +526,13 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   读者语言生成的，落库前换成固定英文句子（`Insufficient user quota` /
   `Not enough quota to pre-consume for this request`）；只换落库副本的文案，原错误对象不变、
   响应仍是读者语言，与上面「日志 content 固定英文」同一口径。
+- **定价失败落库文案**（`relay/helper/price.go` / `relaykit/types/error.go`）：`model_price_error` 的
+  文案由 `i18n.T(c, ...)` 按读者语言生成（`relay.model_price_not_configured`（含 admin 变体）/
+  `relay.task_usage_price_unsupported` / `relay.shared_task_price_needs_override`）。生成处用新增的
+  `types.ErrOptionWithLogMessage(i18n.Translate(i18n.LangEn, key, params))` 把同一 key 的英文句子
+  作为「落库专用文案」带上（`NewAPIError.logMessage` / `GetLogMessage`；`types.NewError` 包装时经
+  `errors.As` 保留），`RecordRelayErrorLog` 落库前优先用它写 `content`——额度类走
+  `ForceRecordRelayErrorLog` 的按码替换，两条路径都不改响应文案，理由同上。
 - **错误码归一**（`relaykit/types/error.go`）：删 `ErrorCodeModelNotFound`，新增
   `model_not_listed` / `no_available_channel` / `get_channel_failed`（渠道选择路径一分为三）与
   `invalid_token` / `upstream_unauthorized` / `upstream_rate_limited`（状态码专属码）；新增
@@ -570,7 +577,7 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 
 **`[FORK]` 标记**：本分支最初直接改上游方法体、未加标记，与其余十一组定制的约定不符；
 已按「每处独立改动点一条」补齐——在 8 个上游文件里新增 17 处 `// [FORK]`，全仓计数由 191
-升到 208。只标改动块、不给整个函数加标记，与既有 191 处同口径；像「响应文案随读者语言、
+升到 213。只标改动块、不给整个函数加标记，与既有 191 处同口径；像「响应文案随读者语言、
 落库固定英文」这类在每个调用点都成立的约定，只在定义处（`middleware/utils.go`、
 `service/channel_select.go`）标一次，不逐调用点重复；测试文件不加标记（改动靠跑用例保证）。
 

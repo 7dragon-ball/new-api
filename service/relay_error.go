@@ -111,7 +111,16 @@ func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, 
 		startTime = time.Now()
 	}
 	useTimeSeconds := int(time.Since(startTime).Seconds())
-	model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(common.UpstreamAddresses(c)...), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+	// [FORK] 使用日志 content 必须与读者语言无关：错误对象可携带落库专用固定英文文案
+	// （如定价失败的文案是按读者语言渲染的），有则用它作为 content；只换落库副本，
+	// 原错误对象不变，响应仍是读者语言。
+	contentErr := err
+	if fixedMessage := err.GetLogMessage(); fixedMessage != "" {
+		snapshot := *err
+		snapshot.Err = errors.New(fixedMessage)
+		contentErr = &snapshot
+	}
+	model.RecordErrorLog(c, userId, channelId, modelName, tokenName, contentErr.MaskSensitiveErrorWithStatusCode(common.UpstreamAddresses(c)...), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 }
 
 // [FORK] 预扣费/额度不足这类错误带抑制标记会被跳过落库，强制落库让使用日志能看见该类失败态。
@@ -123,7 +132,8 @@ func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, 
 // 落库 content 必须是固定英文：额度类失败的文案由 billing 层用 i18n.T(c, ...) 按读者语言生成，
 // 直接落库会让同一种失败在不同语言请求下写出不同 content，使用日志无法检索与聚合（中间件路径
 // 已用 abortWithI18nMessage 消除同类问题）。这里只换掉交给落库的副本的文案，原错误对象不变，
-// 响应仍是读者语言。
+// 响应仍是读者语言。定价类失败（ErrorCodeModelPriceError）的文案在生成处就自带了固定英文
+// （types.ErrOptionWithLogMessage），由 RecordRelayErrorLog 统一替换，不在本函数的 switch 内。
 func ForceRecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	if err == nil {
 		return

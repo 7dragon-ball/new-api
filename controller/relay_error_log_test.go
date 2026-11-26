@@ -9,9 +9,13 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -180,4 +184,53 @@ func TestForceRecordRelayErrorLogRecordsLocalizedQuotaErrorAsEnglish(t *testing.
 	require.NoError(t, database.First(&stored).Error)
 	assert.Equal(t, "status_code=403, Insufficient user quota", stored.Content)
 	assert.Equal(t, localizedText, localized.Error(), "the error the response is built from keeps the reader's text")
+}
+
+// A model-price failure is localized where the text is built, not at the call
+// site, so it cannot be normalized by error code like a quota failure. The fixed
+// English sentence travels on the error object itself (types.ErrOptionWithLogMessage)
+// and survives the types.NewError wrapper PrepareRequestBilling applies.
+func TestForceRecordRelayErrorLogRecordsLocalizedModelPriceErrorAsEnglish(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	database := newErrorLogTestDB(t, 10, "price-owner")
+
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(saved)) })
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"localized-price-test":"tiered_expr"}`,
+		"billing_setting.billing_expr": `{"localized-price-test":"tier(\"base\", u(\"seconds\") * 0.4)"}`,
+	}))
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("Accept-Language", "zh-CN")
+	ctx.Set("id", 10)
+	ctx.Set("username", "price-owner")
+	ctx.Set("token_name", "test-token")
+	ctx.Set("token_id", 14)
+	ctx.Set("original_model", "localized-price-test")
+	ctx.Set("group", "default")
+	common.SetContextKey(ctx, constant.ContextKeyRequestStartTime, time.Now().Add(-time.Second))
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "localized-price-test",
+		UserGroup:       "default",
+		UsingGroup:      "default",
+	}
+	_, err := helper.ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.Error(t, err, "a task usage expression must be rejected as a pricing failure")
+	// PrepareRequestBilling wraps the pricing failure exactly like this.
+	apiErr := types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
+
+	service.ForceRecordRelayErrorLog(ctx, 0, apiErr, nil)
+
+	var stored model.Log
+	require.NoError(t, database.First(&stored).Error)
+	assert.Equal(t, "status_code=400, Model localized-price-test uses a task usage expression; configure ordinary relay pricing and separate plugin billing expressions", stored.Content)
+	assert.Equal(t, "模型 localized-price-test 使用了任务用量表达式；请为普通转发配置常规定价，并为插件单独配置计费表达式", apiErr.Error(), "the error the response is built from keeps the reader's text")
 }

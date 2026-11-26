@@ -116,6 +116,9 @@ type NewAPIError struct {
 	errorCode      ErrorCode
 	StatusCode     int
 	Metadata       json.RawMessage
+	// [FORK] 使用日志 content 必须与读者语言无关：二开为错误对象增加「落库专用固定英文文案」。
+	// 文案由生成读者语言文案的同一处给出（见 relay/helper/price.go），落库路径优先使用它。
+	logMessage string
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
@@ -169,6 +172,17 @@ func (e *NewAPIError) SetRecordErrorLog(record bool) {
 		return
 	}
 	e.recordErrorLog = kitutil.GetPointer(record)
+}
+
+// [FORK] 使用日志 content 必须与读者语言无关。
+// GetLogMessage returns the fixed, reader-language-independent message the usage
+// log must record for this error. It is empty when the error carries none, in
+// which case the recorder falls back to Error(), whose text may be localized.
+func (e *NewAPIError) GetLogMessage() string {
+	if e == nil {
+		return ""
+	}
+	return e.logMessage
 }
 
 func (e *NewAPIError) GetErrorType() ErrorType {
@@ -450,6 +464,14 @@ func ErrOptionWithSkipRetry() NewAPIErrorOptions {
 func ErrOptionWithNoRecordErrorLog() NewAPIErrorOptions {
 	return func(e *NewAPIError) {
 		e.recordErrorLog = kitutil.GetPointer(false)
+	}
+}
+
+// [FORK] ErrOptionWithLogMessage 设置「落库专用固定英文文案」；只影响使用日志的 content，
+// 不影响返回给客户端的 Error()。供文案按读者语言生成、但落库必须是固定英文的错误使用。
+func ErrOptionWithLogMessage(message string) NewAPIErrorOptions {
+	return func(e *NewAPIError) {
+		e.logMessage = message
 	}
 }
 
