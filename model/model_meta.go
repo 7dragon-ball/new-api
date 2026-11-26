@@ -85,6 +85,13 @@ func (mi *Model) MatchesName(name string) bool {
 // only on the error path. A lookup failure is returned instead of being folded
 // into "not listed", so a database fault is not reported as a user
 // configuration problem.
+//
+// The whole candidate set is deliberately read without a LIMIT: precedence is
+// resolved in Go, and the first row matching a pattern wins, so truncating the
+// result would change the listing verdict. The read is bounded by the
+// admin-curated catalog size and happens only after authentication, on a
+// failure that already records a usage-log row, so it is not the dominant cost
+// of that request.
 func IsModelListed(modelName string) (bool, error) {
 	if modelName == "" || DB == nil {
 		return false, nil

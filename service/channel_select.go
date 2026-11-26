@@ -393,8 +393,10 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		}
 	}
 	if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
+		// [FORK] 渠道已存在、只是被过滤条件拒绝，失败原因不是目录状态，固定用 no_available_channel，
+		// 不能复用 modelFailureCode（模型无目录记录时会被误报成 model_not_listed）。
 		return nil, selectGroup, &ChannelSelectError{
-			StatusCode: http.StatusServiceUnavailable, Code: modelFailureCode(modelName), MessageID: i18n.MsgDistributorNoAvailableChannel,
+			StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeNoAvailableChannel, MessageID: i18n.MsgDistributorNoAvailableChannel,
 			Params:     map[string]any{"Group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup), "Model": modelName},
 			FilterKind: kind, Channel: channel, NoAvailableChannel: true,
 		}
@@ -406,7 +408,12 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 // modelFailureCode splits the "no channel for this model" outcome into
 // "model not listed" and "listed but no available channel", which the
 // management log tooltip reads from the recorded error code. The catalog read
-// only happens on this error path.
+// only happens on this error path, after TokenAuth, on a failure that already
+// records a usage-log row, so it is not the dominant cost of that request.
+// IsModelListed deliberately issues no LIMIT: the rule precedence is resolved in
+// Go over the whole candidate set, so truncating it would change the verdict.
+// Bounding the read further would need an index on models.name_rule or a cached
+// catalog, both tracked as separate changes.
 func modelFailureCode(modelName string) types.ErrorCode {
 	listed, err := model.IsModelListed(modelName)
 	if err != nil {
