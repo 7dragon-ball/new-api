@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -116,12 +117,30 @@ func RecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, 
 // [FORK] 预扣费/额度不足这类错误带抑制标记会被跳过落库，强制落库让使用日志能看见该类失败态。
 // ForceRecordRelayErrorLog 落库即使错误对象显式带了 types.ErrOptionWithNoRecordErrorLog。
 // 二开：预扣费/额度不足这类错误会带该抑制标记，被 RecordRelayErrorLog 主动跳过，导致使用
-// 日志看不到这类失败态；这里清除抑制标记后按原错误对象落库，保留其
+// 日志看不到这类失败态；这里清除抑制标记后落库，保留其
 // error_type/RelayError/error_code/status_code 等全部信息（仍受 constant.ErrorLogEnabled 开关控制）。
+//
+// 落库 content 必须是固定英文：额度类失败的文案由 billing 层用 i18n.T(c, ...) 按读者语言生成，
+// 直接落库会让同一种失败在不同语言请求下写出不同 content，使用日志无法检索与聚合（中间件路径
+// 已用 abortWithI18nMessage 消除同类问题）。这里只换掉交给落库的副本的文案，原错误对象不变，
+// 响应仍是读者语言。
 func ForceRecordRelayErrorLog(c *gin.Context, channelId int, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	if err == nil {
 		return
 	}
 	err.SetRecordErrorLog(true)
-	RecordRelayErrorLog(c, channelId, err, relayInfo)
+	fixedMessage := ""
+	switch err.GetErrorCode() {
+	case types.ErrorCodeInsufficientUserQuota:
+		fixedMessage = "Insufficient user quota"
+	case types.ErrorCodePreConsumeTokenQuotaFailed:
+		fixedMessage = "Not enough quota to pre-consume for this request"
+	}
+	logErr := err
+	if fixedMessage != "" {
+		logOnly := *err
+		logOnly.Err = errors.New(fixedMessage)
+		logErr = &logOnly
+	}
+	RecordRelayErrorLog(c, channelId, logErr, relayInfo)
 }

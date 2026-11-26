@@ -520,8 +520,12 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   429 那 4 处不落库，有意不迁移。
 - **非中间件的失败补记**（`controller/relay.go`）：本地请求校验失败补一条 `RecordRelayErrorLog`；
   `PrepareRequestBilling` 失败走新增的 `ForceRecordRelayErrorLog`（与 `RecordRelayErrorLog` 同在
-  `service/relay_error.go`），它清除 `ErrOptionWithNoRecordErrorLog` 抑制标记后按原错误对象落库，保留
+  `service/relay_error.go`），它清除 `ErrOptionWithNoRecordErrorLog` 抑制标记后落库，保留
   `error_type` / `error_code` / `status_code` 等全部信息（仍受 `constant.ErrorLogEnabled` 开关控制）。
+  额度类失败（`insufficient_user_quota` / `pre_consume_token_quota_failed`）的文案是 billing 层按
+  读者语言生成的，落库前换成固定英文句子（`Insufficient user quota` /
+  `Not enough quota to pre-consume for this request`）；只换落库副本的文案，原错误对象不变、
+  响应仍是读者语言，与上面「日志 content 固定英文」同一口径。
 - **错误码归一**（`relaykit/types/error.go`）：删 `ErrorCodeModelNotFound`，新增
   `model_not_listed` / `no_available_channel` / `get_channel_failed`（渠道选择路径一分为三）与
   `invalid_token` / `upstream_unauthorized` / `upstream_rate_limited`（状态码专属码）；新增

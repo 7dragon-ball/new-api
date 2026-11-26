@@ -146,3 +146,38 @@ func TestForceRecordRelayErrorLogBypassesSuppression(t *testing.T) {
 	assert.Equal(t, string(types.ErrorCodeInsufficientUserQuota), storedOther["error_code"])
 	assert.Equal(t, float64(http.StatusForbidden), storedOther["status_code"])
 }
+
+// A quota failure whose text was localized for the reader must still be recorded in
+// the fixed English sentence, while the error object the response is built from keeps
+// the reader's text.
+func TestForceRecordRelayErrorLogRecordsLocalizedQuotaErrorAsEnglish(t *testing.T) {
+	database := newErrorLogTestDB(t, 9, "localized-owner")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Request.Header.Set("Accept-Language", "zh-CN")
+	ctx.Set("id", 9)
+	ctx.Set("username", "localized-owner")
+	ctx.Set("token_name", "test-token")
+	ctx.Set("token_id", 13)
+	ctx.Set("original_model", "gpt-test")
+	ctx.Set("group", "default")
+	common.SetContextKey(ctx, constant.ContextKeyRequestStartTime, time.Now().Add(-time.Second))
+
+	// What billing_session.go hands over for a zh-CN request: reader-language text
+	// plus the suppression option that makes RecordRelayErrorLog skip it.
+	const localizedText = "预扣费额度失败，用户剩余额度：1，需要预扣费额度：2"
+	localized := types.NewErrorWithStatusCode(
+		errors.New(localizedText),
+		types.ErrorCodeInsufficientUserQuota,
+		http.StatusForbidden,
+		types.ErrOptionWithNoRecordErrorLog(),
+	)
+
+	service.ForceRecordRelayErrorLog(ctx, 0, localized, nil)
+
+	var stored model.Log
+	require.NoError(t, database.First(&stored).Error)
+	assert.Equal(t, "status_code=403, Insufficient user quota", stored.Content)
+	assert.Equal(t, localizedText, localized.Error(), "the error the response is built from keeps the reader's text")
+}
