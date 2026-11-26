@@ -493,6 +493,118 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 `TEST_POSTGRES_DSN`）；路由注册在 `router/api-router.go` 与
 `middleware/access_token_routes.go`（两处都是单行 `[FORK]`）。
 
+### 十二、失败调用的调用状态落库（`fork/feat/log-call-status-on-main`）
+
+**背景**：上游 usage log 只覆盖走到计费的成功调用。以下失败此前在控制台完全看不到：中间件前置
+校验/鉴权拒绝（模型未上架、无可用渠道、密钥无权限、密钥不可用、渠道被禁）、`controller/relay.go`
+的本地请求校验失败、以及预扣费/额度不足——后者显式带 `ErrOptionWithNoRecordErrorLog`，被
+`RecordRelayErrorLog` 主动跳过。另有一类虽落库但 `error_code` 无诊断价值：无可用渠道统一记
+`model_not_found`，上游 401/429 只记 `bad_response_status_code`，无法区分「模型未上架」与
+「有模型但没渠道」，也无法区分「用户密钥不可用」与「上游限速」。
+
+**做法**：
+
+- **中间件落库**（`middleware/utils.go`）：`abortWithOpenAiMessage` 末尾补记一条错误日志。只覆盖
+  「已认证用户、可归类的客户端失败」——`userId == 0`（未认证）与 429（本地模型限流，
+  `middleware/model-rate-limit.go`）不写，避免日志放大；调用方未给码时按状态码推导
+  （401→`invalid_token`、403→`access_denied`、其余 4xx→`invalid_request`），推导不出用户可见
+  状态的 5xx 也不写（带显式码的 5xx，如模型未上架，仍写）。先 `RecordRequestPolicyTermination`
+  再 `RecordRelayErrorLog`，否则落库内容缺这次失败对应的策略决策。
+- **日志 content 固定英文**（`middleware/utils.go`）：错误日志的 `content` 必须与读者语言无关，
+  否则同一次失败在不同语言的请求里落下不同文本，检索与聚合都对不上。为此把
+  `abortWithOpenAiMessage` 拆成 `abortWithLogMessage(c, status, message, logMessage, code...)`
+  分发层，并新增 `abortWithI18nMessage(c, status, key, params, code...)`：响应用
+  `i18n.T(c, key, params)` 保持读者语言，落库用 `i18n.Translate(i18n.LangEn, key, params)` 取同一
+  key 的英文句子。`middleware/distributor.go` / `auth.go` / `task_plugin.go` 共 17 处本地化调用点
+  迁到 `abortWithI18nMessage`；本来就是英文句子的调用点（`abortWithOpenAiMessage`）行为不变；
+  429 那 4 处不落库，有意不迁移。
+- **非中间件的失败补记**（`controller/relay.go`）：本地请求校验失败补一条 `RecordRelayErrorLog`；
+  `PrepareRequestBilling` 失败走新增的 `ForceRecordRelayErrorLog`（与 `RecordRelayErrorLog` 同在
+  `service/relay_error.go`），它清除 `ErrOptionWithNoRecordErrorLog` 抑制标记后按原错误对象落库，保留
+  `error_type` / `error_code` / `status_code` 等全部信息（仍受 `constant.ErrorLogEnabled` 开关控制）。
+- **错误码归一**（`relaykit/types/error.go`）：删 `ErrorCodeModelNotFound`，新增
+  `model_not_listed` / `no_available_channel` / `get_channel_failed`（渠道选择路径一分为三）与
+  `invalid_token` / `upstream_unauthorized` / `upstream_rate_limited`（状态码专属码）；新增
+  `GetUpstreamErrorCode` / `SetErrorCode` / `SetRecordErrorLog` 三个方法。
+- **渠道选择定码**（`service/channel_select.go`）：`modelFailureCode` 在错误路径上查一次模型目录
+  （`model.IsModelListed`）：已上架→`no_available_channel`，未上架→`model_not_listed`；取渠道
+  本身出错→`get_channel_failed`。目录查询失败**不**臆断「未上架」（那是把数据库故障当成用户配置
+  问题），改记 `common.SysError` 并退回 `no_available_channel`。
+- **上游 401/429 定码**（`service/error.go`）：`RelayErrorHandler` 拆出 `relayErrorHandlerRaw`，
+  在结果上按上游状态码覆盖 `error_code`（401→`upstream_unauthorized`、429→
+  `upstream_rate_limited`），**不改 `StatusCode`**；新码不带 `channel:` 前缀，`IsChannelError`
+  判假，管理员配置的按状态码重试/禁用策略照常生效。
+- **保留上游具体原因**（`service/relay_error.go`）：覆盖码会丢掉 provider 的具体原因
+  （`invalid_api_key` / `insufficient_quota`），故在 `other.admin_info.upstream_error_code` 另存
+  一份，仅当上游码非空且不同于归一码时写。
+- **模型目录优先级**（`model/model_meta.go`）：新增 `IsModelListed`，复用 `resolveModelMetadata`
+  的目录优先级（exact → prefix → suffix → contains），只认启用行；`resolveModelMetadata` 补
+  `Order("id")` 作 tie-break，同规则多行命中时结果稳定。
+- **错误日志带模型名**（`middleware/distributor.go`）：`original_model` 原本只在成功选路后写入，
+  提前到选路前写，让其后的前置校验失败日志也带得上模型名（成功路径稍后用同值覆盖，无副作用）。
+
+**对外契约变更声明（重要）**：「无可用渠道」失败此前是 HTTP **503** + `code: "model_not_found"`，
+现在**状态码仍是 503**，`code` 拆成三个：`model_not_listed`（模型未上架）、`no_available_channel`
+（已上架但无可用渠道）、`get_channel_failed`（取渠道报错）——三条失败路径在
+`service/channel_select.go` 都返回 `http.StatusServiceUnavailable`。**依赖旧 `model_not_found`
+的调用方需同步**。401/429 的**响应码不是**变更——`ToOpenAIError()` 对 `ErrorTypeOpenAIError`
+分支返回原始上游 RelayError，客户端仍收到上游自己的码；归一码只写进 usage log 的 `error_code`。
+
+**残留 `model_not_found` 字面量（确认无需清理）**：`types.ErrorCodeModelNotFound` 常量已删、全仓
+无引用（`grep -rn "ErrorCodeModelNotFound" --include="*.go" .` 零命中）；字符串字面量仍存两处，
+都在本分支未改动的文件、属不同路径：
+
+- `controller/model.go` 的 `RetrieveModel`（`GET /v1/models/:model`，OpenAI 兼容接口）返回
+  `"model_not_found"`——是 OpenAI 契约字面量，与错误码归一无关，保留；
+- `pkg/perf_metrics/outcome.go` 的 `classifyFailure` 把它当**上游码**归类，与新码一样落
+  `OutcomeFailure`，无回归。
+
+**控制台展示（已知限制）**：错误日志的 `content` 是已渲染的英文句子（`model` / `group` 参数已代入）。
+前端用量日志对错误日志走 `renderLogContent(other, t) ?? log.content` 回退，而错误日志路径
+（`model.RecordErrorLog`）不写 `content_parts`、前端也不按 `error_code` 本地化，因此控制台展示的
+是英文原文。本 fork 不改前端，接受这一口径：日志是运维产物，固定英文句子利于跨语言检索。
+
+**`[FORK]` 标记**：本分支最初直接改上游方法体、未加标记，与其余十一组定制的约定不符；
+已按「每处独立改动点一条」补齐——在 8 个上游文件里新增 17 处 `// [FORK]`，全仓计数由 191
+升到 208。只标改动块、不给整个函数加标记，与既有 191 处同口径；像「响应文案随读者语言、
+落库固定英文」这类在每个调用点都成立的约定，只在定义处（`middleware/utils.go`、
+`service/channel_select.go`）标一次，不逐调用点重复；测试文件不加标记（改动靠跑用例保证）。
+
+**文件**：`middleware/utils.go`、`middleware/distributor.go`、`middleware/auth.go`、
+`middleware/task_plugin.go`、`controller/relay.go`、`model/model_meta.go`、
+`relaykit/types/error.go`、`service/channel_select.go`、`service/error.go`、
+`service/relay_error.go`；测试
+`middleware/utils_fork_test.go`（新增）、`middleware/distributor_test.go`、
+`controller/relay_error_log_test.go`、`service/error_test.go`、`model/model_meta_fork_test.go`（新增）、
+`router/relay_router_test.go`。
+
+**三库实跑记录**（2026-11-26）：
+
+- 环境：Go `go1.26.11 darwin/arm64`；SQLite（测试用 `:memory:` 内存库）；MySQL `8.0.46`
+  （`mysql:8.0`，`127.0.0.1:13306`）；PostgreSQL `16.15`（`postgres:16-alpine`，
+  `127.0.0.1:15432`）。
+- 命令：
+
+  ```bash
+  TEST_MYSQL_DSN='root:testpass@tcp(127.0.0.1:13306)/newapi_cr_test?charset=utf8mb4&parseTime=True&loc=Local' \
+  TEST_POSTGRES_DSN='postgres://tm:tm_dev_password@127.0.0.1:15432/newapi_cr_test?sslmode=disable' \
+  go test ./middleware/ ./service/ ./model/ ./controller/ ./router/ -count=1
+  ```
+
+- 结果：`middleware`、`service`、`router` 全 PASS；`model`、`controller` 的 **MySQL 子测试**
+  FAIL，SQLite 与 PostgreSQL 子测试全 PASS。定稿修复（`abortWithLogMessage` 分发层、
+  `ForceRecordRelayErrorLog` 归位 `service/relay_error.go`、`IsModelListed` 的 `Order("id")`）
+  后在同一工作树复跑，逐包结果与 MySQL 失败点与上表完全一致；`go build ./...` 与
+  `relaykit` / `tokenkit` 的 `GOWORK=off go build ./...` 均通过。
+- MySQL 失败是**既有限制、与本分支无关**：共 12 处（`model` 1 处 + `controller` 11 处），报错一致为
+  `Error 1170 (42000): BLOB/TEXT column 'phone' used in key specification without a key length`，
+  源自 `model/user.go` 的 `Phone *string ... uniqueIndex:uk_users_phone`——MySQL 把 `*string` 渲染成
+  `TEXT`，唯一索引需要 key length（PG / SQLite 无此约束）。该 tag 在本分支未改动
+  （`git diff fork/main...HEAD -- model/user.go` 为空），并在 `fork/main` 的干净 worktree 上以同一 DSN
+  复现同一报错（`go test ./model/ -run TestAuthCacheIntegrityDatabaseMatrix`：`/mysql` FAIL，
+  `/sqlite`、`/postgres` PASS）。与上面「数据库」一节的「MySQL 不在运行范围」一致。
+- `relaykit` / `tokenkit` 独立构建：各自 `GOWORK=off go build ./...` 通过。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -526,12 +638,14 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 102 个文件（54 个上游文件被改、48 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +9686/−219，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+共 114 个文件（64 个上游文件被改、50 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +10302/−229，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+（定稿修复把分支新增的 `service/relay_error_fallback.go` 并回 `service/relay_error.go` 并删除，
+故新增数比本分支初版少 1。）
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。54 个被改文件里有 9 个是 `web/`、4 个不是功能
+> 那不是定制，不计入上面的文件数。64 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
@@ -566,12 +680,20 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/user_cache.go` | `baseUserWithDepartment` 成为「用户 → 带部门名的 `UserBase`」的唯一实现，三个缓存路径共用 | 中 |
 | `model/user_auth_cache.go` | 内联 Lua 多写两列（ARGV 下标必须与 `UserBase` 字段顺序对齐）；`userCacheSchemaVersion` 升 3 | **最高**，漏写一列就永远读回空串 |
 | `model/redemption.go` | 兑换时抄一份兑换人用户名/显示名 | 低 |
-| `model/model_meta.go` | `SearchModels` / `SearchModelsWithChannels` 加 `tag` 参数（只匹配 `tags` 列、子串）；合成行带 `tag` 时不追加、`status=disabled` 时追加（2 处 `[FORK]`） | 中，模型列表主查询 |
+| `model/model_meta.go` | `SearchModels` / `SearchModelsWithChannels` 加 `tag` 参数（只匹配 `tags` 列、子串）；合成行带 `tag` 时不追加、`status=disabled` 时追加（2 处 `[FORK]`）；新增 `IsModelListed`、`resolveModelMetadata` 补 `Order("id")`（见「十二」） | 中，模型列表主查询 |
 | `controller/model_meta.go` | `listModelsMeta` 多一个 `tag` 透传，`GetAllModelsMeta` 恒传空串（2 处 `[FORK]`） | 低 |
 | `controller/model_management_test.go` | `tag_filtering` 用例；`status=disabled` 保留合成行的断言 | 低 |
 | `constant/context_key.go` | 新增 `ContextKeyUserDisplayName` / `ContextKeyUserDepartmentName` | 低 |
-| `middleware/auth.go` | 鉴权通过后把身份写进上下文 | 低 |
-| `middleware/distributor.go` | 分发后把渠道名/供应商写进上下文 | 低 |
+| `middleware/auth.go` | 鉴权通过后把身份写进上下文；错误响应迁到 `abortWithI18nMessage`（响应本地化、落库英文，见「十二」） | 低 |
+| `middleware/distributor.go` | 分发后把渠道名/供应商写进上下文；`original_model` 提前写入、selectErr 走 `abortWithLogMessage` 落库、`noAvailableChannelMessage` 返回响应文案与日志英文两份（见「十二」） | 低 |
+| `middleware/utils.go` | `abortWithOpenAiMessage` 拆成 `abortWithLogMessage` 分发层 + `abortWithI18nMessage`；abort 时补记错误日志（见「十二」） | 中，所有 abort 路径 |
+| `middleware/task_plugin.go` | 1 处本地化 abort 迁到 `abortWithI18nMessage` | 低，单行 |
+| `relaykit/types/error.go` | 删 `ErrorCodeModelNotFound`；新增 `model_not_listed` / `no_available_channel` / `get_channel_failed` / `invalid_token` / `upstream_unauthorized` / `upstream_rate_limited` 与 `SetErrorCode` / `GetUpstreamErrorCode` / `SetRecordErrorLog`（见「十二」） | 中，错误码是跨模块契约 |
+| `service/channel_select.go` | `modelFailureCode` 在失败路径按 `model.IsModelListed` 区分未上架 / 无可用渠道 / 取渠道失败 | 中，选路失败路径 |
+| `service/error.go` | `RelayErrorHandler` 拆出 `relayErrorHandlerRaw`，按上游 401/429 覆盖 `error_code`（不改 `StatusCode`） | 中，上游错误解析主路径 |
+| `service/relay_error.go` | 落库 `error_code` 并另存 `upstream_error_code`；新增 `ForceRecordRelayErrorLog`（见「十二」） | 中 |
+| `controller/relay.go` | 本地请求校验失败补 `RecordRelayErrorLog`；`PrepareRequestBilling` 失败走 `ForceRecordRelayErrorLog` | 中，relay 主路径 |
+| `middleware/distributor_test.go`、`service/error_test.go`、`router/relay_router_test.go`、`controller/relay_error_log_test.go` | 对应测试：双语 abort、401/429 覆盖码、路由错误码、强制落库绕过抑制 | 低 |
 | `service/task_billing.go` | `LogTaskConsumption` 加一行调用写指纹（任务型渠道的提交日志） | 低 |
 | `relay/responses_websocket.go` | lockedContext 白名单提成包级变量 `lockedContextKeys`（行为不变，为让白名单可被测试断言） | 低 |
 | `controller/token.go`、`model/token.go` | 令牌「使用方」`owner`：请求字段（指针区分未传）、128 字节校验、写库 | 低 |
@@ -619,6 +741,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `model/model_tag_fork.go` | `ListModelTags`：拉 `tags` 列拆开去重（小写比较、保留原样大小写）、码点序、默认上限 50 |
 | `controller/model_tag_fork.go` | `GET /api/models/tags` handler |
 | `controller/model_tag_fork_test.go` | 去重排序、`keyword` 按单个标签收窄（不是整格）、`limit` 与缺省 |
+| `middleware/utils_fork_test.go` | abort 落库回归：`abortWithOpenAiMessage` / `abortWithI18nMessage` 的响应与落库文本、`userId==0` 与 429 不落库、带显式码的 5xx 仍落库（见「十二」） |
+| `model/model_meta_fork_test.go` | `IsModelListed` 目录优先级（exact 优先、disabled、同名多行 tie-break 稳定）与无库时不报错（见「十二」） |
 
 （另有 12 个上游文件被改签名、补迁移或补测试，已并入上表。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
@@ -634,7 +758,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 190 处、60 个文件：
+当前共 208 处、66 个文件（含本分支新增的 17 处，见「十二」）：
 
 | 文件 | 处数 |
 |---|---|
@@ -648,30 +772,37 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `controller/department_fork.go` | 6 |
 | `model/department_fork.go` | 6 |
 | `model/user_last_called_fork_test.go` | 6 |
-| `model/channel.go` | 5 |
 | `model/channel_cache.go` | 5 |
 | `model/channel_priority_cache_fork.go` | 5 |
+| `model/channel.go` | 5 |
 | `model/usedata.go` | 5 |
 | `router/api-router.go` | 5 |
 | `controller/channel_ability_fork.go` | 4 |
 | `model/channel_priority_fork.go` | 4 |
 | `model/log.go` | 4 |
+| `model/model_meta.go` | 4 |
+| `relaykit/types/error.go` | 4 |
 | `constant/context_key.go` | 3 |
+| `middleware/distributor.go` | 3 |
 | `model/ability.go` | 3 |
 | `router/channel-router.go` | 3 |
 | `controller/audit.go` | 2 |
 | `controller/channel_ability_fork_test.go` | 2 |
-| `controller/channel_priority_fork.go` | 2 |
 | `controller/channel_priority_fork_test.go` | 2 |
+| `controller/channel_priority_fork.go` | 2 |
 | `controller/model_meta.go` | 2 |
+| `controller/model_tag_fork_test.go` | 2 |
+| `controller/relay.go` | 2 |
 | `middleware/access_token_routes.go` | 2 |
 | `middleware/auth.go` | 2 |
+| `middleware/utils.go` | 2 |
 | `model/channel_priority_fork_test.go` | 2 |
 | `model/department_fork_test.go` | 2 |
-| `model/model_meta.go` | 2 |
 | `model/user_auth_cache.go` | 2 |
+| `service/channel_select.go` | 2 |
+| `service/relay_error.go` | 2 |
 | `service/security_verification_fork.go` | 2 |
-| `common/random_password_fork.go`、`controller/channel.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/model_tag_fork_test.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`middleware/distributor.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `common/random_password_fork.go`、`controller/channel.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .

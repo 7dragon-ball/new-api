@@ -581,11 +581,9 @@ func TokenAuth() func(c *gin.Context) {
 		if err != nil {
 			if errors.Is(err, model.ErrDatabase) {
 				common.SysLog(common.LogText("TokenAuth ValidateUserToken database error: %s", err.Error()))
-				abortWithOpenAiMessage(c, http.StatusInternalServerError,
-					common.TranslateMessage(c, i18n.MsgDatabaseError))
+				abortWithI18nMessage(c, http.StatusInternalServerError, i18n.MsgDatabaseError, nil)
 			} else {
-				abortWithOpenAiMessage(c, http.StatusUnauthorized,
-					common.TranslateMessage(c, i18n.MsgTokenInvalid))
+				abortWithI18nMessage(c, http.StatusUnauthorized, i18n.MsgTokenInvalid, nil)
 			}
 			return
 		}
@@ -596,11 +594,11 @@ func TokenAuth() func(c *gin.Context) {
 			logger.LogDebug(c, "Token has IP restrictions, checking client IP %s", clientIp)
 			ip := net.ParseIP(clientIp)
 			if ip == nil {
-				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthClientIPUnresolved))
+				abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgAuthClientIPUnresolved, nil)
 				return
 			}
 			if common.IsIpInCIDRList(ip, allowIps) == false {
-				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthTokenIPNotAllowed), types.ErrorCodeAccessDenied)
+				abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgAuthTokenIPNotAllowed, nil, types.ErrorCodeAccessDenied)
 				return
 			}
 			logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
@@ -615,7 +613,7 @@ func TokenAuth() func(c *gin.Context) {
 		}
 		userEnabled := userCache.Status == common.UserStatusEnabled
 		if !userEnabled {
-			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
+			abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgAuthUserBanned, nil)
 			return
 		}
 
@@ -626,13 +624,13 @@ func TokenAuth() func(c *gin.Context) {
 		if tokenGroup != "" {
 			// check common.UserUsableGroups[userGroup]
 			if _, ok := service.GetUserUsableGroups(userGroup)[tokenGroup]; !ok {
-				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthTokenGroupForbidden, map[string]any{"Group": tokenGroup}))
+				abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgAuthTokenGroupForbidden, map[string]any{"Group": tokenGroup})
 				return
 			}
 			// check group in common.GroupRatio
 			if !ratio_setting.ContainsGroupRatio(tokenGroup) {
 				if tokenGroup != "auto" {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthTokenGroupDeprecated, map[string]any{"Group": tokenGroup}))
+					abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgAuthTokenGroupDeprecated, map[string]any{"Group": tokenGroup})
 					return
 				}
 			}
@@ -708,7 +706,7 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 		if model.IsAdmin(token.UserId) {
 			id, err := strconv.Atoi(parts[1])
 			if err != nil {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidChannelId))
+				abortWithI18nMessage(c, http.StatusBadRequest, i18n.MsgDistributorInvalidChannelId, nil)
 				return fmt.Errorf("invalid specific channel id")
 			}
 			service.GetChannelConstraints(c).AddPin(dto.ChannelPin{
@@ -719,7 +717,7 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 			})
 		} else {
 			c.Header("specific_channel_version", "701e3ae1dc3f7975556d354e0675168d004891c8")
-			abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgAuthChannelSelectForbidden))
+			abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgAuthChannelSelectForbidden, nil)
 			return errors.New("regular users cannot specify a channel")
 		}
 	}

@@ -84,8 +84,10 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 	return claudeErr
 }
 
+// [FORK] 按上游 401/429 把 error_code 覆盖为二开专属码，同时保留上游原始码以免丢失 provider 原因。
 // RelayErrorHandler 解析上游错误响应，并在其基础上按上游状态码覆盖为二开专属错误码，
-// 供使用日志的「调用状态」提示区分「用户密钥不可用」(401) 与「上游限速/风控」(429)。
+// 供使用日志的「调用状态」提示区分「上游拒绝鉴权」(401) 与「上游限速/风控」(429)：
+// 上游 401 表示渠道凭据被上游拒绝（上游侧问题），不是终端用户自己的密钥无效。
 // 只覆盖 error_code，不改 StatusCode；覆盖后的错误码不带 channel: 前缀，不会被
 // IsChannelError 判为渠道错误，因此管理员配置的重试/禁用状态码策略照常生效。
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) *types.NewAPIError {

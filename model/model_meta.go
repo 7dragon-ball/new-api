@@ -74,6 +74,7 @@ func (mi *Model) MatchesName(name string) bool {
 	}
 }
 
+// [FORK] 选路失败要区分「模型未上架」与「无可用渠道」。
 // IsModelListed reports whether modelName resolves to an enabled entry in the
 // platform model catalog, using the same precedence as the public catalog
 // (resolveModelMetadata: exact, then prefix, suffix, contains). Soft-deleted
@@ -91,9 +92,16 @@ func IsModelListed(modelName string) (bool, error) {
 	var records []Model
 	// The exact entry must win even when disabled, so keep disabled rows and
 	// resolve precedence in memory instead of filtering by status here.
+	// Prefix/suffix/contains matching is done in Go rather than SQL because the
+	// LIKE/escape syntax differs across SQLite/MySQL/PostgreSQL; this runs only on
+	// the channel-selection failure path, so loading the non-exact rows is acceptable.
+	// Order("id") only makes the duplicate-name tie-break reproducible (the pricing
+	// catalog reads rows unordered), so a given model always resolves the same way.
 	if err := DB.Model(&Model{}).
 		Select("model_name", "name_rule", "status").
 		Where("model_name = ? OR name_rule <> ?", modelName, NameRuleExact).
+		// [FORK] 同一 NameRule 命中多行时按 id 取稳定的一行，避免上架判定随查询顺序抖动。
+		Order("id").
 		Find(&records).Error; err != nil {
 		return false, err
 	}

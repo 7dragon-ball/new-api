@@ -67,6 +67,7 @@ const (
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
+	// [FORK] 失败调用要在使用日志里带稳定的调用状态码：新增 invalid_token，作为 401 的默认码。
 	// 二开：中间件 abortWithOpenAiMessage 在调用方未指定错误码时按 HTTP 状态码推导的默认码
 	// （401→invalid_token、403→access_denied、其余 4xx→invalid_request），避免使用日志里
 	// error_code 为空。429 与 5xx 不落库，故没有默认码。
@@ -82,12 +83,15 @@ const (
 	ErrorCodeBadResponseBody        ErrorCode = "bad_response_body"
 	ErrorCodeEmptyResponse          ErrorCode = "empty_response"
 	ErrorCodeAwsInvokeError         ErrorCode = "aws_invoke_error"
+	// [FORK] 失败调用要在使用日志里带稳定的调用状态码：原 model_not_found 拆成「模型未上架」「无可用渠道」两个更精确的码。
 	// 二开：把「模型未上架」与「有模型但无可用渠道」分开记，供使用日志的调用状态提示区分。
 	ErrorCodeModelNotListed     ErrorCode = "model_not_listed"
 	ErrorCodeNoAvailableChannel ErrorCode = "no_available_channel"
 	ErrorCodePromptBlocked      ErrorCode = "prompt_blocked"
+	// [FORK] 失败调用要在使用日志里带稳定的调用状态码：另加 401/429 专属码，区分上游拒绝鉴权与限速。
 	// 二开：上游按 HTTP 状态码返回的专属错误码，供使用日志的调用状态提示区分。
-	//   - upstream_unauthorized：上游 401 拒绝使用方密钥
+	//   - upstream_unauthorized：上游 401 拒绝鉴权（通常是渠道凭据失效/被吊销，
+	//     属上游侧问题，并非终端用户自己的密钥无效；用户密钥无效由本网关返回 invalid_token）
 	//   - upstream_rate_limited：上游 429 限速/风控
 	// 两者都不带 channel: 前缀，因此 IsChannelError 为假，不会绕过管理员在
 	// 「状态码范围」里配置的重试/禁用策略（ShouldDisableChannel / DecideRelayRetry）。
@@ -129,6 +133,7 @@ func (e *NewAPIError) GetErrorCode() ErrorCode {
 	return e.errorCode
 }
 
+// [FORK] 供二开按上游状态码覆盖 error_code、覆盖后仍保留上游原始码、以及强制落库使用。
 // GetUpstreamErrorCode returns the error code carried in the upstream provider's
 // response error object (e.g. invalid_api_key, insufficient_quota). SetErrorCode
 // normalizes the recorded code while leaving the relay error untouched, so the

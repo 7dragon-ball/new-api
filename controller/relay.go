@@ -153,6 +153,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		} else {
 			newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithStatusCode(http.StatusBadRequest), types.ErrOptionWithSkipRetry())
 		}
+		// [FORK] 本地请求校验失败此前不落库，使用日志看不到，故补记。
 		// 二开：本地请求校验失败此前不落库，使用日志看不到失败态，故补记一条错误日志（此时尚无 relayInfo）。
 		service.RecordRelayErrorLog(c, 0, newAPIError, nil)
 		return
@@ -186,6 +187,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 
 	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
+		// [FORK] 预扣费/额度不足这类失败带抑制标记会被跳过落库，使用日志看不到，故补记。
 		// 二开：预扣费/额度不足这类错误带 ErrOptionWithNoRecordErrorLog，会被 RecordRelayErrorLog
 		// 主动跳过，导致使用日志看不到失败态；这里走强制落库的薄封装补记一条错误日志。
 		service.ForceRecordRelayErrorLog(c, 0, newAPIError, relayInfo)

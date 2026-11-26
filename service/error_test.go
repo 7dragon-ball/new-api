@@ -205,3 +205,18 @@ func TestRelayErrorHandlerPreservesUpstreamErrorCodeOnOverride(t *testing.T) {
 	// ...while the provider's own code stays reachable for diagnosis instead of being lost.
 	assert.Equal(t, types.ErrorCode("invalid_api_key"), newAPIError.GetUpstreamErrorCode())
 }
+
+// 上游 401 的响应体不是 JSON error 对象时（如网关返回的纯文本/HTML），错误来自 new-api
+// 自身而非上游响应体，GetUpstreamErrorCode 应为空，避免把内部哨兵当成上游错误码写入日志。
+func TestRelayErrorHandlerHasNoUpstreamCodeForNonObjectBody(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader("Unauthorized")),
+	}
+
+	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+
+	require.NotNil(t, newAPIError)
+	assert.Equal(t, types.ErrorCodeUpstreamUnauthorized, newAPIError.GetErrorCode())
+	assert.Empty(t, newAPIError.GetUpstreamErrorCode())
+}

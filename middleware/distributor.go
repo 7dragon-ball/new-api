@@ -47,9 +47,10 @@ func Distribute() func(c *gin.Context) {
 		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
 		if err != nil {
-			abortWithOpenAiMessage(c, invalidRequestStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+			abortWithI18nMessage(c, invalidRequestStatus(err), i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()})
 			return
 		}
+		// [FORK] 其后前置校验失败也要落库，日志需要模型名，故提前写入 original_model。
 		// 二开：original_model 原本只在成功选路后写入。这里提前写入，让其后的前置校验失败
 		// 错误日志也能带上模型名。注意其前的 getModelRequest 失败分支（上一处 return）拿不到
 		// 模型名。成功路径稍后会用同值覆盖，无副作用。
@@ -65,7 +66,7 @@ func Distribute() func(c *gin.Context) {
 				s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
 				if !ok {
 					// token model limit is empty, all models are not allowed
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
+					abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgDistributorTokenNoModelAccess, nil)
 					return
 				}
 				var tokenModelLimit map[string]bool
@@ -74,14 +75,14 @@ func Distribute() func(c *gin.Context) {
 					tokenModelLimit = map[string]bool{}
 				}
 				if !TokenModelLimitAllows(tokenModelLimit, modelRequest.Model) {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelRequest.Model}))
+					abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelRequest.Model})
 					return
 				}
 			}
 
 			if shouldSelectChannel {
 				if modelRequest.Model == "" {
-					abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorModelNameRequired))
+					abortWithI18nMessage(c, http.StatusBadRequest, i18n.MsgDistributorModelNameRequired, nil)
 					return
 				}
 				// check path is /pg/chat/completions
@@ -90,12 +91,12 @@ func Distribute() func(c *gin.Context) {
 					playgroundRequest := &dto.PlayGroundRequest{}
 					err = common.UnmarshalBodyReusable(c, playgroundRequest)
 					if err != nil {
-						abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidPlayground, map[string]any{"Error": err.Error()}))
+						abortWithI18nMessage(c, http.StatusBadRequest, i18n.MsgDistributorInvalidPlayground, map[string]any{"Error": err.Error()})
 						return
 					}
 					if playgroundRequest.Group != "" {
 						if !service.GroupInUserUsableGroups(usingGroup, playgroundRequest.Group) && playgroundRequest.Group != usingGroup {
-							abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorGroupAccessDenied))
+							abortWithI18nMessage(c, http.StatusForbidden, i18n.MsgDistributorGroupAccessDenied, nil)
 							return
 						}
 						common.SetContextKey(c, constant.ContextKeyUsingGroup, playgroundRequest.Group)
@@ -126,13 +127,15 @@ func Distribute() func(c *gin.Context) {
 				if selectErr.FilterKind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, selectErr.Channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
-				message := selectErr.Message
+				// [FORK] 选路失败要落库并带稳定错误码；响应文案随读者语言，落库固定英文。
+				message, logMessage := selectErr.Message, selectErr.Message
 				if selectErr.NoAvailableChannel {
-					message = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
+					message, logMessage = noAvailableChannelMessage(c, usingGroup, modelRequest.Model)
 				} else if selectErr.MessageID != "" {
 					message = i18n.T(c, selectErr.MessageID, selectErr.Params)
+					logMessage = i18n.Translate(i18n.LangEn, selectErr.MessageID, selectErr.Params)
 				}
-				abortWithOpenAiMessage(c, selectErr.StatusCode, message, selectErr.Code)
+				abortWithLogMessage(c, selectErr.StatusCode, message, logMessage, selectErr.Code)
 				return
 			}
 		}
@@ -145,13 +148,16 @@ func Distribute() func(c *gin.Context) {
 	}
 }
 
-// noAvailableChannelMessage explains a 503 for a task-plugin-claimed model.
-// The response tells the caller the model is plugin-claimed without naming the
-// plugin; the candidate plugin keys go to the server log under the request id.
-func noAvailableChannelMessage(c *gin.Context, group, modelName string) string {
+// noAvailableChannelMessage explains a 503 for a task-plugin-claimed model, in the
+// reader's language and as the fixed English sentence the usage log records. The
+// response tells the caller the model is plugin-claimed without naming the plugin;
+// the candidate plugin keys go to the server log under the request id.
+func noAvailableChannelMessage(c *gin.Context, group, modelName string) (message string, englishMessage string) {
+	key := i18n.MsgDistributorNoAvailableChannel
 	value, exists := c.Get(jsplugin.ContextKeyPinnedPlugin)
 	pinned, ok := value.(jsplugin.PinnedPlugin)
 	if exists && ok && pinned.Plugin != nil {
+		key = i18n.MsgDistributorNoAvailableChannelTaskPlugin
 		keys := []string{pinned.Plugin.Meta.Key}
 		if _, candidates := pinnedCandidatePlugins(c); len(candidates) > 0 {
 			keys = nil
@@ -162,9 +168,9 @@ func noAvailableChannelMessage(c *gin.Context, group, modelName string) string {
 			}
 		}
 		logger.LogWarn(c, common.LogText("task_plugin subsystem=distribution event=no_available_channel group=%q model=%q plugins=%q reason=no_eligible_channel", group, modelName, strings.Join(keys, ",")))
-		return i18n.T(c, i18n.MsgDistributorNoAvailableChannelTaskPlugin, map[string]any{"Group": group, "Model": modelName})
 	}
-	return i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": group, "Model": modelName})
+	params := map[string]any{"Group": group, "Model": modelName}
+	return i18n.T(c, key, params), i18n.Translate(i18n.LangEn, key, params)
 }
 
 func channelMatchesExpectedTaskPlugin(c *gin.Context, channel *model.Channel, expected string) bool {

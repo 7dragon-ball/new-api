@@ -20,7 +20,11 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing.T) {
+// newErrorLogTestDB installs a fresh in-memory SQLite database as both the main and
+// the log database for the duration of the test, turns error logging on, and seeds
+// the user row the test records logs for. The previous globals are restored on cleanup.
+func newErrorLogTestDB(t *testing.T, userId int, username string) *gorm.DB {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousRedisEnabled := common.RedisEnabled
@@ -46,7 +50,12 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 		require.NoError(t, sqlDB.Close())
 	})
 
-	require.NoError(t, database.Create(&model.User{Id: 7, Username: "log-owner", Group: "default"}).Error)
+	require.NoError(t, database.Create(&model.User{Id: userId, Username: username, Group: "default"}).Error)
+	return database
+}
+
+func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing.T) {
+	database := newErrorLogTestDB(t, 7, "log-owner")
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -100,32 +109,7 @@ func TestProcessChannelErrorUsesSnapshotWithoutLeakingChannelMetadata(t *testing
 }
 
 func TestForceRecordRelayErrorLogBypassesSuppression(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	previousDB, previousLogDB := model.DB, model.LOG_DB
-	previousRedisEnabled := common.RedisEnabled
-	previousMainDatabaseType := common.MainDatabaseType()
-	previousLogDatabaseType := common.LogDatabaseType()
-	previousErrorLogEnabled := constant.ErrorLogEnabled
-
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	sqlDB, err := database.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Log{}))
-	model.DB, model.LOG_DB = database, database
-	common.RedisEnabled = false
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
-	constant.ErrorLogEnabled = true
-	t.Cleanup(func() {
-		model.DB, model.LOG_DB = previousDB, previousLogDB
-		common.RedisEnabled = previousRedisEnabled
-		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
-		constant.ErrorLogEnabled = previousErrorLogEnabled
-		require.NoError(t, sqlDB.Close())
-	})
-
-	require.NoError(t, database.Create(&model.User{Id: 8, Username: "fallback-owner", Group: "default"}).Error)
+	database := newErrorLogTestDB(t, 8, "fallback-owner")
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)

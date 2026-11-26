@@ -380,6 +380,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				showGroup = fmt.Sprintf("auto(%s)", selectGroup)
 			}
 			return nil, selectGroup, &ChannelSelectError{
+				// [FORK] 取渠道失败也计入调用失败，用固定码 get_channel_failed 替代原先笼统的 model_not_found。
 				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeGetChannelFailed, MessageID: i18n.MsgDistributorGetChannelFailed,
 				Params: map[string]any{"Group": showGroup, "Model": modelName, "Error": err.Error()},
 			}
@@ -401,6 +402,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 	return channel, selectGroup, nil
 }
 
+// [FORK] 把「模型未上架」与「有模型但无可用渠道」分开归类，使用日志的调用状态才能区分。
 // modelFailureCode splits the "no channel for this model" outcome into
 // "model not listed" and "listed but no available channel", which the
 // management log tooltip reads from the recorded error code. The catalog read
