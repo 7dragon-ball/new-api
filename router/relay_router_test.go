@@ -139,9 +139,10 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 				assert.Equal(t, fmt.Sprintf("plugin google for user %d", user.Id), recorder.Body.String())
 				return
 			}
-			// The relay looks for a Gemini channel serving the model; there is none.
+			// The relay looks for a Gemini channel serving the model; there is none,
+			// and the model is absent from the platform model catalog.
 			assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-			assert.Contains(t, recorder.Body.String(), `"code":"model_not_found"`)
+			assert.Contains(t, recorder.Body.String(), `"code":"model_not_listed"`)
 		})
 	}
 }

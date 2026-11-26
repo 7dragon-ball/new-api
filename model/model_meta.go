@@ -76,18 +76,30 @@ func (mi *Model) MatchesName(name string) bool {
 
 // IsModelListed reports whether modelName is present in the platform model
 // catalog with an enabled status (status = 1). Soft-deleted rows are excluded
-// by the Model soft-delete scope. Channel selection calls it at failure time to
-// tell "model not listed" from "no available channel" for the recorded error
-// code; it runs only on the error path.
+// by the Model soft-delete scope. A row matches through its NameRule (exact,
+// prefix, suffix, or contains), so a model covered by a listed rule counts as
+// listed. Channel selection calls it at failure time to tell "model not listed"
+// from "no available channel" for the recorded error code; it runs only on the
+// error path.
 func IsModelListed(modelName string) bool {
-	if modelName == "" {
+	if modelName == "" || DB == nil {
 		return false
 	}
-	var count int64
-	if err := DB.Model(&Model{}).Where("model_name = ? AND status = ?", modelName, 1).Count(&count).Error; err != nil {
+	var records []Model
+	// Fetch every enabled row that could match: the exact name, or any row with a
+	// non-exact rule evaluated by MatchesName afterwards.
+	if err := DB.Model(&Model{}).
+		Where("status = ?", 1).
+		Where("model_name = ? OR name_rule <> ?", modelName, NameRuleExact).
+		Find(&records).Error; err != nil {
 		return false
 	}
-	return count > 0
+	for i := range records {
+		if records[i].MatchesName(modelName) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveModelMetadata preserves catalog precedence: exact, prefix, suffix,

@@ -86,15 +86,16 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 
 // RelayErrorHandler 解析上游错误响应，并在其基础上按上游状态码覆盖为二开专属错误码，
 // 供使用日志的「调用状态」提示区分「用户密钥不可用」(401) 与「上游限速/风控」(429)。
-// 只覆盖 error_code，不改 StatusCode，因此既有的重试/禁用判定不受影响。
+// 只覆盖 error_code，不改 StatusCode；覆盖后的错误码不带 channel: 前缀，不会被
+// IsChannelError 判为渠道错误，因此管理员配置的重试/禁用状态码策略照常生效。
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) *types.NewAPIError {
 	newApiErr := relayErrorHandlerRaw(ctx, resp, showBodyWhenFail)
-	if newApiErr == nil || resp == nil {
-		return newApiErr
+	if newApiErr == nil {
+		return nil
 	}
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
-		newApiErr.SetErrorCode(types.ErrorCodeChannelUpstreamUnauthorized)
+		newApiErr.SetErrorCode(types.ErrorCodeUpstreamUnauthorized)
 	case http.StatusTooManyRequests:
 		newApiErr.SetErrorCode(types.ErrorCodeUpstreamRateLimited)
 	}

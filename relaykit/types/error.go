@@ -84,11 +84,12 @@ const (
 	ErrorCodeNoAvailableChannel ErrorCode = "no_available_channel"
 	ErrorCodePromptBlocked      ErrorCode = "prompt_blocked"
 	// 二开：上游按 HTTP 状态码返回的专属错误码，供使用日志的调用状态提示区分。
-	//   - channel:upstream_unauthorized：上游 401 拒绝使用方密钥
-	//   - upstream_rate_limited：上游 429 限速/风控（不带 channel: 前缀，避免被判为
-	//     渠道错误而触发 ShouldDisableChannel 误禁用渠道）
-	ErrorCodeChannelUpstreamUnauthorized ErrorCode = "channel:upstream_unauthorized"
-	ErrorCodeUpstreamRateLimited         ErrorCode = "upstream_rate_limited"
+	//   - upstream_unauthorized：上游 401 拒绝使用方密钥
+	//   - upstream_rate_limited：上游 429 限速/风控
+	// 两者都不带 channel: 前缀，因此 IsChannelError 为假，不会绕过管理员在
+	// 「状态码范围」里配置的重试/禁用策略（ShouldDisableChannel / DecideRelayRetry）。
+	ErrorCodeUpstreamUnauthorized ErrorCode = "upstream_unauthorized"
+	ErrorCodeUpstreamRateLimited  ErrorCode = "upstream_rate_limited"
 
 	// sql error
 	ErrorCodeQueryDataError  ErrorCode = "query_data_error"

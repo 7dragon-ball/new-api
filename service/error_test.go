@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -157,4 +158,35 @@ func withDebugEnabled(t *testing.T, enabled bool) {
 	t.Cleanup(func() {
 		common.DebugEnabled = oldDebug
 	})
+}
+
+func TestRelayErrorHandlerAssignsUpstreamErrorCodes(t *testing.T) {
+	testCases := []struct {
+		name       string
+		statusCode int
+		wantCode   types.ErrorCode
+	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, wantCode: types.ErrorCodeUpstreamUnauthorized},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantCode: types.ErrorCodeUpstreamRateLimited},
+		{name: "other status keeps original code", statusCode: http.StatusInternalServerError, wantCode: types.ErrorCodeBadResponseStatusCode},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: tc.statusCode,
+				Body:       io.NopCloser(strings.NewReader(`{"message":"upstream failed"}`)),
+			}
+
+			newAPIError := RelayErrorHandler(context.Background(), resp, false)
+
+			require.NotNil(t, newAPIError)
+			// The override only rewrites error_code, never the HTTP status.
+			assert.Equal(t, tc.statusCode, newAPIError.StatusCode)
+			assert.Equal(t, tc.wantCode, newAPIError.GetErrorCode())
+			// The overridden codes carry no channel: prefix, so the administrator's
+			// retry/disable status-code policy still applies.
+			assert.False(t, types.IsChannelError(newAPIError))
+		})
+	}
 }
