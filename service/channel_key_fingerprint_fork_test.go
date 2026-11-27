@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -156,4 +157,106 @@ func TestAppendRelayLogAdminInfoFingerprintOnSingleKeyChannel(t *testing.T) {
 	assert.Equal(t, "9f431373b2e17fc0", adminInfo["channel_key_fp"])
 	_, hasIndex := adminInfo["multi_key_index"]
 	assert.False(t, hasIndex, "单密钥渠道上游不写 multi_key_index")
+}
+
+// ---------------------------------------------------------------------------
+// channel_key_masked：删除密钥后历史日志的归属快照
+// ---------------------------------------------------------------------------
+
+// 掩码与指纹同源同一次写：只写指纹的话，密钥一删历史行就再也算不出掩码。
+func TestAppendChannelKeyFingerprintRecordsMaskedSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+	ctx.Set(string(constant.ContextKeyChannelKey), "sk-abcdefghijklmnopqrstuvwxyz")
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "sk-a**********wxyz", adminInfo["channel_key_masked"])
+}
+
+// 掩码快照与 BFF 的 maskTokenKey（packages/shared/src/mask.ts）必须逐字一致：
+// 两侧口径分叉会让「已删除」判定永远不成立（BFF 拿快照比对不上自己算的掩码）。
+// 这些向量与 BFF 的 mask 单测是同一张表，改口径时两边同时改。
+func TestChannelKeyMaskedSnapshotVectors(t *testing.T) {
+	cases := []struct{ name, key, want string }{
+		{"1 位全星", "a", "*"},
+		{"4 位全星", "abcd", "****"},
+		{"5 位留前 2 后 2", "abcde", "ab****de"},
+		{"8 位留前 2 后 2", "abcdefgh", "ab****gh"},
+		{"9 位留前 4 后 4", "abcdefghi", "abcd**********fghi"},
+		{"常见长度", "sk-abcdefghijklmnopqrstuvwxyz", "sk-a**********wxyz"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, model.MaskTokenKey(c.key))
+		})
+	}
+}
+
+// 快照绝不落明文：拿整串去比对，任何长度都不允许相等。
+// 用「露出位数 < 原文长度」而不是 `masked != key`：10–14 位的串若改用「前 10 后 4」
+// 口径，前后缀会重叠、逐位可还原，但字符序列与原文不同，`!=` 抓不住。
+func TestChannelKeyMaskedSnapshotNeverEqualsPlaintext(t *testing.T) {
+	for _, key := range []string{
+		"sk-abcdefghijklmnopqrstuvwxyz",
+		"abcdefghij",   // 10 位：重叠口径的临界长度
+		"abcdefghijkl", // 12 位
+		"short",
+	} {
+		masked := model.MaskTokenKey(key)
+		assert.NotEqual(t, key, masked, "掩码不得等于原文")
+		revealed := strings.Count(masked, "*")
+		assert.Less(t, len(masked)-revealed, len(key), "露出位数必须少于原文长度（%q → %q）", key, masked)
+	}
+}
+
+// 插件托管的 credential 行同样只落脱敏串，不因为它是 JSON 就原样落库。
+func TestAppendChannelKeyFingerprintMasksPluginCredential(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+	line := `{"type":"plugin_credential","plugin":"veo","token":"super-secret-oauth-token"}`
+	ctx.Set(string(constant.ContextKeyChannelKey), line)
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	masked, _ := adminInfo["channel_key_masked"].(string)
+	assert.NotEqual(t, line, masked)
+	assert.NotContains(t, masked, "super-secret-oauth-token", "插件凭据的令牌不得进入日志")
+}
+
+// 没有 key 时两个字段都不写，保持「无值即缺字段」——不要写空串，BFF 用 `?? ` 会当成有值。
+func TestAppendChannelKeyFingerprintOmitsMaskWithoutKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, _ := other.Snapshot()["admin_info"].(map[string]any)
+	_, hasMask := adminInfo["channel_key_masked"]
+	assert.False(t, hasMask)
+}
+
+// 掩码与指纹同作用域：都在 admin_info，不得漏进 public（public 对普通用户可见）。
+func TestChannelKeyMaskedStaysInAdminInfo(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+	ctx.Set(string(constant.ContextKeyChannelKey), "sk-abcdefghijklmnopqrstuvwxyz")
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	snapshot := other.Snapshot()
+	_, inPublic := snapshot["channel_key_masked"]
+	assert.False(t, inPublic, "掩码不得出现在 public 顶层")
+	adminInfo, ok := snapshot["admin_info"].(map[string]any)
+	require.True(t, ok)
+	_, inAdmin := adminInfo["channel_key_masked"]
+	assert.True(t, inAdmin)
 }

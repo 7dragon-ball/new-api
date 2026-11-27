@@ -33,7 +33,7 @@ func ChannelKeyFingerprint(key string) string {
 	return hex.EncodeToString(common.Sha256Raw([]byte(key)))[:16]
 }
 
-// AppendChannelKeyFingerprint 把日志写入时刻实际使用的密钥指纹记进 admin_info。
+// AppendChannelKeyFingerprint 把日志写入时刻实际使用的密钥指纹与脱敏串记进 admin_info。
 //
 // 取 ContextKeyChannelKey 而不是 GetNextEnabledKey 的返回值：插件类渠道会在选定后
 // 把该键改写成刷新后的凭据行（relay/channel/providerplugin/adaptor.go、
@@ -49,11 +49,28 @@ func ChannelKeyFingerprint(key string) string {
 //
 // 该键在 middleware/distributor.go 里无条件设置（不在 IsMultiKey 分支内），因此单密钥
 // 渠道与错误日志同样带得上指纹。
+//
+// [FORK] channel_key_masked 是同一把钥的脱敏串快照，解决「密钥被删除后历史日志失去归属」：
+// 渠道密钥是硬删除（`channels` 表无 `deleted_at`，多把钥匙只是 `channels.key` 这一个
+// text 列里的行），删掉后指纹在库里再也对不上任何候选，BFF 只能回落 `multi_key_index`，
+// 而删除会让下标整体前移 —— 历史行会显示成**另一把仍在的密钥**，点「揭晓明文」还会把
+// 那把钥的真身下发出去（张冠李戴比空着更糟）。
+//
+// 只存脱敏串、不存明文：`admin_info` 对 role >= 10 可见（model/log_other.go 的
+// formatLogOtherJSON 只剥离 root_info），而 `GET /api/log/` 与 `/api/log/export`
+// 都只挂 AdminAuth，落明文等于给运营开一条批量导出全站密钥的后门。脱敏口径与 BFF
+// 的 maskTokenKey / Go 的 MaskTokenKey 三方一致（前 4 + 10 星 + 后 4），不可逆，
+// 也答不了「把这把钥复制去排障」。
+//
+// 插件托管的 credential 行照常打码：MaskTokenKey 只露首尾各 4 字节，对
+// `{"type":"plugin_credential",...}` 这类 JSON 只露出结构字符，与列表侧现行口径相同。
 func AppendChannelKeyFingerprint(ctx *gin.Context, other *model.LogOther) {
 	if ctx == nil || other == nil {
 		return
 	}
-	if fp := ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.ContextKeyChannelKey)); fp != "" {
+	key := common.GetContextKeyString(ctx, constant.ContextKeyChannelKey)
+	if fp := ChannelKeyFingerprint(key); fp != "" {
 		other.SetAdmin("channel_key_fp", fp)
+		other.SetAdmin("channel_key_masked", model.MaskTokenKey(key))
 	}
 }
