@@ -192,6 +192,29 @@ func TestAddChannelInvalidVertexBatchDoesNotReturnResults(t *testing.T) {
 	}
 }
 
+func TestAddChannelPersistsBaseURLWithoutSurroundingWhitespace(t *testing.T) {
+	rootID := setupChannelCreateTest(t)
+	request, err := common.Marshal(AddChannelRequest{Mode: "single", Channel: &model.Channel{
+		Name: "padded-base-url", Type: constant.ChannelTypeOpenAI, Key: "sk-padded",
+		BaseURL: common.GetPointer("  https://api.example.com  "), Models: "test-model", Group: "default",
+	}})
+	require.NoError(t, err)
+	response := postAddChannel(t, rootID, common.RoleRootUser, string(request))
+	require.Equal(t, http.StatusOK, response.Code)
+	var result struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.True(t, result.Success, response.Body.String())
+
+	var stored model.Channel
+	require.NoError(t, model.DB.Where("name = ?", "padded-base-url").First(&stored).Error)
+	require.NotNil(t, stored.BaseURL)
+	// 落库的值必须已去掉首尾空白：留着它会让上游请求在 http.NewRequest 处解析失败。
+	assert.Equal(t, "https://api.example.com", *stored.BaseURL)
+}
+
 func TestAddChannelRollbackDoesNotReturnIDs(t *testing.T) {
 	rootID := setupChannelCreateTest(t)
 	// Force a real database error in the second chunk, after the first 50 rows

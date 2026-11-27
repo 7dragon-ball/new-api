@@ -114,6 +114,33 @@ func TestValidateChannelRequiresNewAPIBaseURL(t *testing.T) {
 	}
 }
 
+func TestValidateChannelNormalizesBaseURLWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "leading", in: "   https://api.example.com", want: "https://api.example.com"},
+		{name: "trailing", in: "https://api.example.com   ", want: "https://api.example.com"},
+		{name: "both", in: "\t https://api.example.com \n", want: "https://api.example.com"},
+		{name: "clean", in: "https://api.example.com", want: "https://api.example.com"},
+		{name: "empty", in: "", want: ""},
+		{name: "blank becomes empty", in: "   ", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := &model.Channel{Type: constant.ChannelTypeOpenAI, BaseURL: common.GetPointer(tc.in)}
+			require.NoError(t, validateChannel(channel, false))
+			require.NotNil(t, channel.BaseURL)
+			assert.Equal(t, tc.want, *channel.BaseURL, "a base URL with surrounding whitespace must be persisted trimmed")
+		})
+	}
+
+	// nil 保持 nil：ValidateChannel 不得把「未配置、回退到类型默认地址」变成空串指针。
+	channel := &model.Channel{Type: constant.ChannelTypeOpenAI}
+	require.NoError(t, validateChannel(channel, false))
+	assert.Nil(t, channel.BaseURL)
+}
+
 func TestNewAPIChannelRegistration(t *testing.T) {
 	apiType, ok := common.ChannelType2APIType(constant.ChannelTypeNewAPI)
 
