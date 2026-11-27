@@ -539,13 +539,13 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	// [FORK] 渠道测试照实记账但恒不计价：上游真实产生了 token 消耗，不记就永远对不上账
 	// （DeepSeek 显示 4 次、平台 3 条）。quota 传 0，钱包与 quota_data 的金额都不动；
 	// 前端靠 other.billing_exempt 把金额列渲染成 `—` 而不是 ￥0。
+	// 不写 TokenName：测试没有用任何用户密钥
 	milliseconds := time.Since(tik).Milliseconds()
 	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
 		ChannelId:        channel.Id,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
 		ModelName:        info.OriginModelName,
-		TokenName:        "Model test",
 		Quota:            0,
 		Content:          []*common.Message{common.NewMessage("Model test")},
 		UseTimeSeconds:   int(milliseconds / 1000),

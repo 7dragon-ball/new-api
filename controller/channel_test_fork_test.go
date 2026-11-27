@@ -361,6 +361,8 @@ func TestPreviewTestChannelWritesZeroQuotaConsumeLog(t *testing.T) {
 	// 临时渠道没有名字，也不编造：快照留空，日志页渠道列显示 `—`，channel_id 记 0。
 	assert.Zero(t, rows[0].ChannelId)
 	assert.Empty(t, rows[0].ChannelName, "预览态不编造渠道名")
+	// 测试没有用任何用户密钥，不写 token_name：日志「密钥用途」列显示 `—`，不凭空多出一种用途。
+	assert.Empty(t, rows[0].TokenName, "渠道测试不写假的密钥用途")
 }
 
 // 已保存渠道的测试走同一个记账分支：同样 quota=0，但渠道名与 id 来自真实渠道。
