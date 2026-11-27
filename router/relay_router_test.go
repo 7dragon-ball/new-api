@@ -147,6 +147,50 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 	}
 }
 
+// [FORK] 推理入口只拦截「显式下架」（目录里有命中行且 status != 1）的模型；目录里没
+// 有该行的模型照旧放行。已上架但无可用渠道，必须落到「渠道问题」而不是「模型未上架」。
+func TestRelayBlocksOnlyRetiredModels(t *testing.T) {
+	setupRelayRouterTestDB(t)
+	require.NoError(t, i18n.Init())
+	user := model.User{Username: "listing-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "listingtestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
+	require.NoError(t, model.DB.Create(&model.Model{ModelName: "gemini-2.5-flash", Status: 1, NameRule: model.NameRuleExact}).Error)
+	// Status has gorm:"default:1", so a Create with Status:0 would fall back to the
+	// DB default; unlist through an explicit UPDATE as the platform does.
+	require.NoError(t, model.DB.Create(&model.Model{ModelName: "retired-model", Status: 1, NameRule: model.NameRuleExact}).Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("model_name = ?", "retired-model").Update("status", 0).Error)
+
+	engine := gin.New()
+	SetRelayRouter(engine)
+
+	for _, testCase := range []struct {
+		modelName string
+		wantCode  string
+		wantText  string
+	}{
+		{modelName: "gemini-2.5-flash", wantCode: "no_available_channel", wantText: "No available channel for model gemini-2.5-flash"},
+		{modelName: "retired-model", wantCode: "model_not_listed", wantText: "Model retired-model is not offered by this platform"},
+		{modelName: "never-catalogued", wantCode: "model_not_listed", wantText: "No available channel for model never-catalogued"},
+	} {
+		t.Run(testCase.modelName, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+testCase.modelName+":generateContent", strings.NewReader(`{}`))
+			request.Header.Set("x-goog-api-key", "listingtestkey")
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, request)
+
+			require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+			body := recorder.Body.String()
+			assert.Contains(t, body, `"code":"`+testCase.wantCode+`"`)
+			// 「显式下架」的前置拦截与「已上架但无渠道」的选渠道失败共用 model_not_listed
+			// 这一错误码，只有响应文案能区分两条路径：后者是 no_available_channel 文案，前者
+			// 是 model_not_listed 文案。若删掉 Distribute 里的前置拦截，retired-model 会落到
+			// 选渠道失败、得到「No available channel…」，本条断言随即失败。
+			assert.Contains(t, body, testCase.wantText)
+		})
+	}
+}
+
 func setupRelayRouterTestDB(t *testing.T) {
 	t.Helper()
 

@@ -683,6 +683,40 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 `newAwsClient`（密钥段数 / 格式）失败时产生；AWS 凭据真正的过期或签名错误发生在 invoke 期，
 走状态码判据，而 403 不在默认停用码段内。排障时不要把它当成本节的 bug。
 
+### 十四、模型下架前置拦截与目录内存快照（`fork/feat/log-call-status-on-main`）
+
+「十二」把「模型未上架」写进了失败调用日志，但只在选渠道失败后才归类：一个已下架却仍挂着可用
+渠道的模型，请求依旧会成功。本次把下架判定**前移到选渠道之前**，并把目录判定搬进内存快照，
+去掉热路径上的库查询。
+
+- **选渠道前置拦截**：`Distribute` 在 `!pinned && shouldSelectChannel` 分支里，命中「上下架目录里
+  命中行且 `status != 1`」即返回 `503` + `model_not_listed`。只拦**显式下架**——目录里查不到该模型
+  的行（含渠道里已有、还没建元数据的合成行）不算下架，照旧放行；内部任务 / 插件钉渠道的请求
+  （`pinned`）天然豁免。
+- **内存快照**：`model/model_listing_cache_fork.go` 在启动与每次 `SyncTopicModels` 同步时重建快照
+  （按规则类型分桶：一个 `exact` 映射 + 前缀/后缀/包含三组有序切片；`listed` / `retired` 由同一份
+  status 源派生），`Distribute` 与 `modelFailureCode` 改走 `IsModelRetiredCached` /
+  `IsModelListedCached`；快照未就绪时回退到「十二」的库查询实现，行为不变。
+- **启动预热失败会重试**：启动预热失败时用 `service.SyncTopicLoadFailed(model.SyncTopicModels, err)`
+  把该 topic 标记为未加载（与 `main.go` 对 OAuth 的处理一致），首个 node-sync tick 会重跑
+  `InitModelListingCache`；重试成功前每个推理请求走库回退，快照不会被永久钉死在未就绪状态。
+- **判定与归类同源**：库查询侧把 `IsModelRetired` 与 `IsModelListed` 收敛到同一个 resolver
+  （`resolvedCatalogStatus`，位于 `model/model_meta.go`），两者只在末端谓词（`status == 1` /
+  `status != 1`）上不同，避免查询与优先级各写一份而随时间漂移。
+- **对外契约变更声明**：此前「下架」只影响模型广场展示，不拦调用；一个 `status != 1` 但仍有可用
+  渠道的模型过去能调用成功，现在一律 `503 model_not_listed`。这是有意的路由层收紧，使用方需知悉。
+
+改动：root `main.go`（启动预热 + `SyncTopicModels` 回调重建）、`middleware/distributor.go`
+（前置拦截块，`[FORK]` 共 4 处；目录查询失败放行并打日志）、`service/channel_select.go`
+（`modelFailureCode` 改走缓存）、`model/model_meta.go`（`IsModelListed` 与新增的 `IsModelRetired`
+收敛到 `resolvedCatalogStatus`）、`router/relay_router_test.go`（回归用例），后端 `i18n/keys.go` 与
+`i18n/locales/{en,zh-CN,zh-TW}.yaml`（新增 `distributor.model_not_listed` 文案键，配套「十二」引入的
+`abortWithI18nMessage`）；新增 `model/model_listing_cache_fork.go` 与
+`model/model_listing_cache_fork_test.go`（与 `model/model_meta_fork_test.go` 共用 dialect harness
+与 fixture，不重复）。
+
+> 本增量已随 `c65564832` 提交，已并入下面 `git diff 6ef123cd5..HEAD` 的统计。
+
 ## 数据库
 
 本 fork **只跑 PostgreSQL**，自动化测试用 SQLite 内存库，MySQL 不在运行范围内。
@@ -716,20 +750,24 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 120 个文件（69 个上游文件被改、51 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +10774/−376，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+共 127 个文件（74 个上游文件被改、53 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +11189/−379，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
 （定稿修复把分支新增的 `service/relay_error_fallback.go` 并回 `service/relay_error.go` 并删除，
 故新增数比本分支初版少 1。）
+（「十四」增量触及 root `main.go`、`middleware/distributor.go`、`service/channel_select.go`、
+后端 `i18n/`、`router/relay_router_test.go`，并新增两个 `_fork` 文件；已随 `c65564832` 提交，已计入本统计。）
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。69 个被改文件里有 9 个是 `web/`、4 个不是功能
+> 那不是定制，不计入上面的文件数。74 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
 
 | 文件 | 改动 | 风险 |
 |---|---|---|
+| `main.go` | `[FORK]` 启动预热目录快照、`SyncTopicModels` 回调重建快照；预热失败标记未加载以触发首个 tick 重试（见「十四」） | 低，纯新增调用 |
+| `i18n/keys.go`、`i18n/locales/{en,zh-CN,zh-TW}.yaml` | 新增 `distributor.model_not_listed` 文案键（见「十四」） | 低 |
 | `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，前四组定制都改它 |
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |
 | `model/channel_cache.go` | 新增 `priorityLookupCache` 的构建与发布、`GetRandomSatisfiedChannel` 的优先级改读 `abilities.priority`（5 处 `[FORK]`） | **高**，逐请求热路径 |
@@ -823,6 +861,8 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `controller/model_tag_fork_test.go` | 去重排序、`keyword` 按单个标签收窄（不是整格）、`limit` 与缺省 |
 | `middleware/utils_fork_test.go` | abort 落库回归：`abortWithOpenAiMessage` / `abortWithI18nMessage` 的响应与落库文本、`userId==0` 与 429 不落库、带显式码的 5xx 仍落库（见「十二」） |
 | `model/model_meta_fork_test.go` | `IsModelListed` 目录优先级（exact 优先、disabled、同名多行 tie-break 稳定）与无库时不报错（见「十二」） |
+| `model/model_listing_cache_fork.go` | 目录内存快照：`listed`/`retired` 映射、`InitModelListingCache`、`IsModelRetiredCached` / `IsModelListedCached`（见「十四」） |
+| `model/model_listing_cache_fork_test.go` | 快照重建、与库查询优先级一致、未就绪回退库查询（见「十四」） |
 
 （另有 12 个上游文件被改签名、补迁移或补测试，已并入上表。）上游若在这些路径放了同名文件，
 git 会报 `add/add` 冲突——这是唯一需要留意的情形。
@@ -838,7 +878,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 216 处、69 个文件：
+当前共 221 处、72 个文件（含本分支新增，见「十二」「十三」「十四」；口径见文末 `grep`）：
 
 | 文件 | 处数 |
 |---|---|
@@ -863,7 +903,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `model/model_meta.go` | 4 |
 | `relaykit/types/error.go` | 7 |
 | `constant/context_key.go` | 3 |
-| `middleware/distributor.go` | 3 |
+| `middleware/distributor.go` | 4 |
 | `model/ability.go` | 3 |
 | `router/channel-router.go` | 3 |
 | `controller/audit.go` | 2 |
@@ -880,11 +920,13 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `model/department_fork_test.go` | 2 |
 | `model/user_auth_cache.go` | 2 |
 | `service/channel.go` | 2 |
+| `controller/channel.go` | 2 |
 | `service/channel_select.go` | 3 |
 | `service/relay_error.go` | 3 |
 | `service/security_verification_fork.go` | 2 |
-| `controller/channel.go` | 2 |
-| `common/random_password_fork.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/helper/price.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_disable_fork_test.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `main.go` | 2 |
+| `model/model_listing_cache_fork.go` | 1 |
+| `common/random_password_fork.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/helper/price.go`、`relay/responses_websocket.go`、`router/relay_router_test.go`、`service/access_token_scope.go`、`service/channel_disable_fork_test.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
