@@ -316,10 +316,9 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   key 允许为空，因为「自建算力」渠道走内网网关、上游不校验秘钥。`endpoint_type` / `stream` 与
   `GET /test/:id` 同口径透传（新建弹窗要测非 chat 端点或流式）；未知的 `endpoint_type` 落回
   `testChannel()` 默认分支（chat 端点 + OpenAI 格式），与老接口行为一致。
-- `controller/channel-test.go` 五处 `// [FORK]` —— `testChannel()` 开头算一次 `preview := channel.Id == 0`，
-  据此跳过定价校验（网关 `model_ratio` 与平台成本表是两套数据，不跳过会让未配价模型全部测试失败）、
-  结算/消费日志（否则记到 channel 0），并在调 `RelayErrorHandler` 前把上游响应体里的明文凭据
-  （含 Codex 的 OAuth token）替换成 `[REDACTED]`；`TestChannel` 的两个错误分支再对回给前端的
+- `controller/channel-test.go` 四处 `// [FORK]` —— `testChannel()` 在两种渠道上都不做定价校验、
+  照实记账但恒不计价（见下方「渠道测试的记账口径」），并在调 `RelayErrorHandler` 前把上游响应体里的
+  明文凭据（含 Codex 的 OAuth token）替换成 `[REDACTED]`；`TestChannel` 的两个错误分支再对回给前端的
   message 做一次同样的脱敏——这个接口只需要 `ChannelOperate`，上游回显 Key 等于绕开
   `ChannelSensitiveWrite` 读到密钥。
 - 错误 message 过 `redactCredentialError`，脱敏集合由 `credentialSecrets()` 给出（秘钥本身 +
@@ -346,6 +345,20 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 400 的 message key `type and model are required` 已登记进 7 个前端语言包（与 `Invalid parameters` 同口径）。
 
 `testChannel()` 签名未变，既有两个调用点（`TestChannel` 与 `testChannelForHealthCheck`）零改动。
+
+**渠道测试的记账口径**：预览态、已保存态、定时健康检查现在走同一条路径——照实记账，恒不计价。
+
+- 写 `logs` 与 `quota_data`，`quota` 恒为 0，钱包不动（改造前预览态不写日志，已保存态按网关
+  定价写一个**假金额**，定时健康检查每轮都把这个假金额累进 `quota_data`）。
+- `prompt_tokens` / `completion_tokens` / `cache_tokens` 照实写；缓存写入写两个 key，
+  日志详情读 `cache_creation_tokens`、`quota_data` 读 `cache_write_tokens`。
+- `other.billing_exempt = true`，管理端前端（`token-master`）据此把金额列渲染成 `—` 而不是 ￥0；
+  本仓库前端不渲染日志，这条标记只对 BFF / 前端生效。
+- 不写 `token_name`：测试没有使用任何用户密钥，写死 `Model test` 会让「密钥用途」列凭空多出一种用途。
+- 预览态（`Id == 0`）`channel_id` 记 0、`channel_name` 快照留空，日志页渠道列显示 `—`。
+- 测试路径上的 `ModelPriceHelper` 已删除：未配价模型会让「连通性测试」因与连通性无关的原因失败，
+  查不到价时还会返回写死的 37.5 兜底倍率（`SelfUseModeEnabled`）。
+- 历史行不回填：改造前已保存渠道的测试行仍带真实 `quota`，在用量统计里继续显示金额。
 
 ### 九、供应关系优先级（`abilities.priority` 参与选路）
 
@@ -703,14 +716,14 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 118 个文件（67 个上游文件被改、51 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +10673/−262，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+共 120 个文件（69 个上游文件被改、51 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +10774/−376，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
 （定稿修复把分支新增的 `service/relay_error_fallback.go` 并回 `service/relay_error.go` 并删除，
 故新增数比本分支初版少 1。）
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。67 个被改文件里有 9 个是 `web/`、4 个不是功能
+> 那不是定制，不计入上面的文件数。69 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**
@@ -727,10 +740,10 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `service/security_verification.go` | 新增 1 个 proof scope 常量，白名单与「要求表」各加 1 项 | 低 |
 | `router/channel-router.go` | 权限路由表插入两条：`PUT /ability/priority`（`ChannelWrite`）与 `POST /test`（`ChannelSensitiveWrite`，1 处 `[FORK]`） | 低，单行 |
 | `router/channel_router_test.go` | 同上两条路由的权限断言 | 低 |
-| `controller/channel-test.go` | `testChannel()` 按 `channel.Id == 0` 跳过定价校验与结算/消费日志、错误日志脱敏，`TestChannel` 回前端前脱敏（5 处 `[FORK]`） | 中，逐模型测试热路径 |
+| `controller/channel-test.go` | `testChannel()` 预览态 / 已保存态都不做定价校验、照实记账但 `quota` 恒为 0、错误日志脱敏，`TestChannel` 回前端前脱敏（4 处 `[FORK]`） | 中，逐模型测试热路径 |
 | `controller/channel.go` | `FetchModels` 的取 key 逻辑改为调 `credentialKeyFor`（1 处 `[FORK]`） | 低，单行 |
 | `service/channel.go` | `ShouldDisableChannel` 的 `channel:*` 分支改为只放行秘钥两类，配置类错误直接判否、不再落到状态码 / 关键词判据（2 处 `[FORK]`，见「十三」） | 中，自动停用的唯一判据 |
-| `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态用例（跳过定价/消费日志、日志脱敏） | 低 |
+| `controller/channel_test_internal_test.go` | 补 `testChannel()` 预览态 / 已保存态用例（记账口径、`billing_exempt`、日志脱敏） | 低 |
 | `service/access_token_scope.go` | proof scope → PAT scope 表新增 `admin.user.password.batch_reset` → `user:write` | 低 |
 | `middleware/access_token_routes.go` | PAT 路由规则新增 `POST /api/user/batch/reset_password` → `user:write`、`GET /api/models/tags` → `model:read` | 低 |
 | `model/main.go` | `migrateDB()` 开头调 goose 迁移；AutoMigrate 列表**移除** `&Department{}` | 低 |
@@ -825,7 +838,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 // [FORK] <一句话说明为什么这块和上游不同>
 ```
 
-当前共 217 处、69 个文件：
+当前共 216 处、69 个文件：
 
 | 文件 | 处数 |
 |---|---|
@@ -835,7 +848,7 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `model/channel_ability_fork.go` | 9 |
 | `model/channel_ability_fork_test.go` | 7 |
 | `service/security_verification.go` | 7 |
-| `controller/channel-test.go` | 6 |
+| `controller/channel-test.go` | 4 |
 | `controller/department_fork.go` | 6 |
 | `model/department_fork.go` | 6 |
 | `model/user_last_called_fork_test.go` | 6 |
@@ -870,7 +883,8 @@ git 会报 `add/add` 冲突——这是唯一需要留意的情形。
 | `service/channel_select.go` | 3 |
 | `service/relay_error.go` | 3 |
 | `service/security_verification_fork.go` | 2 |
-| `common/random_password_fork.go`、`controller/channel.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/helper/price.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_disable_fork_test.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
+| `controller/channel.go` | 2 |
+| `common/random_password_fork.go`、`controller/channel_test_fork.go`、`controller/department_usage_fork.go`、`controller/model_tag_fork.go`、`controller/security_enrollment_test.go`、`controller/user_batch_password_reset_fork.go`、`controller/user_management_fork.go`、`controller/user_unified_update_fork_test.go`、`migrations/embed.go`、`model/goose_fork.go`、`model/main.go`、`model/model_tag_fork.go`、`model/redemption.go`、`model/user_batch_password_fork.go`、`model/user_cache.go`、`model/user_department_fork_test.go`、`model/user_phone_fork.go`、`relay/helper/price.go`、`relay/responses_websocket.go`、`service/access_token_scope.go`、`service/channel_disable_fork_test.go`、`service/channel_key_fingerprint_fork.go`、`service/error.go`、`service/log_info_generate.go`、`service/security_verification_batch_password_fork.go`、`service/task_billing.go`、`service/violation_fee.go` | 各 1 |
 
 ```bash
 grep -rn "\[FORK\]" --include="*.go" .
