@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -156,4 +157,130 @@ func TestAppendRelayLogAdminInfoFingerprintOnSingleKeyChannel(t *testing.T) {
 	assert.Equal(t, "9f431373b2e17fc0", adminInfo["channel_key_fp"])
 	_, hasIndex := adminInfo["multi_key_index"]
 	assert.False(t, hasIndex, "单密钥渠道上游不写 multi_key_index")
+}
+
+// ---------------------------------------------------------------------------
+// channel_key_masked：删除密钥后历史日志的归属快照
+// ---------------------------------------------------------------------------
+
+// 掩码与指纹同源同一次写：只写指纹的话，密钥一删历史行就再也算不出掩码。
+func TestAppendChannelKeyFingerprintRecordsMaskedSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+	ctx.Set(string(constant.ContextKeyChannelKey), "sk-abcdefghijklmnopqrstuvwxyz")
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "sk-a**********wxyz", adminInfo["channel_key_masked"])
+}
+
+// 达到阈值才落 MaskTokenKey 口径（前 4 + 10 星 + 后 4）：16 位正好是边界。
+// 这条串只被展示、不参与匹配，因此不需要与 BFF 的 maskTokenKey 逐字一致。
+func TestChannelKeyMaskedSnapshotVectors(t *testing.T) {
+	cases := []struct{ name, key, want string }{
+		{"阈值边界 16 位", "abcdefghijklmnop", "abcd**********mnop"},
+		{"常见长度", "sk-abcdefghijklmnopqrstuvwxyz", "sk-a**********wxyz"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			ctx, _ := gin.CreateTestContext(nil)
+			ctx.Set(string(constant.ContextKeyChannelKey), c.key)
+
+			other := model.NewLogOther()
+			AppendChannelKeyFingerprint(ctx, other)
+
+			adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, c.want, adminInfo["channel_key_masked"])
+		})
+	}
+}
+
+// 短钥不得露出任何原文：9–13 位在 MaskTokenKey 下首尾重叠（9 位只藏 1 位），而 admin_info
+// 对 role >= 10 可见并随 `/api/log/export` 批量导出。这里按「露出字符数」断言上限，
+// 不能用「露出位数 < 原文长度」—— 那个条件对 9 位钥仍然成立，抓不到这个暴露面。
+func TestAppendChannelKeyFingerprintDoesNotRevealShortKeys(t *testing.T) {
+	const maxRevealedChars = 0
+	cases := []struct{ name, key string }{
+		{"1 位", "a"},
+		{"4 位", "abcd"},
+		{"8 位不留片段", "abcdefgh"},
+		{"9 位重叠区", "abcdefghi"},
+		{"12 位重叠区", "abcdefghijkl"},
+		{"13 位重叠区", "abcdefghijklm"},
+		{"15 位阈值之下", "abcdefghijklmno"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			ctx, _ := gin.CreateTestContext(nil)
+			ctx.Set(string(constant.ContextKeyChannelKey), c.key)
+
+			other := model.NewLogOther()
+			AppendChannelKeyFingerprint(ctx, other)
+
+			adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+			require.True(t, ok)
+			masked, ok := adminInfo["channel_key_masked"].(string)
+			require.True(t, ok)
+			assert.Equal(t, "***", masked, "短钥只落全星占位")
+			revealed := len(masked) - strings.Count(masked, "*")
+			assert.LessOrEqual(t, revealed, maxRevealedChars, "短钥快照露出 %d 个原文片段：%q", revealed, masked)
+			assert.NotContains(t, masked, c.key[:1], "短钥不得露出任何原文片段")
+		})
+	}
+}
+
+// 插件托管的 credential 行同样只落脱敏串，不因为它是 JSON 就原样落库。
+func TestAppendChannelKeyFingerprintMasksPluginCredential(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+	line := `{"type":"plugin_credential","plugin":"veo","token":"super-secret-oauth-token"}`
+	ctx.Set(string(constant.ContextKeyChannelKey), line)
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	masked, ok := adminInfo["channel_key_masked"].(string)
+	require.True(t, ok, "插件托管的 credential 行也必须写掩码字段")
+	require.NotEmpty(t, masked)
+	assert.NotEqual(t, line, masked)
+	assert.NotContains(t, masked, "super-secret-oauth-token", "插件凭据的令牌不得进入日志")
+}
+
+// 没有 key 时两个字段都不写，保持「无值即缺字段」——不要写空串，BFF 用 `?? ` 会当成有值。
+func TestAppendChannelKeyFingerprintOmitsMaskWithoutKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	adminInfo, _ := other.Snapshot()["admin_info"].(map[string]any)
+	_, hasMask := adminInfo["channel_key_masked"]
+	assert.False(t, hasMask)
+}
+
+// 掩码与指纹同作用域：都在 admin_info，不得漏进 public（public 对普通用户可见）。
+func TestChannelKeyMaskedStaysInAdminInfo(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(nil)
+	ctx.Set(string(constant.ContextKeyChannelKey), "sk-abcdefghijklmnopqrstuvwxyz")
+
+	other := model.NewLogOther()
+	AppendChannelKeyFingerprint(ctx, other)
+
+	snapshot := other.Snapshot()
+	_, inPublic := snapshot["channel_key_masked"]
+	assert.False(t, inPublic, "掩码不得出现在 public 顶层")
+	adminInfo, ok := snapshot["admin_info"].(map[string]any)
+	require.True(t, ok)
+	_, inAdmin := adminInfo["channel_key_masked"]
+	assert.True(t, inAdmin)
 }
