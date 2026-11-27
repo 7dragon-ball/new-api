@@ -177,39 +177,61 @@ func TestAppendChannelKeyFingerprintRecordsMaskedSnapshot(t *testing.T) {
 	assert.Equal(t, "sk-a**********wxyz", adminInfo["channel_key_masked"])
 }
 
-// 掩码快照与 BFF 的 maskTokenKey（packages/shared/src/mask.ts）必须逐字一致：
-// 两侧口径分叉会让「已删除」判定永远不成立（BFF 拿快照比对不上自己算的掩码）。
-// 这些向量与 BFF 的 mask 单测是同一张表，改口径时两边同时改。
+// 达到阈值才落 MaskTokenKey 口径（前 4 + 10 星 + 后 4）：16 位正好是边界。
+// 这条串只被展示、不参与匹配，因此不需要与 BFF 的 maskTokenKey 逐字一致。
 func TestChannelKeyMaskedSnapshotVectors(t *testing.T) {
 	cases := []struct{ name, key, want string }{
-		{"1 位全星", "a", "*"},
-		{"4 位全星", "abcd", "****"},
-		{"5 位留前 2 后 2", "abcde", "ab****de"},
-		{"8 位留前 2 后 2", "abcdefgh", "ab****gh"},
-		{"9 位留前 4 后 4", "abcdefghi", "abcd**********fghi"},
+		{"阈值边界 16 位", "abcdefghijklmnop", "abcd**********mnop"},
 		{"常见长度", "sk-abcdefghijklmnopqrstuvwxyz", "sk-a**********wxyz"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.want, model.MaskTokenKey(c.key))
+			gin.SetMode(gin.TestMode)
+			ctx, _ := gin.CreateTestContext(nil)
+			ctx.Set(string(constant.ContextKeyChannelKey), c.key)
+
+			other := model.NewLogOther()
+			AppendChannelKeyFingerprint(ctx, other)
+
+			adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, c.want, adminInfo["channel_key_masked"])
 		})
 	}
 }
 
-// 快照绝不落明文：拿整串去比对，任何长度都不允许相等。
-// 用「露出位数 < 原文长度」而不是 `masked != key`：10–14 位的串若改用「前 10 后 4」
-// 口径，前后缀会重叠、逐位可还原，但字符序列与原文不同，`!=` 抓不住。
-func TestChannelKeyMaskedSnapshotNeverEqualsPlaintext(t *testing.T) {
-	for _, key := range []string{
-		"sk-abcdefghijklmnopqrstuvwxyz",
-		"abcdefghij",   // 10 位：重叠口径的临界长度
-		"abcdefghijkl", // 12 位
-		"short",
-	} {
-		masked := model.MaskTokenKey(key)
-		assert.NotEqual(t, key, masked, "掩码不得等于原文")
-		revealed := strings.Count(masked, "*")
-		assert.Less(t, len(masked)-revealed, len(key), "露出位数必须少于原文长度（%q → %q）", key, masked)
+// 短钥不得露出任何原文：9–13 位在 MaskTokenKey 下首尾重叠（9 位只藏 1 位），而 admin_info
+// 对 role >= 10 可见并随 `/api/log/export` 批量导出。这里按「露出字符数」断言上限，
+// 不能用「露出位数 < 原文长度」—— 那个条件对 9 位钥仍然成立，抓不到这个暴露面。
+func TestAppendChannelKeyFingerprintDoesNotRevealShortKeys(t *testing.T) {
+	const maxRevealedChars = 0
+	cases := []struct{ name, key string }{
+		{"1 位", "a"},
+		{"4 位", "abcd"},
+		{"8 位不留片段", "abcdefgh"},
+		{"9 位重叠区", "abcdefghi"},
+		{"12 位重叠区", "abcdefghijkl"},
+		{"13 位重叠区", "abcdefghijklm"},
+		{"15 位阈值之下", "abcdefghijklmno"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			ctx, _ := gin.CreateTestContext(nil)
+			ctx.Set(string(constant.ContextKeyChannelKey), c.key)
+
+			other := model.NewLogOther()
+			AppendChannelKeyFingerprint(ctx, other)
+
+			adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+			require.True(t, ok)
+			masked, ok := adminInfo["channel_key_masked"].(string)
+			require.True(t, ok)
+			assert.Equal(t, "***", masked, "短钥只落全星占位")
+			revealed := len(masked) - strings.Count(masked, "*")
+			assert.LessOrEqual(t, revealed, maxRevealedChars, "短钥快照露出 %d 个原文片段：%q", revealed, masked)
+			assert.NotContains(t, masked, c.key[:1], "短钥不得露出任何原文片段")
+		})
 	}
 }
 

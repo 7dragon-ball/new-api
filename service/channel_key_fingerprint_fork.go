@@ -33,6 +33,16 @@ func ChannelKeyFingerprint(key string) string {
 	return hex.EncodeToString(common.Sha256Raw([]byte(key)))[:16]
 }
 
+// 快照的短钥阈值：len(key) 低于此值时只落全星占位，不露任何原文片段。
+// MaskTokenKey 在 9–13 位首尾重叠（9 位只藏 1 位），而这条串会进 admin_info，
+// 对 role >= 10 可见并随 `/api/log/export` 批量导出，短钥接近可还原。
+// 取 16 位：达到阈值时最多露 8 个字符（一半），40+ 位的真实上游钥约 1/5。
+const channelKeyMaskedMinLen = 16
+
+// channelKeyMaskedPlaceholder 是短钥的快照值。它不是 MaskTokenKey 的输出
+// （后者对 ≥ channelKeyMaskedMinLen 的钥至少 18 字符），BFF 据此显示「已删除的短钥」。
+const channelKeyMaskedPlaceholder = "***"
+
 // AppendChannelKeyFingerprint 把日志写入时刻实际使用的密钥指纹与脱敏串记进 admin_info。
 //
 // 取 ContextKeyChannelKey 而不是 GetNextEnabledKey 的返回值：插件类渠道会在选定后
@@ -58,26 +68,32 @@ func ChannelKeyFingerprint(key string) string {
 //
 // 只存脱敏串、不存明文：`admin_info` 对 role >= 10 可见（model/log_other.go 的
 // formatLogOtherJSON 只剥离 root_info），而 `GET /api/log/` 与 `/api/log/export`
-// 都只挂 AdminAuth，落明文等于给运营开一条批量导出全站密钥的后门。脱敏口径与 BFF
-// 的 maskTokenKey / Go 的 MaskTokenKey 三方一致（前 4 + 10 星 + 后 4），不可逆，
+// 都只挂 AdminAuth，落明文等于给运营开一条批量导出全站密钥的后门。脱敏串不可逆，
 // 也答不了「把这把钥复制去排障」。
 //
-// 插件托管的 credential 行照常打码：MaskTokenKey 只露首尾各 4 字节，对
-// `{"type":"plugin_credential",...}` 这类 JSON 只露出结构字符，与日志列表侧现行口径相同。
+// 快照**只被展示**，不参与归属判定：判「已删除」只看字段是否存在，指纹命中时 BFF 用的是
+// 候选自己算出的掩码。所以这条串的格式是本仓库内部的展示口径，不需要与 BFF 的
+// maskTokenKey 逐字一致 —— 前 4 + 后 4 不唯一，一旦拿它当匹配键，就会以更粗的粒度复现
+// 这里要修的张冠李戴。
 //
-// 两处约束（有意接受，勿顺手改）：
-//   - 脱敏串只用于「指纹未命中时说明这一行是哪把钥、是否已删除」，**不得**当作匹配键：
-//     前 4 + 后 4 不唯一，两把钥同首同尾时会以更粗的粒度复现这里要修的张冠李戴。
-//   - MaskTokenKey 在 9–13 位时首尾重叠（9 位只藏 1 位），而 admin_info 对 role >= 10 可见、
-//     并随 /api/log/export 批量导出，短钥落进日志接近可还原。40+ 位的真实上游钥不受影响；
-//     收紧口径会同时破坏与 BFF maskTokenKey 的逐字一致（两侧比对即失效），故只记录不改。
+// 短钥不落首尾片段：MaskTokenKey 在 9–13 位时首尾重叠（9 位只藏 1 位），而 admin_info 对
+// role >= 10 可见、并随 `/api/log/export` 批量导出 —— 一条 9 位钥落进日志接近可还原。
+// 因此 len(key) < channelKeyMaskedMinLen 只写全星占位，不写任何原文片段；展示上退化成
+// 「已删除，且是短钥」。≥ 阈值的钥最多露 8 个字符（16 位时占一半，40+ 位的真实上游钥约
+// 1/5），这条残余暴露是有意接受的已知风险，不是不可改的口径。
+//
+// 插件托管的 credential 行是整行 JSON，长度远超阈值，落的是整行的前 4 + 后 4。
 func AppendChannelKeyFingerprint(ctx *gin.Context, other *model.LogOther) {
 	if ctx == nil || other == nil {
 		return
 	}
 	key := common.GetContextKeyString(ctx, constant.ContextKeyChannelKey)
 	if fp := ChannelKeyFingerprint(key); fp != "" {
+		masked := channelKeyMaskedPlaceholder
+		if len(key) >= channelKeyMaskedMinLen {
+			masked = model.MaskTokenKey(key)
+		}
 		other.SetAdmin("channel_key_fp", fp)
-		other.SetAdmin("channel_key_masked", model.MaskTokenKey(key))
+		other.SetAdmin("channel_key_masked", masked)
 	}
 }

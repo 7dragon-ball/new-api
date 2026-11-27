@@ -250,9 +250,9 @@ if fp := service.ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.
 的指纹在库里再也对不上任何候选，BFF 只能回落 `multi_key_index` —— 而删除让下标前移，历史行
 会显示成**另一把仍在的密钥**，`/reveal` 还会把那一把的真明文下发。张冠李戴比空着更糟。
 
-做法：在与 `channel_key_fp` 同一次写入里，多写 `other.admin_info.channel_key_masked =
-model.MaskTokenKey(key)`，即同一把钥的脱敏串（≤4 全星、≤8 前 2 后 2、更长前 4 + 10 星 + 后 4）。
-两个字段同源同一次写，不会出现「有指纹没掩码」。
+做法：在与 `channel_key_fp` 同一次写入里，多写 `other.admin_info.channel_key_masked`：
+`len(key) >= 16` 取 `model.MaskTokenKey(key)`（前 4 + 10 星 + 后 4），更短的钥只写全星占位
+`***`，不写任何原文片段。两个字段同源同一次写，不会出现「有指纹没掩码」。
 
 **只落脱敏串，不落明文**：`admin_info` 对 role >= 10 可见（`model/log_other.go` 的
 `formatLogOtherJSON` 在 admin 视图只剥 `root_info`），而 `GET /api/log/` 与 `/api/log/export`
@@ -265,13 +265,19 @@ model.MaskTokenKey(key)`，即同一把钥的脱敏串（≤4 全星、≤8 前 
 - **快照只用于展示，不得当作匹配键。** 前 4 + 后 4 不唯一，两把钥同首同尾时会以更粗的粒度
   复现同一个张冠李戴。归属判定只认 `channel_key_fp`；`channel_key_masked` 只回答「指纹未命中
   时这一行是哪把钥、是否已删除」。
-- **短钥的暴露面是有意接受的代价。** `MaskTokenKey` 在 9–13 位首尾重叠（9 位只藏 1 位），而
-  `admin_info` 对 role >= 10 可见并随导出批量导出，短钥落进日志接近可还原。真实上游钥 40+ 位
-  不受影响。收紧口径会同时破坏与 BFF `maskTokenKey` 的逐字一致（比对即失效），故不改，只记录。
+- **短钥只落全星占位。** `MaskTokenKey` 在 9–13 位首尾重叠（9 位只藏 1 位），而 `admin_info`
+  对 role >= 10 可见并随 `/api/log/export` 批量导出 —— 一条 9 位钥落进日志接近可还原。阈值取
+  16 位：达到阈值最多露 8 个字符（16 位占一半，40+ 位的真实上游钥约 1/5），低于阈值不露任何
+  原文片段，展示上退化成「已删除，且是短钥」。
 
-脱敏口径必须与 BFF 的 `maskTokenKey`（`packages/shared/src/mask.ts`）逐字一致，两侧各有一张
-同源向量表互相指向：Go 侧在 `channel_key_fingerprint_fork_test.go`，BFF 侧在
-`logs.service.spec.ts`。改口径要两边同时改。
+**快照不需要与 BFF 的 `maskTokenKey` 逐字一致。** 判「已删除」只看字段是否存在；指纹命中时
+BFF 用的是候选自己算出的掩码。这条串的格式是本仓库内部的展示口径，不是跨仓库契约 —— 之前的
+设计把它写成「必须与 `maskTokenKey` 一致，否则 BFF 比对不上」，与「快照不参与匹配」自相矛盾，
+已按本节更正。BFF 只需照原样展示 `channel_key_masked`，不要把 `***` 与候选掩码做比较。
+
+阈值以上 8 个字符的残余暴露是有意接受的**已知风险**（可由安全负责人推翻重定），不是「不可改
+的口径约束」：`model.MaskTokenKey` 同时服务 `/api/token/` 列表展示，所以 fork 侧的保护做在
+`AppendChannelKeyFingerprint` 里，而不是改全局函数。
 
 ## BFF 改动（token-master）
 
@@ -363,8 +369,8 @@ pnpm test && pnpm typecheck
    → 取指纹那一把；多密钥渠道 + 缺序号 + 有指纹 → 取指纹那一把（不再返回拼接串）。
 7. 单密钥渠道 key 含换行 + 有指纹 → 返回整条，不截断成第一行。
 8. 删除后的归属：指纹在候选里命中 → 取命中那把（即使有快照）；指纹未命中 + 有快照 → 掩码
-   等于快照、`/reveal` 返回空，**不得**回落序号取另一把；两个都没有的老日志 → 行为与改动前
-   逐字一致。掩码快照的向量表与 Go 侧同源（`maskTokenKey`）。
+   等于快照（原样展示，不与候选掩码比较）、`/reveal` 返回空，**不得**回落序号取另一把；两个都
+   没有的老日志 → 行为与改动前逐字一致。短钥快照是 `***`，展示即可，不需要特殊分支。
 
 ## 风险
 
@@ -374,5 +380,6 @@ pnpm test && pnpm typecheck
 | 先发 BFF | 静默空结果 | 发布顺序写进本节与 worklog |
 | 插件渠道取到刷新前的 key | 该渠道检索全空 | 取 `ContextKeyChannelKey`；用例 3 专门锁住 |
 | 把 `channel_key_masked` 当匹配键 | 同首同尾的两把钥互相顶替，等于没修 | 快照只做展示；归属判定只认 `channel_key_fp` |
+| 阈值以上仍露 8 个字符 | 16 位钥露一半；短钥已由占位兜住 | 已知风险，可由安全负责人推翻重定 |
 | 多密钥渠道缺序号的老日志 | 掩码与 reveal 给出拼接串 | 新日志靠指纹回填已修好；老日志不回填，属已接受缺口 |
 | `docs/页面能力盘点.md` 的旧口径 | 文档说「按 (channel_id, 序号) 下推」 | 改 BFF 时同步更新该段 |
