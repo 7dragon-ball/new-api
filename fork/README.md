@@ -228,9 +228,13 @@ Phone *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:
 
 **哈希输入不做任何规范化**，连 trim 都不做。两侧输入本来就同源（都是 `channels.key` 里那一行的字节），而 Go 的 `strings.TrimSpace` 与 JS 的 `trim()` 覆盖的字符集不同——U+FEFF 对 JS 是空白、对 Go 不是，U+0085 反过来。加 strip 只会制造两侧永远对不上的指纹，表现是「按密钥搜不到」。
 
-**已知缺口**：升级前的日志没有该字段；JSON 数组形式的渠道密钥（Vertex 等服务账号）不参与反查；任务退款/差额结算日志（`RecordTaskBillingLog`）只有 `context.Context`，不带指纹。详见 `fork/design-channel-key-fingerprint.md`。
+**删除密钥后的归属**：同一次写入里再多落 `other.admin_info.channel_key_masked = MaskTokenKey(key)`（前 4 + 10 星 + 后 4）。渠道密钥是硬删除，密钥一删指纹在库里就再也对不上任何候选，BFF 只能回落 `multi_key_index`，而删除会让下标前移 —— 历史行会显示成**另一把仍在的密钥**，`/reveal` 还会下发那一把的真明文。快照不可逆，只回答「当时是哪把、现在还在不在」，答不了「复制去排障」。
 
-**发布顺序**：先发含此改动的新 API 镜像，再发按指纹搜索的 BFF。反过来的表现是「按密钥搜永远空页」，不报错。
+只落脱敏串不落明文：`admin_info` 对 role >= 10 可见，`GET /api/log/` 与 `/api/log/export` 都只挂 `AdminAuth`；落明文等于给运营开一条批量导出全站密钥的后门。两条约束：快照**只做展示**，归属判定仍只认 `channel_key_fp`（前 4 + 后 4 不唯一，当匹配键用会以更粗的粒度复现同一个张冠李戴）；短钥（9–13 位时 `MaskTokenKey` 首尾重叠）的暴露面是有意接受的代价，真实上游钥 40+ 位不受影响，收紧口径会破坏与 BFF `maskTokenKey` 的逐字一致。
+
+**已知缺口**：删除密钥后按该钥明文搜不到（指纹没有可比对象，只能靠快照展示）；升级前的日志没有这两个字段；JSON 数组形式的渠道密钥（Vertex 等服务账号）不参与反查；任务退款/差额结算日志（`RecordTaskBillingLog`）只有 `context.Context`，不带指纹。详见 `fork/design-channel-key-fingerprint.md`。
+
+**发布顺序**：先发含此改动的新 API 镜像，再发按指纹搜索、按快照判定「已删除」的 BFF（两个字段同一批写入，BFF 读之前只是多落几个字节）。反过来的表现是「按密钥搜永远空页」，不报错。
 
 ### 六、批量重置用户密码
 

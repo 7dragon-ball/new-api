@@ -38,6 +38,7 @@ id 要动存储模型与上游前端，每次 merge 都要付冲突成本。哈�
 | 取哪个 key | **`ContextKeyChannelKey`**（日志写入时刻的值） | 见下节。 |
 | 存储位置 | `other.admin_info.channel_key_fp` | `admin_info` 由 `formatLogOtherJSON` 对普通用户整体剥离（`model/log_other.go:246-258`），天然只对管理员可见，与 `multi_key_index` 同作用域。 |
 | JSON 数组 key | 不纳入 | BFF 侧要逐字节对齐数组元素的原始文本，得新写一个原文扫描器；这类渠道的 key 是凭证 JSON，不是运维会拿来搜的形态。 |
+| 密钥被删除后的归属 | 同一次写入再落一条脱敏串快照 `channel_key_masked` | 硬删除后指纹在库里对不上任何候选，回落序号会指向另一把（并下发它的明文）；快照不可逆，只答「当时是哪把、还在不在」。详见「5. 删除密钥后的归属快照」。 |
 | 任务结算/退款日志 | 接受漏 | 这些路径只有 `context.Context`，没有 `gin.Context`。`Task.PrivateData` 里已为插件任务存了原始密钥（`model/task.go` 的 `Key` 字段），理论上可在提交时算出指纹一并持久化、结算时再写出；但退款与差额结算不是「这次调用用了哪把钥匙」的记录，且要改动 Task 模型的写入路径，成本与收益不成比例，故不做。 |
 
 ## 关键事实（已核对代码）
@@ -128,13 +129,20 @@ fingerprint(key) = hex(sha256(key))[:16]
 1. 渠道无 key → null
 2. 有指纹，且 sha256(整条 key) == 指纹 → 整条 key（单密钥渠道）
 3. 有指纹，在换行拆出的行里匹配 → 那一把（多密钥渠道）
-4. 无指纹或都未命中 → 保持原有逻辑（keyIndex === null 返回整条 key，否则按序号取）
+4. 指纹未命中（或没有指纹）但有 channel_key_masked 快照 → 该钥已删除：
+   掩码显示快照本身，/reveal 返回空
+5. 既无指纹命中也无快照 → 保持原有逻辑（keyIndex === null 返回整条 key，否则按序号取）
 ```
 
 第 2 步先于第 3 步，保证单密钥渠道里带换行的凭证（Vertex service account）不被拆坏。
-JSON 数组渠道第 2、3 步都不命中，落回第 4 步。
+JSON 数组渠道第 2、3 步都不命中，落回第 4、5 步。
 
-**第 4 步必须与改动前逐字一致。** 单密钥渠道的日志本来就没有 `multi_key_index`，若把它改
+**第 4 步是「删除后张冠李戴」的修复点，不允许绕过**：硬删除让 `multi_key_index` 整体前移，
+继续按序号取会显示成另一把仍在的钥，`/reveal` 还会下发那一把的真明文。判「已删除」看的是
+「有没有快照」，**不是**「快照 == 某个候选的掩码」——后者是匹配，会以更粗的粒度复现同一个
+张冠李戴（见「5. 删除密钥后的归属快照」）。
+
+**第 5 步必须与改动前逐字一致。** 单密钥渠道的日志本来就没有 `multi_key_index`，若把它改
 成返回 `null`，所有老日志会从显示掩码变成 `—`——这是回归，不是「不管老日志」。
 「不管老日志」指的是不回填指纹，不是改变它们的现有展示。
 
@@ -146,6 +154,7 @@ JSON 数组渠道第 2、3 步都不命中，落回第 4 步。
 
 | 缺口 | 现象 | 原因 |
 |---|---|---|
+| 密钥被删除后 | 按该钥明文搜不到（指纹与库内候选自然对不上） | 指纹是「与库里那一行相比」的标识，键删了就没有可比对象。展示侧靠 `channel_key_masked` 快照仍能显示这把已删钥的掩码，见「5.」 |
 | 升级前的日志 | 按密钥明文搜不到 | 没有指纹字段，且不回填。展示侧也不回填，但仍走原有回落逻辑，显示不受影响 |
 | 升级前写入的多密钥渠道缺序号日志 | 掩码与 reveal 给出拼接串 | 没有指纹可回填；升级后新写入的日志已靠指纹修正 |
 | JSON 数组形式的渠道密钥（Vertex 等多密钥） | 该渠道日志按密钥搜不到 | 上游存的是 `json.RawMessage` 原文，BFF 现有 `splitChannelKeys` 会 `JSON.stringify` 重排；逐字节对齐需要新写原文扫描器 |
@@ -222,7 +231,7 @@ if fp := service.ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.
 
 | 文件 | 改动 | 类型 |
 |---|---|---|
-| `service/channel_key_fingerprint_fork.go` | 哈希 + 写 admin_info（**不做任何规范化**） | 新增 |
+| `service/channel_key_fingerprint_fork.go` | 哈希 + 写 admin_info（**不做任何规范化**），并同处落 `channel_key_masked` 快照 | 新增 |
 | `service/channel_key_fingerprint_fork_test.go` | 向量、写入路径与 WS 白名单测试 | 新增 |
 | `service/log_info_generate.go` | `AppendRelayLogAdminInfo` +1 处调用 | 改上游 |
 | `service/violation_fee.go` | +1 处调用 | 改上游 |
@@ -233,6 +242,36 @@ if fp := service.ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.
 上游其余文件零改动：无 `constant/`、无 `middleware/`、无 schema 迁移。注意
 `relay/responses_websocket.go` 是**本次唯一的 relay 侧改动**，且只是把内联切片提成
 包级变量（行为不变），目的是让「白名单必须含 `ContextKeyChannelKey`」这件事可被测试断言。
+
+### 5. 删除密钥后的归属快照（`channel_key_masked`）
+
+指纹只能与**库里现在还在的**候选比对。渠道密钥是硬删除（`channels` 无 `deleted_at`，多把钥只是
+`channels.key` 这一列文本里的行），`delete_key` 把那一行 splice 掉、下标整体前移，于是历史日志
+的指纹在库里再也对不上任何候选，BFF 只能回落 `multi_key_index` —— 而删除让下标前移，历史行
+会显示成**另一把仍在的密钥**，`/reveal` 还会把那一把的真明文下发。张冠李戴比空着更糟。
+
+做法：在与 `channel_key_fp` 同一次写入里，多写 `other.admin_info.channel_key_masked =
+model.MaskTokenKey(key)`，即同一把钥的脱敏串（≤4 全星、≤8 前 2 后 2、更长前 4 + 10 星 + 后 4）。
+两个字段同源同一次写，不会出现「有指纹没掩码」。
+
+**只落脱敏串，不落明文**：`admin_info` 对 role >= 10 可见（`model/log_other.go` 的
+`formatLogOtherJSON` 在 admin 视图只剥 `root_info`），而 `GET /api/log/` 与 `/api/log/export`
+都只挂 `AdminAuth`。落明文等于给运营开一条批量导出全站密钥的后门，绕过 BFF 的 `AdminGuard`
+（role === 100）与 200 条上限。作为对照，role >= 10 现在拿不到任何密钥片段：渠道列表与详情都
+`Omit("key")`，明文只走 `POST /api/channel/:id[/key]` 的 `RootAuth` + 二次验证。
+
+两条约束：
+
+- **快照只用于展示，不得当作匹配键。** 前 4 + 后 4 不唯一，两把钥同首同尾时会以更粗的粒度
+  复现同一个张冠李戴。归属判定只认 `channel_key_fp`；`channel_key_masked` 只回答「指纹未命中
+  时这一行是哪把钥、是否已删除」。
+- **短钥的暴露面是有意接受的代价。** `MaskTokenKey` 在 9–13 位首尾重叠（9 位只藏 1 位），而
+  `admin_info` 对 role >= 10 可见并随导出批量导出，短钥落进日志接近可还原。真实上游钥 40+ 位
+  不受影响。收紧口径会同时破坏与 BFF `maskTokenKey` 的逐字一致（比对即失效），故不改，只记录。
+
+脱敏口径必须与 BFF 的 `maskTokenKey`（`packages/shared/src/mask.ts`）逐字一致，两侧各有一张
+同源向量表互相指向：Go 侧在 `channel_key_fingerprint_fork_test.go`，BFF 侧在
+`logs.service.spec.ts`。改口径要两边同时改。
 
 ## BFF 改动（token-master）
 
@@ -258,7 +297,10 @@ if fp := service.ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.
 - `ROWS_SQL` 与 `RevealRawRow` 各加一列 `${CHANNEL_KEY_FP_TEXT} AS channel_key_fp`（文本，
   不走 `safeInt`）。
 - `AdminLogRow.upstream_key_index` 的语义不变，仍从 `multi_key_index` 读，供界面显示「Key N」。
-- `upstreamKeyOf(channel, keyIndex, fingerprint)`：按上节「展示侧也用指纹」的四步。
+- `upstreamKeyOf(channel, keyIndex, fingerprint, masked)`：按上节「展示侧也用指纹」的五步。
+  `ROWS_SQL` / `RevealRawRow` 再各加一列
+  `${OTHER_JSONB} -> 'admin_info' ->> 'channel_key_masked' AS channel_key_masked`，`/reveal`
+  在「已删除」时返回空并提示密钥已删除（不写审计以外的额外状态）。
 - 列表掩码与 `/reveal` 共用同一个 `upstreamKeyOf`，一处改完两处生效。
 
 **单密钥渠道的搜索语义（有意）**：以前只按 `channel_id` 筛，渠道换过钥匙后仍会命中所有历史
@@ -276,6 +318,9 @@ if fp := service.ChannelKeyFingerprint(common.GetContextKeyString(ctx, constant.
 反过来的后果是**静默空结果**：BFF 按 `channel_key_fp` 筛，库里一条都没有，界面表现为「查无
 此钥」，看起来像 bug 而不像功能未就绪。两版之间可以有任意长的观察期，期间上游只多写一个字
 段，BFF 仍按旧逻辑工作。
+
+`channel_key_masked` 与 `channel_key_fp` 同一批写入，BFF 在同一个版本里开始读；在读之前它只是
+多落一个字段，无行为影响。
 
 无数据库迁移：`logs.other` 是 text 列，加字段不需要 schema 变更，BFF 用 `OTHER_JSONB` 读。
 
@@ -317,6 +362,9 @@ pnpm test && pnpm typecheck
 6. 展示回填：多密钥渠道 + 日志有序号 → 取那一把；**有序号但指纹指向另一把**（密钥重排后）
    → 取指纹那一把；多密钥渠道 + 缺序号 + 有指纹 → 取指纹那一把（不再返回拼接串）。
 7. 单密钥渠道 key 含换行 + 有指纹 → 返回整条，不截断成第一行。
+8. 删除后的归属：指纹在候选里命中 → 取命中那把（即使有快照）；指纹未命中 + 有快照 → 掩码
+   等于快照、`/reveal` 返回空，**不得**回落序号取另一把；两个都没有的老日志 → 行为与改动前
+   逐字一致。掩码快照的向量表与 Go 侧同源（`maskTokenKey`）。
 
 ## 风险
 
@@ -325,5 +373,6 @@ pnpm test && pnpm typecheck
 | 两侧哈希输入漂移 | 搜索永远无结果，且看起来像「查无此钥」 | 不 trim，输入本就同源；共用测试向量，含 BOM/NEL 用例 |
 | 先发 BFF | 静默空结果 | 发布顺序写进本节与 worklog |
 | 插件渠道取到刷新前的 key | 该渠道检索全空 | 取 `ContextKeyChannelKey`；用例 3 专门锁住 |
+| 把 `channel_key_masked` 当匹配键 | 同首同尾的两把钥互相顶替，等于没修 | 快照只做展示；归属判定只认 `channel_key_fp` |
 | 多密钥渠道缺序号的老日志 | 掩码与 reveal 给出拼接串 | 新日志靠指纹回填已修好；老日志不回填，属已接受缺口 |
 | `docs/页面能力盘点.md` 的旧口径 | 文档说「按 (channel_id, 序号) 下推」 | 改 BFF 时同步更新该段 |

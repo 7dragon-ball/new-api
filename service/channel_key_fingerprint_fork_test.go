@@ -225,7 +225,9 @@ func TestAppendChannelKeyFingerprintMasksPluginCredential(t *testing.T) {
 
 	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
 	require.True(t, ok)
-	masked, _ := adminInfo["channel_key_masked"].(string)
+	masked, ok := adminInfo["channel_key_masked"].(string)
+	require.True(t, ok, "插件托管的 credential 行也必须写掩码字段")
+	require.NotEmpty(t, masked)
 	assert.NotEqual(t, line, masked)
 	assert.NotContains(t, masked, "super-secret-oauth-token", "插件凭据的令牌不得进入日志")
 }

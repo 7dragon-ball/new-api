@@ -63,7 +63,14 @@ func ChannelKeyFingerprint(key string) string {
 // 也答不了「把这把钥复制去排障」。
 //
 // 插件托管的 credential 行照常打码：MaskTokenKey 只露首尾各 4 字节，对
-// `{"type":"plugin_credential",...}` 这类 JSON 只露出结构字符，与列表侧现行口径相同。
+// `{"type":"plugin_credential",...}` 这类 JSON 只露出结构字符，与日志列表侧现行口径相同。
+//
+// 两处约束（有意接受，勿顺手改）：
+//   - 脱敏串只用于「指纹未命中时说明这一行是哪把钥、是否已删除」，**不得**当作匹配键：
+//     前 4 + 后 4 不唯一，两把钥同首同尾时会以更粗的粒度复现这里要修的张冠李戴。
+//   - MaskTokenKey 在 9–13 位时首尾重叠（9 位只藏 1 位），而 admin_info 对 role >= 10 可见、
+//     并随 /api/log/export 批量导出，短钥落进日志接近可还原。40+ 位的真实上游钥不受影响；
+//     收紧口径会同时破坏与 BFF maskTokenKey 的逐字一致（两侧比对即失效），故只记录不改。
 func AppendChannelKeyFingerprint(ctx *gin.Context, other *model.LogOther) {
 	if ctx == nil || other == nil {
 		return
