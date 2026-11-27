@@ -89,8 +89,11 @@ func Distribute() func(c *gin.Context) {
 				// 覆盖所有挂 Distribute 的 /v1/* 推理端点。只拦「显式下架」——目录里查不到该
 				// 模型的行不算下架，照旧放行（任务插件/未建档模型不受影响）。该分支位于
 				// !pinned && shouldSelectChannel 内，内部任务/插件钉渠道请求与「无可路由模型」
-				// 的轮询类请求天然豁免。目录查询失败时放行，避免把数据库故障当成用户配置问题。
-				if retired, err := model.IsModelRetiredCached(modelRequest.Model); err == nil && retired {
+				// 的轮询类请求天然豁免。目录查询失败时放行并打日志，避免把数据库故障当成用户
+				// 配置问题，也避免拦截静默失效。
+				if retired, err := model.IsModelRetiredCached(modelRequest.Model); err != nil {
+					common.SysError("model catalog lookup failed for " + modelRequest.Model + ": " + err.Error())
+				} else if retired {
 					abortWithI18nMessage(c, http.StatusServiceUnavailable, i18n.MsgDistributorModelNotListed, map[string]any{"Model": modelRequest.Model}, types.ErrorCodeModelNotListed)
 					return
 				}

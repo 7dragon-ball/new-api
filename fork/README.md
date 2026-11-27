@@ -626,17 +626,24 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   命中行且 `status != 1`」即返回 `503` + `model_not_listed`。只拦**显式下架**——目录里查不到该模型
   的行（含渠道里已有、还没建元数据的合成行）不算下架，照旧放行；内部任务 / 插件钉渠道的请求
   （`pinned`）天然豁免。
-- **内存快照**：`model/model_listing_cache_fork.go` 在启动与每次 `SyncTopicModels` 同步时重建
-  `listed` / `retired` 两张映射，`Distribute` 与 `modelFailureCode` 改走 `IsModelRetiredCached` /
+- **内存快照**：`model/model_listing_cache_fork.go` 在启动与每次 `SyncTopicModels` 同步时重建快照
+  （按规则类型分桶：一个 `exact` 映射 + 前缀/后缀/包含三组有序切片；`listed` / `retired` 由同一份
+  status 源派生），`Distribute` 与 `modelFailureCode` 改走 `IsModelRetiredCached` /
   `IsModelListedCached`；快照未就绪时回退到「十二」的库查询实现，行为不变。
+- **判定与归类同源**：库查询侧把 `IsModelRetired` 与 `IsModelListed` 收敛到同一个 resolver
+  （`resolvedCatalogStatus`，位于 `model/model_meta.go`），两者只在末端谓词（`status == 1` /
+  `status != 1`）上不同，避免查询与优先级各写一份而随时间漂移。
 - **对外契约变更声明**：此前「下架」只影响模型广场展示，不拦调用；一个 `status != 1` 但仍有可用
   渠道的模型过去能调用成功，现在一律 `503 model_not_listed`。这是有意的路由层收紧，使用方需知悉。
 
 改动：root `main.go`（启动预热 + `SyncTopicModels` 回调重建）、`middleware/distributor.go`
-（前置拦截块，`[FORK]` 共 4 处）、`service/channel_select.go`（`modelFailureCode` 改走缓存）、
-`router/relay_router_test.go`（回归用例），后端 `i18n/keys.go` 与 `i18n/locales/{en,zh-CN,zh-TW}.yaml`
-（新增 `distributor.model_not_listed` 文案键，配套「十二」引入的 `abortWithI18nMessage`）；新增
-`model/model_listing_cache_fork.go` 与 `model/model_listing_cache_fork_test.go`。
+（前置拦截块，`[FORK]` 共 4 处；目录查询失败放行并打日志）、`service/channel_select.go`
+（`modelFailureCode` 改走缓存）、`model/model_meta.go`（`IsModelListed` 与新增的 `IsModelRetired`
+收敛到 `resolvedCatalogStatus`）、`router/relay_router_test.go`（回归用例），后端 `i18n/keys.go` 与
+`i18n/locales/{en,zh-CN,zh-TW}.yaml`（新增 `distributor.model_not_listed` 文案键，配套「十二」引入的
+`abortWithI18nMessage`）；新增 `model/model_listing_cache_fork.go` 与
+`model/model_listing_cache_fork_test.go`（与 `model/model_meta_fork_test.go` 共用 dialect harness
+与 fixture，不重复）。
 
 > 本增量已随 `c65564832` 提交，已并入下面 `git diff 6ef123cd5..HEAD` 的统计。
 

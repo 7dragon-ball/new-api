@@ -411,8 +411,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 // It now reads the in-memory listing snapshot (IsModelListedCached) so this
 // failure code shares one source of truth with the pre-channel check in
 // Distribute, and this error path no longer issues an unbounded catalog read.
-// The snapshot may lag the database by up to one node-sync tick, which only
-// affects error-code classification, never routing.
+// The snapshot may lag the database by up to one node-sync tick, so both this
+// error-code classification and the pre-channel gate in Distribute follow the
+// snapshot rather than the live catalog.
 func modelFailureCode(modelName string) types.ErrorCode {
 	listed, err := model.IsModelListedCached(modelName)
 	if err != nil {

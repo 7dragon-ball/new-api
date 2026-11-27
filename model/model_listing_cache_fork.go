@@ -108,7 +108,8 @@ func InitModelListingCache() error {
 			// Unknown rule values never match, in either implementation.
 		}
 	}
-	// Copy-on-write: build off-lock, then publish the finished snapshot atomically.
+	// Publish atomically so readers never block on the rebuild; the build itself
+	// is serialized by modelListingReloadMu so concurrent reloads cannot interleave.
 	modelListingCatalogPtr.Store(catalog)
 	return nil
 }
@@ -128,21 +129,14 @@ func IsModelListedCached(modelName string) (bool, error) {
 // IsModelRetired reports whether modelName resolves to a catalog entry that is
 // explicitly disabled (status != 1). Unlike IsModelListed, a name with no
 // catalog entry is NOT retired: it was never curated, so callers keep their
-// previous behavior. Same query and precedence as IsModelListed.
+// previous behavior. It shares resolvedCatalogStatus, so its query and
+// precedence cannot drift from IsModelListed.
 func IsModelRetired(modelName string) (bool, error) {
-	if modelName == "" || DB == nil {
-		return false, nil
-	}
-	var records []Model
-	if err := DB.Model(&Model{}).
-		Select("model_name", "name_rule", "status").
-		Where("model_name = ? OR name_rule <> ?", modelName, NameRuleExact).
-		Order("id").
-		Find(&records).Error; err != nil {
+	status, ok, err := resolvedCatalogStatus(modelName)
+	if err != nil {
 		return false, err
 	}
-	policy := resolveModelMetadata(records, []string{modelName})[modelName]
-	return policy != nil && policy.Status != 1, nil
+	return ok && status != 1, nil
 }
 
 // IsModelRetiredCached is the snapshot-backed form of IsModelRetired, with the
