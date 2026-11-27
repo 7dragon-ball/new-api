@@ -684,6 +684,9 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   （按规则类型分桶：一个 `exact` 映射 + 前缀/后缀/包含三组有序切片；`listed` / `retired` 由同一份
   status 源派生），`Distribute` 与 `modelFailureCode` 改走 `IsModelRetiredCached` /
   `IsModelListedCached`；快照未就绪时回退到「十二」的库查询实现，行为不变。
+- **启动预热失败会重试**：启动预热失败时用 `service.SyncTopicLoadFailed(model.SyncTopicModels, err)`
+  把该 topic 标记为未加载（与 `main.go` 对 OAuth 的处理一致），首个 node-sync tick 会重跑
+  `InitModelListingCache`；重试成功前每个推理请求走库回退，快照不会被永久钉死在未就绪状态。
 - **判定与归类同源**：库查询侧把 `IsModelRetired` 与 `IsModelListed` 收敛到同一个 resolver
   （`resolvedCatalogStatus`，位于 `model/model_meta.go`），两者只在末端谓词（`status == 1` /
   `status != 1`）上不同，避免查询与优先级各写一份而随时间漂移。
@@ -750,7 +753,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 | 文件 | 改动 | 风险 |
 |---|---|---|
-| `main.go` | `[FORK]` 启动预热目录快照、`SyncTopicModels` 回调重建快照（见「十四」） | 低，纯新增调用 |
+| `main.go` | `[FORK]` 启动预热目录快照、`SyncTopicModels` 回调重建快照；预热失败标记未加载以触发首个 tick 重试（见「十四」） | 低，纯新增调用 |
 | `i18n/keys.go`、`i18n/locales/{en,zh-CN,zh-TW}.yaml` | 新增 `distributor.model_not_listed` 文案键（见「十四」） | 低 |
 | `model/user.go` | 不变量辅助函数、`UpdateWithTx`/`delete` 的守卫、`LastCalledAt` / `DepartmentId` / `Phone` 字段、三条扣费写入路径、`SearchUsers` 的筛选条件 | **最高**，前四组定制都改它 |
 | `controller/user.go` | `CreateUser` 允许 root 建 root、接受部门与手机号；`ManageUser` 删两处硬拒、新增两个 action、扩写 demote 分支；`SearchUsers` 加筛选 | **高** |

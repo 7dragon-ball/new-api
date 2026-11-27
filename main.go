@@ -112,12 +112,15 @@ func main() {
 	// endpoint inference can read cached route settings on first request.
 	model.GetPricing()
 
-	// [FORK] 预热模型目录内存快照，避免首个推理请求付一次数据库读；失败只告警。
-	// Warm the platform model catalog so the first inference request does not
-	// pay a database read. Failure only warns: the SyncTopicModels reload below,
-	// or the database fallback in IsModelListedCached, covers it.
+	// [FORK] 预热模型目录内存快照，避免首个推理请求付一次数据库读；失败时把该
+	// topic 标记为未加载，让首个 node-sync tick 重试，期间回退为逐请求库查询。
+	// Warm the platform model catalog so the first inference request does not pay
+	// a database read. On failure mark the topic unapplied so the first node-sync
+	// tick retries it; until then IsModelListedCached falls back to the database
+	// per request.
 	if err := model.InitModelListingCache(); err != nil {
 		common.SysError(common.LogText("InitModelListingCache failed: %s", err.Error()))
+		service.SyncTopicLoadFailed(model.SyncTopicModels, err)
 	}
 
 	// The first plugin sync finishes before the server accepts requests, so no
