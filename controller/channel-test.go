@@ -283,15 +283,6 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	info.IsChannelTest = true
 	info.InitChannelMeta(c)
 
-	err = attachTestBillingRequestInput(info, request)
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
-		}
-	}
-
 	err = helper.ModelMappedHelper(c, info, request)
 	if err != nil {
 		return testResult{
@@ -564,19 +555,6 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 }
 
-func attachTestBillingRequestInput(info *relaycommon.RelayInfo, request dto.Request) error {
-	if info == nil {
-		return nil
-	}
-
-	input, err := helper.BuildBillingExprRequestInputFromRequest(request, info.RequestHeaders)
-	if err != nil {
-		return err
-	}
-	info.BillingRequestInput = &input
-	return nil
-}
-
 // testLogOther 是渠道测试专用的日志附加信息。不调 GenerateTextOtherInfo —— 它会把
 // model_ratio / completion_ratio / model_price 一并写进 other，前端拆成本时会据此把
 // 0 金额拆出三段虚假的费用。
@@ -585,6 +563,13 @@ func testLogOther(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage)
 	other.SetPublic("billing_exempt", true)
 	if usage != nil {
 		other.SetPublic("cache_tokens", usage.PromptTokensDetails.CachedTokens)
+		// 缓存写入是上游账单里独立的一档（Claude 的 cache_creation_input_tokens），
+		// 不记就仍然对不上账。CacheCreationTokensTotal 已做「三者取 max」的归一化。
+		// 两个 key 的读者不同：日志详情读 cache_creation_tokens，quota_data 读 cache_write_tokens。
+		if creation := usage.PromptTokensDetails.CacheCreationTokensTotal(); creation > 0 {
+			other.SetPublic("cache_creation_tokens", creation)
+			other.SetPublic("cache_write_tokens", creation)
+		}
 	}
 	service.AppendRelayLogAdminInfo(c, info, other)
 	return other

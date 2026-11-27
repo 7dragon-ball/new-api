@@ -459,9 +459,12 @@ func TestTestLogOtherMarksBillingExempt(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
 	usage := &dto.Usage{
-		PromptTokens:        100,
-		CompletionTokens:    20,
-		PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 40},
+		PromptTokens:     100,
+		CompletionTokens: 20,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens:             40,
+			CacheCreationInputTokens: 30,
+		},
 	}
 
 	other := testLogOther(ctx, info, usage)
@@ -469,5 +472,9 @@ func TestTestLogOtherMarksBillingExempt(t *testing.T) {
 
 	require.Equal(t, true, fields["billing_exempt"], "渠道测试必须标记为不计价")
 	require.EqualValues(t, 40, fields["cache_tokens"], "缓存命中数要照实写进 other")
+	// 缓存写入是上游账单里独立的一档，日志详情读 cache_creation_tokens，
+	// quota_data 读 cache_write_tokens，两个都得写。
+	require.EqualValues(t, 30, fields["cache_creation_tokens"], "缓存写入数要照实写进 other")
+	require.EqualValues(t, 30, fields["cache_write_tokens"], "quota_data 从 cache_write_tokens 取缓存写入")
 	require.NotContains(t, fields, "model_ratio", "不计价就不该写倍率")
 }
