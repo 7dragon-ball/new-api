@@ -407,15 +407,15 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 // [FORK] 把「模型未上架」与「有模型但无可用渠道」分开归类，使用日志的调用状态才能区分。
 // modelFailureCode splits the "no channel for this model" outcome into
 // "model not listed" and "listed but no available channel", which the
-// management log tooltip reads from the recorded error code. The catalog read
-// only happens on this error path, after TokenAuth, on a failure that already
-// records a usage-log row, so it is not the dominant cost of that request.
-// IsModelListed deliberately issues no LIMIT: the rule precedence is resolved in
-// Go over the whole candidate set, so truncating it would change the verdict.
-// Bounding the read further would need an index on models.name_rule or a cached
-// catalog, both tracked as separate changes.
+// management log tooltip reads from the recorded error code.
+// It now reads the in-memory listing snapshot (IsModelListedCached) so this
+// failure code shares one source of truth with the pre-channel check in
+// Distribute, and this error path no longer issues an unbounded catalog read.
+// The snapshot may lag the database by up to one node-sync tick, so both this
+// error-code classification and the pre-channel gate in Distribute follow the
+// snapshot rather than the live catalog.
 func modelFailureCode(modelName string) types.ErrorCode {
-	listed, err := model.IsModelListed(modelName)
+	listed, err := model.IsModelListedCached(modelName)
 	if err != nil {
 		// 目录查询失败时不能断言「模型未上架」，否则会把数据库故障当成用户配置问题。
 		common.SysError("model catalog lookup failed for " + modelName + ": " + err.Error())

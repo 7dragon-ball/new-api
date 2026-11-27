@@ -75,16 +75,16 @@ func (mi *Model) MatchesName(name string) bool {
 }
 
 // [FORK] 选路失败要区分「模型未上架」与「无可用渠道」。
-// IsModelListed reports whether modelName resolves to an enabled entry in the
-// platform model catalog, using the same precedence as the public catalog
-// (resolveModelMetadata: exact, then prefix, suffix, contains). Soft-deleted
-// rows are excluded by the Model soft-delete scope. Because the winning rule
-// decides, a retired exact entry shadows a broader enabled rule, matching what
-// the catalog shows. Channel selection calls it at failure time to tell "model
-// not listed" from "no available channel" for the recorded error code; it runs
-// only on the error path. A lookup failure is returned instead of being folded
-// into "not listed", so a database fault is not reported as a user
-// configuration problem.
+// resolvedCatalogStatus resolves which catalog rule covers modelName, using the
+// same precedence as the public catalog (resolveModelMetadata: exact, then
+// prefix, suffix, contains), and returns the winning rule's status. ok is false
+// when no rule covers the name. Soft-deleted rows are excluded by the Model
+// soft-delete scope. Because the winning rule decides, a retired exact entry
+// shadows a broader enabled rule, matching what the catalog shows. This is the
+// single database source behind IsModelListed (and IsModelRetired in
+// model_listing_cache_fork.go), so their verdicts cannot drift apart. A lookup
+// failure is returned instead of being folded into "not listed", so a database
+// fault is not reported as a user configuration problem.
 //
 // The whole candidate set is deliberately read without a LIMIT: precedence is
 // resolved in Go, and the first row matching a pattern wins, so truncating the
@@ -92,9 +92,9 @@ func (mi *Model) MatchesName(name string) bool {
 // admin-curated catalog size and happens only after authentication, on a
 // failure that already records a usage-log row, so it is not the dominant cost
 // of that request.
-func IsModelListed(modelName string) (bool, error) {
+func resolvedCatalogStatus(modelName string) (int, bool, error) {
 	if modelName == "" || DB == nil {
-		return false, nil
+		return 0, false, nil
 	}
 	var records []Model
 	// The exact entry must win even when disabled, so keep disabled rows and
@@ -110,10 +110,24 @@ func IsModelListed(modelName string) (bool, error) {
 		// [FORK] 同一 NameRule 命中多行时按 id 取稳定的一行，避免上架判定随查询顺序抖动。
 		Order("id").
 		Find(&records).Error; err != nil {
-		return false, err
+		return 0, false, err
 	}
 	policy := resolveModelMetadata(records, []string{modelName})[modelName]
-	return policy != nil && policy.Status == 1, nil
+	if policy == nil {
+		return 0, false, nil
+	}
+	return policy.Status, true, nil
+}
+
+// IsModelListed reports whether modelName resolves to an enabled entry in the
+// platform model catalog. Channel selection calls it at failure time to tell
+// "model not listed" from "no available channel" for the recorded error code.
+func IsModelListed(modelName string) (bool, error) {
+	status, ok, err := resolvedCatalogStatus(modelName)
+	if err != nil {
+		return false, err
+	}
+	return ok && status == 1, nil
 }
 
 // resolveModelMetadata preserves catalog precedence: exact, prefix, suffix,
