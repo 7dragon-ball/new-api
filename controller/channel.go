@@ -582,6 +582,16 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 		return fmt.Errorf("channel cannot be empty")
 	}
 
+	// [FORK] 首尾空白在保存时清掉，不落库。上游拼请求是纯 `fmt.Sprintf(base, path)` +
+	// `http.NewRequest`，地址里带空格会让它在那里解析失败并只报 `do request failed`，
+	// 真正原因（invalid character " " in host name）用户看不到。管理端表单已拦，
+	// 这里兜底另外两种来源：别的客户端/脚本直接调接口，以及历史遗留值。
+	if channel.BaseURL != nil {
+		if trimmed := strings.TrimSpace(*channel.BaseURL); trimmed != *channel.BaseURL {
+			channel.BaseURL = &trimmed
+		}
+	}
+
 	// 校验 channel settings
 	if err := channel.ValidateSettings(); err != nil {
 		return common.NewMessage("Invalid channel settings format: {{error}}", map[string]any{"error": err.Error()})
