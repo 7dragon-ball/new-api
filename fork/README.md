@@ -232,7 +232,7 @@ Phone *string `json:"phone" gorm:"column:phone;uniqueIndex:uk_users_phone,where:
 
 只落脱敏串不落明文：`admin_info` 对 role >= 10 可见，`GET /api/log/` 与 `/api/log/export` 都只挂 `AdminAuth`；落明文等于给运营开一条批量导出全站密钥的后门。两条约束：快照**只做展示**，归属判定仍只认 `channel_key_fp`（前 4 + 后 4 不唯一，当匹配键用会以更粗的粒度复现同一个张冠李戴）；短钥只落全星占位（`MaskTokenKey` 在 9–13 位首尾重叠，9 位只藏 1 位，落进日志接近可还原）。快照**不需要**与 BFF 的 `maskTokenKey` 逐字一致 —— 判「已删除」只看字段是否存在。阈值以上 8 个字符的残余暴露是已知风险，fork 侧保护做在 `AppendChannelKeyFingerprint` 里而不是改全局 `MaskTokenKey`（它还服务 `/api/token/` 列表）。
 
-**已知缺口**：删除密钥后按该钥明文搜不到（指纹没有可比对象，只能靠快照展示）；升级前的日志没有这两个字段；JSON 数组形式的渠道密钥（Vertex 等服务账号）不参与反查；任务退款/差额结算日志（`RecordTaskBillingLog`）只有 `context.Context`，不带指纹。详见 `fork/design-channel-key-fingerprint.md`。
+**已知缺口**：删除密钥后按该钥明文搜不到（指纹没有可比对象，只能靠快照展示）；升级前的日志没有这两个字段；JSON 数组形式的渠道密钥（Vertex 等服务账号）不参与反查，并且**有快照的行也 reveal 不出明文**——上游算指纹/掩码用的是 `json.RawMessage` 原文，BFF 手里是重新 `stringify` 的紧凑形态，两者字节本来就不同，所以这类渠道只能用「序号越界」判已删除，不能用快照比对；任务退款/差额结算日志（`RecordTaskBillingLog`）只有 `context.Context`，不带指纹。详见 `fork/design-channel-key-fingerprint.md`。
 
 **发布顺序**：先发含此改动的新 API 镜像，再发按指纹搜索、按快照判定「已删除」的 BFF（两个字段同一批写入，BFF 读之前只是多落几个字节）。反过来的表现是「按密钥搜永远空页」，不报错。
 
