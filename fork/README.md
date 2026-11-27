@@ -616,7 +616,7 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `/sqlite`、`/postgres` PASS）。与上面「数据库」一节的「MySQL 不在运行范围」一致。
 - `relaykit` / `tokenkit` 独立构建：各自 `GOWORK=off go build ./...` 通过。
 
-### 十三、模型下架前置拦截与目录内存快照（`fork/feat/log-call-status-on-main`，未提交）
+### 十三、模型下架前置拦截与目录内存快照（`fork/feat/log-call-status-on-main`）
 
 「十二」把「模型未上架」写进了失败调用日志，但只在选渠道失败后才归类：一个已下架却仍挂着可用
 渠道的模型，请求依旧会成功。本次把下架判定**前移到选渠道之前**，并把目录判定搬进内存快照，
@@ -638,7 +638,7 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
 （新增 `distributor.model_not_listed` 文案键，配套「十二」引入的 `abortWithI18nMessage`）；新增
 `model/model_listing_cache_fork.go` 与 `model/model_listing_cache_fork_test.go`。
 
-> 本增量是工作区**未提交**改动，未并入下面 `git diff 6ef123cd5..HEAD` 的统计。
+> 本增量已随 `c65564832` 提交，已并入下面 `git diff 6ef123cd5..HEAD` 的统计。
 
 ## 数据库
 
@@ -673,16 +673,16 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 
 ## 改了哪些文件
 
-共 114 个文件（64 个上游文件被改、50 个新增；不含 `fork/` 目录与 `.github/`）。
-后端 `.go` / `.sql` 部分 +10302/−229，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
+共 123 个文件（71 个上游文件被改、52 个新增；不含 `fork/` 目录与 `.github/`）。
+后端 `.go` / `.sql` 部分 +10962/−262，`web/` 部分 +145/−0（都是 i18n 与类型联合）。
 （定稿修复把分支新增的 `service/relay_error_fallback.go` 并回 `service/relay_error.go` 并删除，
 故新增数比本分支初版少 1。）
 （「十三」增量触及 root `main.go`、`middleware/distributor.go`、`service/channel_select.go`、
-后端 `i18n/`、`router/relay_router_test.go`，并新增两个 `_fork` 文件；它尚未提交，不计入本统计。）
+后端 `i18n/`、`router/relay_router_test.go`，并新增两个 `_fork` 文件；已随 `c65564832` 提交，已计入本统计。）
 
 > 统计口径：`git diff --name-status 6ef123cd5..HEAD -- . ':(exclude)fork' ':(exclude).github'`。
 > 上游基线 `6ef123cd5` 之后还删了 6 个上游的 `.github/workflows/*.yml`、只留 `quay-publish.yml`，
-> 那不是定制，不计入上面的文件数。64 个被改文件里有 9 个是 `web/`、4 个不是功能
+> 那不是定制，不计入上面的文件数。71 个被改文件里有 9 个是 `web/`、4 个不是功能
 > 代码：`AGENTS.md`（写明部门表只支持 PG 的既定例外）、`docs/authentication.md`、`go.mod` / `go.sum`（依赖）。
 
 **上游文件（merge 时唯一可能冲突的地方）**

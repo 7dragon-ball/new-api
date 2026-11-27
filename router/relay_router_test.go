@@ -167,10 +167,11 @@ func TestRelayBlocksOnlyRetiredModels(t *testing.T) {
 	for _, testCase := range []struct {
 		modelName string
 		wantCode  string
+		wantText  string
 	}{
-		{modelName: "gemini-2.5-flash", wantCode: "no_available_channel"},
-		{modelName: "retired-model", wantCode: "model_not_listed"},
-		{modelName: "never-catalogued", wantCode: "model_not_listed"},
+		{modelName: "gemini-2.5-flash", wantCode: "no_available_channel", wantText: "No available channel for model gemini-2.5-flash"},
+		{modelName: "retired-model", wantCode: "model_not_listed", wantText: "Model retired-model is not offered by this platform"},
+		{modelName: "never-catalogued", wantCode: "model_not_listed", wantText: "No available channel for model never-catalogued"},
 	} {
 		t.Run(testCase.modelName, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+testCase.modelName+":generateContent", strings.NewReader(`{}`))
@@ -179,7 +180,13 @@ func TestRelayBlocksOnlyRetiredModels(t *testing.T) {
 			engine.ServeHTTP(recorder, request)
 
 			require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-			assert.Contains(t, recorder.Body.String(), `"code":"`+testCase.wantCode+`"`)
+			body := recorder.Body.String()
+			assert.Contains(t, body, `"code":"`+testCase.wantCode+`"`)
+			// 「显式下架」的前置拦截与「已上架但无渠道」的选渠道失败共用 model_not_listed
+			// 这一错误码，只有响应文案能区分两条路径：后者是 no_available_channel 文案，前者
+			// 是 model_not_listed 文案。若删掉 Distribute 里的前置拦截，retired-model 会落到
+			// 选渠道失败、得到「No available channel…」，本条断言随即失败。
+			assert.Contains(t, body, testCase.wantText)
 		})
 	}
 }
