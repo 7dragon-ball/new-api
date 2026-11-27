@@ -147,6 +147,43 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 	}
 }
 
+// [FORK] 推理入口只拦截「显式下架」（目录里有命中行且 status != 1）的模型；目录里没
+// 有该行的模型照旧放行。已上架但无可用渠道，必须落到「渠道问题」而不是「模型未上架」。
+func TestRelayBlocksOnlyRetiredModels(t *testing.T) {
+	setupRelayRouterTestDB(t)
+	require.NoError(t, i18n.Init())
+	user := model.User{Username: "listing-user", Status: common.UserStatusEnabled, Group: "default", Quota: 100}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, model.DB.Create(&model.Token{UserId: user.Id, Key: "listingtestkey", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}).Error)
+	require.NoError(t, model.DB.Create(&model.Model{ModelName: "gemini-2.5-flash", Status: 1, NameRule: model.NameRuleExact}).Error)
+	// Status has gorm:"default:1", so a Create with Status:0 would fall back to the
+	// DB default; unlist through an explicit UPDATE as the platform does.
+	require.NoError(t, model.DB.Create(&model.Model{ModelName: "retired-model", Status: 1, NameRule: model.NameRuleExact}).Error)
+	require.NoError(t, model.DB.Model(&model.Model{}).Where("model_name = ?", "retired-model").Update("status", 0).Error)
+
+	engine := gin.New()
+	SetRelayRouter(engine)
+
+	for _, testCase := range []struct {
+		modelName string
+		wantCode  string
+	}{
+		{modelName: "gemini-2.5-flash", wantCode: "no_available_channel"},
+		{modelName: "retired-model", wantCode: "model_not_listed"},
+		{modelName: "never-catalogued", wantCode: "model_not_listed"},
+	} {
+		t.Run(testCase.modelName, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+testCase.modelName+":generateContent", strings.NewReader(`{}`))
+			request.Header.Set("x-goog-api-key", "listingtestkey")
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, request)
+
+			require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), `"code":"`+testCase.wantCode+`"`)
+		})
+	}
+}
+
 func setupRelayRouterTestDB(t *testing.T) {
 	t.Helper()
 

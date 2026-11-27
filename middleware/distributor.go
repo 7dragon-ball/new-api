@@ -85,6 +85,15 @@ func Distribute() func(c *gin.Context) {
 					abortWithI18nMessage(c, http.StatusBadRequest, i18n.MsgDistributorModelNameRequired, nil)
 					return
 				}
+				// [FORK] 下架（models 目录里命中行且 status != 1）即拒绝调用：在选渠道前拦截，
+				// 覆盖所有挂 Distribute 的 /v1/* 推理端点。只拦「显式下架」——目录里查不到该
+				// 模型的行不算下架，照旧放行（任务插件/未建档模型不受影响）。该分支位于
+				// !pinned && shouldSelectChannel 内，内部任务/插件钉渠道请求与「无可路由模型」
+				// 的轮询类请求天然豁免。目录查询失败时放行，避免把数据库故障当成用户配置问题。
+				if retired, err := model.IsModelRetiredCached(modelRequest.Model); err == nil && retired {
+					abortWithI18nMessage(c, http.StatusServiceUnavailable, i18n.MsgDistributorModelNotListed, map[string]any{"Model": modelRequest.Model}, types.ErrorCodeModelNotListed)
+					return
+				}
 				// check path is /pg/chat/completions
 				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
 					usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)

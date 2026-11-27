@@ -112,6 +112,14 @@ func main() {
 	// endpoint inference can read cached route settings on first request.
 	model.GetPricing()
 
+	// [FORK] 预热模型目录内存快照，避免首个推理请求付一次数据库读；失败只告警。
+	// Warm the platform model catalog so the first inference request does not
+	// pay a database read. Failure only warns: the SyncTopicModels reload below,
+	// or the database fallback in IsModelListedCached, covers it.
+	if err := model.InitModelListingCache(); err != nil {
+		common.SysError(common.LogText("InitModelListingCache failed: %s", err.Error()))
+	}
+
 	// The first plugin sync finishes before the server accepts requests, so no
 	// request runs without the uploaded plugins.
 	controller.SyncTaskPluginsOnce()
@@ -132,7 +140,10 @@ func main() {
 	service.RegisterSyncTopic(model.SyncTopicOAuthProviders, func(context.Context) error { return oauth.LoadCustomProviders() })
 	service.RegisterSyncTopic(model.SyncTopicModels, func(context.Context) error {
 		model.RefreshPricing()
-		return nil
+		// [FORK] 重建目录快照，让上架/下架变更在一个节点同步周期内于各节点生效。
+		// Rebuild the listing snapshot so an unlist/list change takes effect on
+		// every node within a node-sync tick.
+		return model.InitModelListingCache()
 	})
 	if !common.RedisEnabled {
 		// With Redis every node shares the plan cache.
