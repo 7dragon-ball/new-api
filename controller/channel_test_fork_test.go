@@ -336,26 +336,50 @@ func TestPreviewTestChannelSkipsPriceCheck(t *testing.T) {
 	assert.Equal(t, 1, hits, "请求必须真的打到上游")
 }
 
-// 预览态不写 consumer log（Id=0 会让它记到 channel 0）。
+// 预览态也要写消费日志（quota=0、token 照实），否则上游真实发生的调用在平台侧毫无痕迹，
+// 用户对不上账：DeepSeek 显示 4 次，平台只有 3 条。
 //
-// 这里必须给模型配一个 ratio：否则请求在 ModelPriceHelper 就被挡下，永远走不到
-// RecordConsumeLog，断言 channel 0 没有日志会「因为没跑到」而通过，测不出任何东西。
-//
-// 注意：`testChannel()` 自身不调 `UpdateResponseTime`（那是 handler 的事），所以本任务
-// 只钉消费日志。「不改 channels 表」那条断言属于 handler 测试。
-func TestPreviewTestChannelWritesNoConsumeLog(t *testing.T) {
+// 这里必须给模型配一个 ratio：改造前请求在 ModelPriceHelper 就被挡下、永远走不到
+// RecordConsumeLog，断言「有日志」会「因为没跑到」而误判。现在定价已从测试路径删除，
+// 这条 pricedModel 只是保住用例与改造前的输入一致。
+func TestPreviewTestChannelWritesZeroQuotaConsumeLog(t *testing.T) {
 	previewTestEnv(t)
 	pricedModel(t, "preview-priced-model")
 	upstream := chatOK(t, nil)
 	defer upstream.Close()
 
 	base := upstream.URL
-	ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Key: "sk-preview", BaseURL: &base}
+	ch := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "", Key: "sk-preview", BaseURL: &base}
 	_ = testChannel(t.Context(), ch, 7, "preview-priced-model", "", false)
 
-	var count int64
-	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Count(&count).Error)
-	assert.Zero(t, count, "预览态不得写任何消费日志")
+	var rows []model.Log
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Find(&rows).Error)
+	require.Len(t, rows, 1, "预览态必须留下恰好一条消费日志")
+	assert.Equal(t, model.LogTypeConsume, rows[0].Type)
+	assert.Zero(t, rows[0].Quota, "渠道测试不得计价")
+	assert.Positive(t, rows[0].PromptTokens, "prompt token 必须照实记录")
+	// 临时渠道没有名字，也不编造：快照留空，日志页渠道列显示 `—`，channel_id 记 0。
+	assert.Zero(t, rows[0].ChannelId)
+	assert.Empty(t, rows[0].ChannelName, "预览态不编造渠道名")
+}
+
+// 已保存渠道的测试走同一个记账分支：同样 quota=0，但渠道名与 id 来自真实渠道。
+func TestSavedChannelTestWritesZeroQuotaConsumeLog(t *testing.T) {
+	previewTestEnv(t)
+	pricedModel(t, "saved-priced-model")
+	upstream := chatOK(t, nil)
+	defer upstream.Close()
+
+	base := upstream.URL
+	ch := &model.Channel{Id: 10, Name: "已保存渠道", Type: constant.ChannelTypeOpenAI, Key: "sk-saved", BaseURL: &base}
+	_ = testChannel(t.Context(), ch, 7, "saved-priced-model", "", false)
+
+	var rows []model.Log
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Find(&rows).Error)
+	require.Len(t, rows, 1)
+	assert.Zero(t, rows[0].Quota, "已保存渠道的测试同样不计价")
+	assert.Equal(t, 10, rows[0].ChannelId)
+	assert.Equal(t, "已保存渠道", rows[0].ChannelName)
 }
 
 // 上游错误体会被 RelayErrorHandler 原样拼进 err，而预览态的 key 来自请求体。
@@ -495,19 +519,22 @@ func pricedModel(t *testing.T, name string) {
 }
 
 // 已保存渠道（Id > 0）行为不变：仍然走定价校验。
-func TestSavedChannelStillChecksPrice(t *testing.T) {
+// 渠道测试不再做定价校验：连通性测试只回答「这个上游通不通」，未配价不该让它失败。
+// 改造前已保存渠道会因为未定价直接失败（那时它要算金额），现在两种渠道都只记账不算价。
+func TestSavedChannelIgnoresMissingPrice(t *testing.T) {
 	previewTestEnv(t)
 	var hits int
 	upstream := chatOK(t, &hits)
 	defer upstream.Close()
 
 	base := upstream.URL
-	ch := &model.Channel{Id: 42, Type: constant.ChannelTypeOpenAI, Key: "sk-saved", BaseURL: &base}
+	ch := &model.Channel{Id: 42, Name: "unpriced-saved", Type: constant.ChannelTypeOpenAI, Key: "sk-saved", BaseURL: &base}
 
 	result := testChannel(t.Context(), ch, 7, "unpriced-model-xyz", "", false)
 
-	require.NotNil(t, result.localErr, "已保存渠道未定价时必须失败")
-	assert.Zero(t, hits, "定价校验在发请求之前，上游不应被调用")
+	require.Nil(t, result.localErr, "未配价不得让连通性测试失败")
+	require.Nil(t, result.newAPIError)
+	assert.Equal(t, 1, hits, "请求必须真的打到上游")
 }
 
 // GET /api/channel/test/:id 只要有 ChannelOperate 权限就能调，而 TestChannel 把

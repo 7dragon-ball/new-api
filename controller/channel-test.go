@@ -19,7 +19,6 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -29,7 +28,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/samber/lo"
@@ -104,9 +102,6 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		ctx = context.Background()
 	}
 	tik := time.Now()
-	// [FORK] 预览态：未落库的临时渠道（Id == 0，见 TestChannelByCredentials）。
-	// 预览态不读网关定价、不结算、不写消费日志。
-	preview := channel.Id == 0
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
 		constant.ChannelTypeMidjourneyPlus,
@@ -341,21 +336,6 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//logInfo.ApiKey = ""
 	common.SysLog(common.LogText("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
 
-	// [FORK] 预览态跳过定价校验：成本表在 BFF 的 channel_costs，与网关 model_ratio
-	// 是两套数据，不跳过会让「新建渠道测试」在网关未配价的模型上全部失败，
-	// 且失败原因与连通性无关。
-	priceData := hosttypes.PriceData{}
-	if !preview {
-		priceData, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
-		if err != nil {
-			return testResult{
-				context:     c,
-				localErr:    err,
-				newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
-			}
-		}
-	}
-
 	adaptor.Init(info)
 
 	var convertedRequest any
@@ -556,27 +536,23 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
 
-	// [FORK] 预览态不结算、不写消费日志：Id == 0 会把这些记录挂到 channel 0 上。
-	if !preview {
-		quota, tieredResult := settleTestQuota(info, priceData, usage)
-		tok := time.Now()
-		milliseconds := tok.Sub(tik).Milliseconds()
-		consumedTime := float64(milliseconds) / 1000.0
-		other := buildTestLogOther(c, info, priceData, usage, tieredResult)
-		model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
-			ChannelId:        channel.Id,
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			ModelName:        info.OriginModelName,
-			TokenName:        "Model test",
-			Quota:            quota,
-			Content:          []*common.Message{common.NewMessage("Model test")},
-			UseTimeSeconds:   int(consumedTime),
-			IsStream:         info.IsStream,
-			Group:            info.UsingGroup,
-			Other:            other,
-		})
-	}
+	// [FORK] 渠道测试照实记账但恒不计价：上游真实产生了 token 消耗，不记就永远对不上账
+	// （DeepSeek 显示 4 次、平台 3 条）。quota 传 0，钱包与 quota_data 的金额都不动；
+	// 前端靠 other.billing_exempt 把金额列渲染成 `—` 而不是 ￥0。
+	milliseconds := time.Since(tik).Milliseconds()
+	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+		ChannelId:        channel.Id,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		ModelName:        info.OriginModelName,
+		TokenName:        "Model test",
+		Quota:            0,
+		Content:          []*common.Message{common.NewMessage("Model test")},
+		UseTimeSeconds:   int(milliseconds / 1000),
+		IsStream:         info.IsStream,
+		Group:            info.UsingGroup,
+		Other:            testLogOther(c, info, usage),
+	})
 	// [FORK] 成功响应体同样可能回显它收到的凭据（base_url 误配到回显服务或调试网关），
 	// 这条日志是那次 body 唯一落盘的地方，写之前按本次下发的 Key 脱敏。
 	common.SysLog(common.LogText("testing channel #%d, response: \n%s", channel.Id,
@@ -601,35 +577,16 @@ func attachTestBillingRequestInput(info *relaycommon.RelayInfo, request dto.Requ
 	return nil
 }
 
-func settleTestQuota(info *relaycommon.RelayInfo, priceData hosttypes.PriceData, usage *dto.Usage) (int, *billingexpr.TieredResult) {
-	if usage != nil && info != nil && info.TieredBillingSnapshot != nil {
-		isClaudeUsageSemantic := usage.UsageSemantic == "anthropic" || info.GetFinalRequestRelayFormat() == types.RelayFormatClaude
-		usedVars := billingexpr.UsedVars(info.TieredBillingSnapshot.ExprString)
-		if ok, quota, result := service.TryTieredSettle(info, service.BuildTieredTokenParams(usage, isClaudeUsageSemantic, usedVars)); ok {
-			return quota, result
-		}
+// testLogOther 是渠道测试专用的日志附加信息。不调 GenerateTextOtherInfo —— 它会把
+// model_ratio / completion_ratio / model_price 一并写进 other，前端拆成本时会据此把
+// 0 金额拆出三段虚假的费用。
+func testLogOther(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage) *model.LogOther {
+	other := model.NewLogOther()
+	other.SetPublic("billing_exempt", true)
+	if usage != nil {
+		other.SetPublic("cache_tokens", usage.PromptTokensDetails.CachedTokens)
 	}
-
-	quota := 0
-	if !priceData.UsePrice {
-		completionQuota := common.QuotaRound(float64(usage.CompletionTokens) * priceData.CompletionRatio)
-		quota = common.QuotaRound(float64(usage.PromptTokens) + float64(completionQuota))
-		quota = common.QuotaRound(float64(quota) * priceData.ModelRatio)
-		if priceData.ModelRatio != 0 && quota <= 0 {
-			quota = 1
-		}
-		return quota, nil
-	}
-
-	return common.QuotaFromFloat(priceData.ModelPrice * common.QuotaPerUnit), nil
-}
-
-func buildTestLogOther(c *gin.Context, info *relaycommon.RelayInfo, priceData hosttypes.PriceData, usage *dto.Usage, tieredResult *billingexpr.TieredResult) *model.LogOther {
-	other := service.GenerateTextOtherInfo(c, info, priceData.ModelRatio, priceData.GroupRatioInfo.GroupRatio, priceData.CompletionRatio,
-		usage.PromptTokensDetails.CachedTokens, priceData.CacheRatio, priceData.ModelPrice, priceData.GroupRatioInfo.GroupSpecialRatio)
-	if tieredResult != nil {
-		service.InjectTieredBillingInfo(other, info, tieredResult)
-	}
+	service.AppendRelayLogAdminInfo(c, info, other)
 	return other
 }
 
