@@ -139,10 +139,11 @@ func TestGeminiRelayHandsLongRunningPredictionToPluginRoute(t *testing.T) {
 				assert.Equal(t, fmt.Sprintf("plugin google for user %d", user.Id), recorder.Body.String())
 				return
 			}
-			// The relay looks for a Gemini channel serving the model; there is none,
-			// and the model is absent from the platform model catalog.
+			// The relay looks for a Gemini channel serving the model; there is none.
+			// The model has no catalog entry, which is not 下架, so the failure is
+			// classified as "no available channel", not "model not listed".
 			assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
-			assert.Contains(t, recorder.Body.String(), `"code":"model_not_listed"`)
+			assert.Contains(t, recorder.Body.String(), `"code":"no_available_channel"`)
 		})
 	}
 }
@@ -171,7 +172,7 @@ func TestRelayBlocksOnlyRetiredModels(t *testing.T) {
 	}{
 		{modelName: "gemini-2.5-flash", wantCode: "no_available_channel", wantText: "No available channel for model gemini-2.5-flash"},
 		{modelName: "retired-model", wantCode: "model_not_listed", wantText: "Model retired-model is not offered by this platform"},
-		{modelName: "never-catalogued", wantCode: "model_not_listed", wantText: "No available channel for model never-catalogued"},
+		{modelName: "never-catalogued", wantCode: "no_available_channel", wantText: "No available channel for model never-catalogued"},
 	} {
 		t.Run(testCase.modelName, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+testCase.modelName+":generateContent", strings.NewReader(`{}`))
@@ -182,10 +183,10 @@ func TestRelayBlocksOnlyRetiredModels(t *testing.T) {
 			require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 			body := recorder.Body.String()
 			assert.Contains(t, body, `"code":"`+testCase.wantCode+`"`)
-			// 「显式下架」的前置拦截与「已上架但无渠道」的选渠道失败共用 model_not_listed
-			// 这一错误码，只有响应文案能区分两条路径：后者是 no_available_channel 文案，前者
-			// 是 model_not_listed 文案。若删掉 Distribute 里的前置拦截，retired-model 会落到
-			// 选渠道失败、得到「No available channel…」，本条断言随即失败。
+			// 「显式下架」的前置拦截记 model_not_listed；「无可用渠道」——含目录里没有该
+			// 行的模型——记 no_available_channel，错误码本身即可区分两条路径。若删掉
+			// Distribute 里的前置拦截，retired-model 会落到选渠道失败、得到
+			// 「No available channel…」，本条断言随即失败。
 			assert.Contains(t, body, testCase.wantText)
 		})
 	}
