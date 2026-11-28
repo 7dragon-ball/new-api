@@ -554,10 +554,11 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `model_not_listed` / `no_available_channel` / `get_channel_failed`（渠道选择路径一分为三）与
   `invalid_token` / `upstream_unauthorized` / `upstream_rate_limited`（状态码专属码）；新增
   `GetUpstreamErrorCode` / `SetErrorCode` / `SetRecordErrorLog` 三个方法。
-- **渠道选择定码**（`service/channel_select.go`）：`modelFailureCode` 在错误路径上查一次模型目录
-  （`model.IsModelListed`）：已上架→`no_available_channel`，未上架→`model_not_listed`；取渠道
-  本身出错→`get_channel_failed`。目录查询失败**不**臆断「未上架」（那是把数据库故障当成用户配置
-  问题），改记 `common.SysError` 并退回 `no_available_channel`。
+- **渠道选择定码**（`service/channel_select.go`）：`modelFailureCode` 在错误路径上判定模型是否
+  **显式下架**（`model.IsModelRetired`）：下架→`model_not_listed`，其余（已上架，**或目录里
+  压根没有该行**的模型）→`no_available_channel`；取渠道本身出错→`get_channel_failed`。目录
+  查询失败**不**臆断「未上架」（那是把数据库故障当成用户配置问题），改记 `common.SysError`
+  并退回 `no_available_channel`。
 - **上游 401/429 定码**（`service/error.go`）：`RelayErrorHandler` 拆出 `relayErrorHandlerRaw`，
   在结果上按上游状态码覆盖 `error_code`（401→`upstream_unauthorized`、429→
   `upstream_rate_limited`），**不改 `StatusCode`**；新码不带 `channel:` 前缀，`IsChannelError`
@@ -572,11 +573,21 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   提前到选路前写，让其后的前置校验失败日志也带得上模型名（成功路径稍后用同值覆盖，无副作用）。
 
 **对外契约变更声明（重要）**：「无可用渠道」失败此前是 HTTP **503** + `code: "model_not_found"`，
-现在**状态码仍是 503**，`code` 拆成三个：`model_not_listed`（模型未上架）、`no_available_channel`
-（已上架但无可用渠道）、`get_channel_failed`（取渠道报错）——三条失败路径在
-`service/channel_select.go` 都返回 `http.StatusServiceUnavailable`。**依赖旧 `model_not_found`
-的调用方需同步**。401/429 的**响应码不是**变更——`ToOpenAIError()` 对 `ErrorTypeOpenAIError`
-分支返回原始上游 RelayError，客户端仍收到上游自己的码；归一码只写进 usage log 的 `error_code`。
+现在**状态码仍是 503**，`code` 拆成三个：`model_not_listed`（模型**显式下架**）、
+`no_available_channel`（**其余一切无可用渠道**：已上架但无可用渠道，或目录里没有该行的模型）、
+`get_channel_failed`（取渠道报错）——三条失败路径在 `service/channel_select.go` 都返回
+`http.StatusServiceUnavailable`。**依赖旧 `model_not_found` 的调用方需同步**。401/429 的
+**响应码不是**变更——`ToOpenAIError()` 对 `ErrorTypeOpenAIError` 分支返回原始上游 RelayError，
+客户端仍收到上游自己的码；归一码只写进 usage log 的 `error_code`。
+
+> **错误码归类修正（2026-11-28）**：`modelFailureCode` 初版按「是否已上架」（`model.IsModelListed`）
+> 定码，把「目录里没有该行的模型」也判成 `model_not_listed`。这与
+> `model/model_listing_cache_fork.go` 写明的不变量（无目录记录 ≠ 下架）以及 `Distribute` 里
+> 「只拦显式下架」的前置拦截相矛盾：**上游渠道被停用**、目录又没有该行的模型（有渠道行、无
+> 目录行）被误报成「模型未上架」。现改为只按「显式下架」（`model.IsModelRetired`）判定，无目录
+> 记录一律归 `no_available_channel`。这是**对外契约的语义变更**：`model_not_listed` 的取值集合
+> 收窄为「显式下架」，调用方若以 `model_not_listed` 判断「模型未上架」，将不再命中从未建档的
+> 模型，需知悉。
 
 **残留 `model_not_found` 字面量（确认无需清理）**：`types.ErrorCodeModelNotFound` 常量已删、全仓
 无引用（`grep -rn "ErrorCodeModelNotFound" --include="*.go" .` 零命中）；字符串字面量仍存两处，
@@ -699,8 +710,8 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   （`pinned`）天然豁免。
 - **内存快照**：`model/model_listing_cache_fork.go` 在启动与每次 `SyncTopicModels` 同步时重建快照
   （按规则类型分桶：一个 `exact` 映射 + 前缀/后缀/包含三组有序切片；`listed` / `retired` 由同一份
-  status 源派生），`Distribute` 与 `modelFailureCode` 改走 `IsModelRetiredCached` /
-  `IsModelListedCached`；快照未就绪时回退到「十二」的库查询实现，行为不变。
+  status 源派生），`Distribute` 与 `modelFailureCode` 都改走 `IsModelRetiredCached`（只拦显式
+  下架）；快照未就绪时回退到「十二」的库查询实现，行为不变。
 - **启动预热失败会重试**：启动预热失败时用 `service.SyncTopicLoadFailed(model.SyncTopicModels, err)`
   把该 topic 标记为未加载（与 `main.go` 对 OAuth 的处理一致），首个 node-sync tick 会重跑
   `InitModelListingCache`；重试成功前每个推理请求走库回退，快照不会被永久钉死在未就绪状态。
@@ -709,6 +720,9 @@ proof 只能用在签发时确认的那一批账号上。逐目标沿用 `canMan
   `status != 1`）上不同，避免查询与优先级各写一份而随时间漂移。
 - **对外契约变更声明**：此前「下架」只影响模型广场展示，不拦调用；一个 `status != 1` 但仍有可用
   渠道的模型过去能调用成功，现在一律 `503 model_not_listed`。这是有意的路由层收紧，使用方需知悉。
+- **错误码归类修正**：`modelFailureCode` 与前置拦截同源改为只按「显式下架」判定后，「目录里没有
+  该行的模型」不再被误记成 `model_not_listed`，而是 `no_available_channel`；详见「十二」的
+  `model_not_listed` 语义修正声明。
 
 改动：root `main.go`（启动预热 + `SyncTopicModels` 回调重建）、`middleware/distributor.go`
 （前置拦截块，`[FORK]` 共 4 处；目录查询失败放行并打日志）、`service/channel_select.go`
@@ -810,7 +824,7 @@ PG 之外的库保留兜底。测试库不受影响：各测试自己 AutoMigrat
 | `middleware/utils.go` | `abortWithOpenAiMessage` 拆成 `abortWithLogMessage` 分发层 + `abortWithI18nMessage`；abort 时补记错误日志（见「十二」） | 中，所有 abort 路径 |
 | `middleware/task_plugin.go` | 1 处本地化 abort 迁到 `abortWithI18nMessage` | 低，单行 |
 | `relaykit/types/error.go` | 删 `ErrorCodeModelNotFound`；新增 `model_not_listed` / `no_available_channel` / `get_channel_failed` / `invalid_token` / `upstream_unauthorized` / `upstream_rate_limited` 与 `SetErrorCode` / `GetUpstreamErrorCode` / `SetRecordErrorLog`（见「十二」） | 中，错误码是跨模块契约 |
-| `service/channel_select.go` | `modelFailureCode` 在失败路径按 `model.IsModelListed` 区分未上架 / 无可用渠道 / 取渠道失败 | 中，选路失败路径 |
+| `service/channel_select.go` | `modelFailureCode` 在失败路径按 `model.IsModelRetired`（显式下架）区分未上架 / 无可用渠道 / 取渠道失败 | 中，选路失败路径 |
 | `service/error.go` | `RelayErrorHandler` 拆出 `relayErrorHandlerRaw`，按上游 401/429 覆盖 `error_code`（不改 `StatusCode`） | 中，上游错误解析主路径 |
 | `service/relay_error.go` | 落库 `error_code` 并另存 `upstream_error_code`；新增 `ForceRecordRelayErrorLog`（见「十二」） | 中 |
 | `controller/relay.go` | 本地请求校验失败补 `RecordRelayErrorLog`；`PrepareRequestBilling` 失败走 `ForceRecordRelayErrorLog` | 中，relay 主路径 |

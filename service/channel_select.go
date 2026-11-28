@@ -405,26 +405,26 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 }
 
 // [FORK] 把「模型未上架」与「有模型但无可用渠道」分开归类，使用日志的调用状态才能区分。
-// modelFailureCode splits the "no channel for this model" outcome into
-// "model not listed" and "listed but no available channel", which the
-// management log tooltip reads from the recorded error code.
-// It now reads the in-memory listing snapshot (IsModelListedCached) so this
-// failure code shares one source of truth with the pre-channel check in
-// Distribute, and this error path no longer issues an unbounded catalog read.
-// The snapshot may lag the database by up to one node-sync tick, so both this
-// error-code classification and the pre-channel gate in Distribute follow the
-// snapshot rather than the live catalog.
+// Only an explicitly disabled catalog entry (status != 1) counts as 未上架: a name
+// with no catalog entry was never curated, so it must NOT be reported as
+// model_not_listed. Doing so contradicted the invariant documented in
+// model/model_listing_cache_fork.go ("a name with no catalog entry is neither
+// listed nor retired") and diverged from the pre-channel gate in Distribute,
+// which blocks only retired models — a channel that was merely disabled upstream
+// therefore surfaced as 「模型未上架」. The classification uses
+// IsModelRetiredCached (not IsModelListedCached) to share one source of truth
+// with that gate; the snapshot may lag the database by up to one node-sync tick.
 func modelFailureCode(modelName string) types.ErrorCode {
-	listed, err := model.IsModelListedCached(modelName)
+	retired, err := model.IsModelRetiredCached(modelName)
 	if err != nil {
 		// 目录查询失败时不能断言「模型未上架」，否则会把数据库故障当成用户配置问题。
 		common.SysError("model catalog lookup failed for " + modelName + ": " + err.Error())
 		return types.ErrorCodeNoAvailableChannel
 	}
-	if listed {
-		return types.ErrorCodeNoAvailableChannel
+	if retired {
+		return types.ErrorCodeModelNotListed
 	}
-	return types.ErrorCodeModelNotListed
+	return types.ErrorCodeNoAvailableChannel
 }
 
 // Origin-task pins report a fixed code so task polling can tell a retired
